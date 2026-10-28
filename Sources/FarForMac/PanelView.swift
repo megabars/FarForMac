@@ -1,0 +1,989 @@
+import AppKit
+import FarCore
+
+enum Palette {
+    static let background = NSColor(calibratedRed: 0.035, green: 0.065, blue: 0.13, alpha: 1)
+    static let panel = NSColor(calibratedRed: 0.055, green: 0.095, blue: 0.18, alpha: 1)
+    static let raised = NSColor(calibratedRed: 0.085, green: 0.14, blue: 0.24, alpha: 1)
+    static let accent = NSColor(calibratedRed: 0.32, green: 0.88, blue: 0.78, alpha: 1)
+    static let text = NSColor(calibratedRed: 0.88, green: 0.92, blue: 0.98, alpha: 1)
+    static let muted = NSColor(calibratedRed: 0.53, green: 0.63, blue: 0.77, alpha: 1)
+}
+
+func label(_ value: String, size: CGFloat = 12, color: NSColor = Palette.text, bold: Bool = false) -> NSTextField {
+    let field = NSTextField(labelWithString: value)
+    field.font = .monospacedSystemFont(ofSize: size, weight: bold ? .semibold : .regular)
+    field.textColor = color
+    field.lineBreakMode = .byTruncatingMiddle
+    return field
+}
+
+func vertical(_ views: [NSView], spacing: CGFloat = 0) -> NSStackView {
+    let stack = NSStackView(views: views)
+    stack.orientation = .vertical
+    stack.alignment = .leading
+    stack.spacing = spacing
+    for view in views { view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
+    return stack
+}
+
+func horizontal(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView {
+    let stack = NSStackView(views: views)
+    stack.orientation = .horizontal
+    stack.alignment = .centerY
+    stack.spacing = spacing
+    return stack
+}
+
+func inset(_ content: NSView, x: CGFloat = 14, y: CGFloat = 10, color: NSColor? = nil) -> NSView {
+    let wrapper = NSView()
+    if let color { wrapper.wantsLayer = true; wrapper.layer?.backgroundColor = color.cgColor }
+    content.translatesAutoresizingMaskIntoConstraints = false
+    wrapper.addSubview(content)
+    NSLayoutConstraint.activate([
+        content.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor, constant: x),
+        content.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor, constant: -x),
+        content.topAnchor.constraint(equalTo: wrapper.topAnchor, constant: y),
+        content.bottomAnchor.constraint(equalTo: wrapper.bottomAnchor, constant: -y)
+    ])
+    return wrapper
+}
+
+final class FileTable: NSTableView {
+    var onFocus: (() -> Void)?
+    var onKey: ((NSEvent) -> Bool)?
+    var onMouse: ((NSEvent) -> Bool)?
+    var onShiftRelease: (() -> Void)?
+    var onSelectAll: (() -> Void)?
+    override func selectAll(_ sender: Any?) { onSelectAll?() }
+    override func becomeFirstResponder() -> Bool { onFocus?(); return super.becomeFirstResponder() }
+    override func mouseDown(with event: NSEvent) {
+        onFocus?()
+        if onMouse?(event) == true { return }
+        super.mouseDown(with: event)
+    }
+    override func flagsChanged(with event: NSEvent) {
+        if !event.modifierFlags.contains(.shift) { onShiftRelease?() }
+        super.flagsChanged(with: event)
+    }
+    override func resignFirstResponder() -> Bool {
+        onShiftRelease?()
+        return super.resignFirstResponder()
+    }
+    override func keyDown(with event: NSEvent) {
+        if onKey?(event) == true { return }
+        super.keyDown(with: event)
+    }
+}
+
+final class FileRow: NSTableRowView {
+    var active = false
+    override func drawSelection(in dirtyRect: NSRect) {
+        (active ? Palette.accent.withAlphaComponent(0.21) : Palette.raised).setFill()
+        bounds.fill()
+        if active {
+            Palette.accent.setFill()
+            NSRect(x: 0, y: 0, width: 3, height: bounds.height).fill()
+        }
+    }
+}
+
+enum PanelDisplayMode: String, Codable, CaseIterable { case brief, full, custom }
+
+@MainActor
+final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+    let table = FileTable()
+    let pathField = NSTextField()
+    let filterField = NSSearchField()
+    let quickFindField = NSSearchField()
+    let title = label("", size: 11, bold: true)
+    let summary = label("", size: 11, color: Palette.muted)
+    let locationKey: String
+    private(set) var directory: URL
+    private(set) var entries: [FileEntry] = []
+    private(set) var visible: [FileEntry] = []
+    private(set) var loading = false
+    var showHidden = false
+    private(set) var sortOptions = FileSortOptions()
+    var sort: FileSort {
+        get { sortOptions.sort }
+        set { var options = sortOptions; options.sort = newValue; setSortOptions(options) }
+    }
+    var ascending: Bool {
+        get { sortOptions.ascending }
+        set { var options = sortOptions; options.ascending = newValue; setSortOptions(options) }
+    }
+    private(set) var displayMode: PanelDisplayMode = .custom
+    private(set) var visibleColumnIDs: Set<String> = ["name", "size", "modified"]
+    private(set) var customColumnIDs: Set<String> = ["name", "size", "modified"]
+    private(set) var colorizeFiles = true
+    var maskGroups: [String: String] = [:]
+    var onDirectoryChange: ((PanelView) -> Void)?
+    private var navigation: PanelNavigation
+    private enum HistoryAction: Equatable { case visit, back, forward, restore }
+    private struct DirectorySnapshot {
+        let entries: [FileEntry]
+        let selection: PanelSelection
+        let cursorRow: Int
+        let columnWidths: [String: CGFloat]
+        let columnOrder: [String]
+        let filter: String
+        let quickFind: String
+        let quickFindHidden: Bool
+        let sortOptions: FileSortOptions
+        let displayMode: PanelDisplayMode
+        let customColumnIDs: Set<String>
+        let colorizeFiles: Bool
+    }
+    private var directorySnapshot: DirectorySnapshot?
+    private var searchResults: [String: SearchResult] = [:]
+    private var removedResultCount = 0
+    private var metadataTask: Task<([FileEntry], [String]), Never>?
+    private let returnButton = NSButton(title: "Вернуться к папке", target: nil, action: nil)
+    var isTemporary: Bool { directorySnapshot != nil }
+    var temporaryTitle: String? { isTemporary ? "Результаты поиска" : nil }
+    var historyPaths: [String] { navigation.history }
+    var canGoBack: Bool { isTemporary || navigation.backPath != nil }
+    var canGoForward: Bool { navigation.forwardPath != nil }
+    var onFocus: ((PanelView) -> Void)?
+    var onError: ((Error) -> Void)?
+    var onFileOpen: ((FileEntry) -> Void)?
+    var onKey: ((NSEvent) -> Bool)?
+    var active = false { didSet { updateActive() } }
+    private var generation = 0
+    private var selection = PanelSelection()
+    private var shiftMarking: Bool?
+    private var synchronizingTable = false
+    private var hasParent = false
+    private var offset: Int { hasParent ? 1 : 0 }
+
+    init(directory: URL, key: String) {
+        self.directory = directory
+        self.locationKey = key
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: "panel.\(key).history"),
+           let saved = try? JSONDecoder().decode(PanelNavigation.self, from: data) {
+            self.navigation = saved
+        } else { self.navigation = PanelNavigation(path: directory.path) }
+        super.init(frame: .zero)
+        if let data = defaults.data(forKey: "panel.\(key).sort"),
+           let saved = try? JSONDecoder().decode(FileSortOptions.self, from: data) { sortOptions = saved }
+        displayMode = PanelDisplayMode(rawValue: defaults.string(forKey: "panel.\(key).display") ?? "custom") ?? .custom
+        if let columns = defaults.stringArray(forKey: "panel.\(key).columns") { customColumnIDs = Set(columns).intersection(Set(Self.columnDefinitions.map(\.id))).union(["name"]) }
+        if defaults.object(forKey: "panel.\(key).colorize") != nil { colorizeFiles = defaults.bool(forKey: "panel.\(key).colorize") }
+        wantsLayer = true
+        layer?.backgroundColor = Palette.panel.cgColor
+        layer?.borderWidth = 1
+        layer?.cornerRadius = 8
+        layer?.masksToBounds = true
+        pathField.stringValue = directory.path
+        pathField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        pathField.textColor = Palette.text
+        pathField.backgroundColor = Palette.background
+        pathField.isBezeled = false
+        pathField.focusRingType = .none
+        pathField.target = self
+        pathField.action = #selector(goToPath)
+        pathField.setAccessibilityLabel("Путь \(key == "left" ? "левой" : "правой") панели")
+        let up = NSButton(image: NSImage(systemSymbolName: "arrow.up", accessibilityDescription: "На уровень выше")!, target: self, action: #selector(parent))
+        up.bezelStyle = .texturedRounded
+        let path = horizontal([up, pathField])
+        pathField.widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
+        filterField.placeholderString = "Фильтр в этой папке  ⌘F"
+        filterField.font = .systemFont(ofSize: 12)
+        filterField.delegate = self
+        filterField.sendsSearchStringImmediately = true
+        filterField.setAccessibilityLabel("Фильтр \(key == "left" ? "левой" : "правой") панели")
+
+        quickFindField.placeholderString = "Быстрый поиск  ⌥буква · ⌃↩ далее · Esc закрыть"
+        quickFindField.font = .systemFont(ofSize: 12)
+        quickFindField.delegate = self
+        quickFindField.sendsSearchStringImmediately = true
+        quickFindField.setAccessibilityLabel("Быстрый поиск")
+        quickFindField.isHidden = true
+
+        table.backgroundColor = Palette.panel
+        table.usesAlternatingRowBackgroundColors = false
+        table.gridStyleMask = []
+        table.rowHeight = 29
+        table.intercellSpacing = NSSize(width: 0, height: 0)
+        table.allowsMultipleSelection = false
+        table.allowsEmptySelection = true
+        table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+        table.focusRingType = .none
+        table.dataSource = self
+        table.delegate = self
+        table.target = self
+        table.doubleAction = #selector(openSelection)
+        table.setAccessibilityLabel(key == "left" ? "Левая файловая панель" : "Правая файловая панель")
+        for definition in Self.columnDefinitions {
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(definition.id))
+            column.title = definition.title
+            column.width = definition.width
+            column.minWidth = definition.id == "name" ? 120 : (definition.id == "origin" ? 180 : 55)
+            column.resizingMask = definition.id == "name" ? .autoresizingMask : .userResizingMask
+            column.headerCell.font = .systemFont(ofSize: 11, weight: .medium)
+            table.addTableColumn(column)
+        }
+        table.autosaveName = "FarMac.\(key).columns"
+        table.autosaveTableColumns = true
+        updateColumns()
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 150).isActive = true
+        returnButton.target = self
+        returnButton.action = #selector(returnToDirectory)
+        returnButton.bezelStyle = .rounded
+        returnButton.isHidden = true
+        let header = inset(vertical([title, returnButton, path, filterField, quickFindField], spacing: 10), color: Palette.raised)
+        let body = vertical([header, scroll, inset(summary, y: 9)])
+        body.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(body)
+        NSLayoutConstraint.activate([
+            body.leadingAnchor.constraint(equalTo: leadingAnchor), body.trailingAnchor.constraint(equalTo: trailingAnchor),
+            body.topAnchor.constraint(equalTo: topAnchor), body.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        table.onFocus = { [weak self] in guard let self else { return }; self.onFocus?(self) }
+        table.onKey = { [weak self] event in
+            guard let self else { return false }
+            return self.handleQuickFindKey(event) || self.handleSelectionKey(event) || (self.onKey?(event) ?? false)
+        }
+        table.onMouse = { [weak self] event in self?.handleSelectionMouse(event) ?? false }
+        table.onShiftRelease = { [weak self] in self?.shiftMarking = nil }
+        table.onSelectAll = { [weak self] in self?.markAll() }
+        updateActive()
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func load(_ url: URL? = nil, preserveSelection: Bool = true, selectName: String? = nil) {
+        if isTemporary, url == nil { refresh(); return }
+        load(url, preserveSelection: preserveSelection, selectName: selectName, historyAction: .visit)
+    }
+
+    /// Results are a distinct, in-memory panel source; the directory and its history stay intact.
+    func showSearchResults(_ results: [SearchResult]) {
+        metadataTask?.cancel()
+        generation += 1
+        loading = false
+        if !isTemporary {
+            directorySnapshot = DirectorySnapshot(
+                entries: entries, selection: selection, cursorRow: table.selectedRow,
+                columnWidths: Dictionary(uniqueKeysWithValues: table.tableColumns.map { ($0.identifier.rawValue, $0.width) }),
+                columnOrder: table.tableColumns.map { $0.identifier.rawValue },
+                filter: filterField.stringValue,
+                quickFind: quickFindField.stringValue, quickFindHidden: quickFindField.isHidden,
+                sortOptions: sortOptions, displayMode: displayMode,
+                customColumnIDs: customColumnIDs, colorizeFiles: colorizeFiles
+            )
+        }
+        searchResults = Dictionary(results.map { ($0.url.path, $0) }, uniquingKeysWith: { first, _ in first })
+        removedResultCount = 0
+        selection = PanelSelection()
+        filterField.stringValue = ""
+        filterField.placeholderString = "Фильтр результатов  ⌘F"
+        endQuickFind(focusTable: false)
+        entries = FileService.sorted(searchResults.values.map {
+            FileEntry(url: $0.url, name: $0.name, isDirectory: $0.isDirectory,
+                      isSymbolicLink: $0.isSymbolicLink, size: $0.size, modified: $0.modified)
+        }, options: sortOptions)
+        returnButton.isHidden = false
+        // A forced origin column must not overwrite the saved directory layout.
+        table.autosaveTableColumns = false
+        if let originIndex = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == "origin" }) {
+            table.moveColumn(originIndex, toColumn: 1)
+        }
+        updateColumns()
+        updateActive()
+        applyFilter(resetSelection: true)
+        refresh()
+        focus()
+    }
+
+    func leaveSearchResults() {
+        guard restoreDirectorySnapshot() else { return }
+        load(nil, preserveSelection: true, historyAction: .restore)
+        focus()
+    }
+
+    @objc private func returnToDirectory() { leaveSearchResults() }
+
+    @discardableResult
+    private func restoreDirectorySnapshot() -> Bool {
+        guard let snapshot = directorySnapshot else { return false }
+        metadataTask?.cancel()
+        metadataTask = nil
+        generation += 1
+        loading = false
+        directorySnapshot = nil
+        searchResults.removeAll()
+        removedResultCount = 0
+        entries = snapshot.entries
+        selection = snapshot.selection
+        filterField.stringValue = snapshot.filter
+        filterField.placeholderString = "Фильтр в этой папке  ⌘F"
+        quickFindField.stringValue = snapshot.quickFind
+        quickFindField.isHidden = snapshot.quickFindHidden
+        sortOptions = snapshot.sortOptions
+        displayMode = snapshot.displayMode
+        customColumnIDs = snapshot.customColumnIDs
+        colorizeFiles = snapshot.colorizeFiles
+        pathField.stringValue = directory.path
+        returnButton.isHidden = true
+        for (index, id) in snapshot.columnOrder.enumerated() {
+            if let current = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == id }) {
+                table.moveColumn(current, toColumn: index)
+            }
+        }
+        updateColumns()
+        for column in table.tableColumns {
+            if let width = snapshot.columnWidths[column.identifier.rawValue] { column.width = width }
+        }
+        table.autosaveTableColumns = true
+        updateActive()
+        applyFilter()
+        if snapshot.cursorRow >= 0 { moveCursor(to: snapshot.cursorRow) }
+        return true
+    }
+
+    func refresh() {
+        guard isTemporary else { load(); return }
+        metadataTask?.cancel()
+        generation += 1
+        let token = generation
+        let results = Array(searchResults.values)
+        loading = true
+        summary.stringValue = "Обновление результатов…"
+        let worker = Task.detached(priority: .userInitiated) {
+            var current: [FileEntry] = []
+            var invalidIDs: [String] = []
+            for result in results {
+                guard !Task.isCancelled else { break }
+                do { current.append(try Self.refreshResult(result)) }
+                catch { invalidIDs.append(result.url.path) }
+            }
+            return (current, invalidIDs)
+        }
+        metadataTask = worker
+        Task {
+            let refreshed = await worker.value
+            guard token == generation, isTemporary else { return }
+            metadataTask = nil
+            for id in refreshed.1 { searchResults.removeValue(forKey: id) }
+            removedResultCount += refreshed.1.count
+            entries = FileService.sorted(refreshed.0, options: sortOptions, markedIDs: selection.markedIDs)
+            loading = false
+            applyFilter()
+        }
+    }
+
+    /// Keep the captured identity: refreshing metadata must never accept a replacement at the same path.
+    nonisolated private static func refreshResult(_ result: SearchResult) throws -> FileEntry {
+        try result.verifyCurrent()
+        let manager = FileManager.default
+        let attributes = try manager.attributesOfItem(atPath: result.url.path)
+        let isLink = attributes[.type] as? FileAttributeType == .typeSymbolicLink
+        let target = isLink ? (try? manager.attributesOfItem(atPath: result.url.resolvingSymlinksInPath().path)) : nil
+        let display = target ?? attributes
+        let dates = try? result.url.resourceValues(forKeys: [.creationDateKey, .contentAccessDateKey])
+        let mode = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        var permissions = isLink ? "l" : (display[.type] as? FileAttributeType == .typeDirectory ? "d" : "-")
+        for (read, write, execute, special, lower, upper) in [
+            (0o400, 0o200, 0o100, 0o4000, "s", "S"),
+            (0o040, 0o020, 0o010, 0o2000, "s", "S"),
+            (0o004, 0o002, 0o001, 0o1000, "t", "T")
+        ] {
+            permissions += mode & read != 0 ? "r" : "-"
+            permissions += mode & write != 0 ? "w" : "-"
+            permissions += mode & special != 0 ? (mode & execute != 0 ? lower : upper) : (mode & execute != 0 ? "x" : "-")
+        }
+        try result.verifyCurrent()
+        return FileEntry(
+            url: result.url, name: result.name,
+            isDirectory: display[.type] as? FileAttributeType == .typeDirectory,
+            isSymbolicLink: isLink, size: (display[.size] as? NSNumber)?.int64Value ?? 0,
+            modified: display[.modificationDate] as? Date,
+            created: dates?.creationDate ?? display[.creationDate] as? Date,
+            accessed: dates?.contentAccessDate, permissions: permissions,
+            owner: attributes[.ownerAccountName] as? String ?? ""
+        )
+    }
+
+    private func load(_ url: URL?, preserveSelection: Bool, selectName: String? = nil, historyAction: HistoryAction) {
+        restoreDirectorySnapshot()
+        let target = (url ?? directory).standardizedFileURL
+        generation += 1
+        let token = generation
+        loading = true
+        summary.stringValue = "Чтение папки…"
+        let hidden = showHidden
+        Task {
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try FileService.list(target, showHidden: hidden)
+                }.value
+                guard token == generation else { return }
+                let resetSelection = target != directory || !preserveSelection
+                if target != directory {
+                    filterField.stringValue = ""
+                    endQuickFind(focusTable: false)
+                }
+                switch historyAction {
+                case .visit: navigation.visit(target.path)
+                case .back: navigation.commitBack()
+                case .forward: navigation.commitForward()
+                case .restore: break
+                }
+                if historyAction != .restore { persistNavigation() }
+                directory = target
+                entries = FileService.sorted(result, options: sortOptions, markedIDs: selection.markedIDs)
+                pathField.stringValue = target.path
+                UserDefaults.standard.set(target.path, forKey: "panel.\(locationKey)")
+                loading = false
+                applyFilter(resetSelection: resetSelection, selectName: selectName)
+                onDirectoryChange?(self)
+            } catch {
+                guard token == generation else { return }
+                loading = false
+                pathField.stringValue = directory.path
+                summary.stringValue = "Не удалось прочитать папку"
+                onError?(error)
+            }
+        }
+    }
+
+    var cursorEntry: FileEntry? {
+        guard !loading, let entry = entry(at: table.selectedRow), validateResults([entry]) else { return nil }
+        return entry
+    }
+    var selectedEntries: [FileEntry] {
+        guard !loading else { return [] }
+        let ids = Set(selection.operationIDs(orderedIDs: visible.map(\.id)))
+        let selected = visible.filter { ids.contains($0.id) }
+        // Reject the entire requested batch if any source is stale; never fall back to the cursor.
+        return validateResults(selected) ? selected : []
+    }
+
+    /// Carry the original snapshots across dialogs so submission can recheck the same sources.
+    func capturedSearchResults(for entries: [FileEntry]) -> [SearchResult] {
+        guard isTemporary else { return [] }
+        return entries.compactMap { searchResults[$0.id] }
+    }
+
+    private func validateResults(_ candidates: [FileEntry]) -> Bool {
+        guard isTemporary else { return true }
+        var invalid = Set<String>()
+        var firstError: Error?
+        for entry in candidates {
+            do {
+                guard let result = searchResults[entry.id] else {
+                    throw NSError(domain: "FarMac.Search", code: 1, userInfo: [NSLocalizedDescriptionKey: "Результат поиска больше недоступен: «\(entry.url.path)»."])
+                }
+                try result.verifyCurrent()
+            } catch { invalid.insert(entry.id); if firstError == nil { firstError = error } }
+        }
+        guard !invalid.isEmpty else { return true }
+        metadataTask?.cancel()
+        metadataTask = nil
+        generation += 1
+        loading = false
+        for id in invalid { searchResults.removeValue(forKey: id) }
+        removedResultCount += invalid.count
+        entries.removeAll { invalid.contains($0.id) }
+        applyFilter()
+        if let firstError { onError?(firstError) }
+        return false
+    }
+
+    func saveSelectionForOperation() { selection.saveMarks(); shiftMarking = nil }
+
+    func toggleMarkAndAdvance() {
+        guard !loading else { return }
+        shiftMarking = nil
+        selection.saveMarks()
+        if let entry = cursorEntry { selection.toggle(entry.id) }
+        moveCursor(to: table.selectedRow + 1)
+        reloadMarks()
+    }
+    func markAll() {
+        guard !loading else { return }
+        selection.saveMarks()
+        shiftMarking = nil
+        selection.setMarked(visible.map(\.id), marked: true)
+        reloadMarks()
+    }
+    /// Clearing after an operation keeps its pre-operation snapshot available to Ctrl+M.
+    func clearMarks() {
+        shiftMarking = nil
+        selection.clearMarks()
+        reloadMarks()
+    }
+    func restoreMarks() {
+        guard !loading else { return }
+        shiftMarking = nil
+        selection.restoreMarks(validIDs: visible.map(\.id))
+        reloadMarks()
+    }
+    func invertMarks(includeDirectories: Bool = false) {
+        guard !loading else { return }
+        selection.saveMarks()
+        shiftMarking = nil
+        // Default FAR inversion also removes previously marked directories.
+        let ids = visible.filter { includeDirectories || !$0.isDirectory || selection.markedIDs.contains($0.id) }.map(\.id)
+        selection.invert(ids)
+        reloadMarks()
+    }
+    func invertFilesAndClearDirectories() { invertMarks() }
+    func selectSameExtension(mark: Bool) {
+        guard let current = cursorEntry, !loading else { return }
+        let ext = current.url.pathExtension
+        let ids = visible.filter {
+            (!mark || !$0.isDirectory) && $0.url.pathExtension.caseInsensitiveCompare(ext) == .orderedSame
+        }.map(\.id)
+        selection.saveMarks()
+        shiftMarking = nil
+        selection.setMarked(ids, marked: mark)
+        reloadMarks()
+    }
+    func selectSameName(mark: Bool) {
+        guard let current = cursorEntry, !loading else { return }
+        let base = current.url.deletingPathExtension().lastPathComponent
+        let ids = visible.filter {
+            (!mark || !$0.isDirectory) && $0.url.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(base) == .orderedSame
+        }.map(\.id)
+        selection.saveMarks()
+        shiftMarking = nil
+        selection.setMarked(ids, marked: mark)
+        reloadMarks()
+    }
+    func applyMask(_ expression: String, mark: Bool, includeDirectories: Bool = false) throws {
+        let mask = try FileMask(expression, groups: maskGroups)
+        guard !loading else { return }
+        // Evaluate the complete batch before changing any marks; timeout is atomic.
+        let matches = try mask.matchingNames(visible.map(\.name), timeLimit: 0.25)
+        let ids = visible.filter { (!mark || includeDirectories || !$0.isDirectory) && matches.contains($0.name) }.map(\.id)
+        selection.saveMarks()
+        shiftMarking = nil
+        selection.setMarked(ids, marked: mark)
+        reloadMarks()
+    }
+
+    private var pageRowCount: Int {
+        max(1, Int((table.enclosingScrollView?.contentSize.height ?? table.visibleRect.height) / (table.rowHeight + table.intercellSpacing.height)))
+    }
+    private func handleSelectionKey(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if !modifiers.contains(.shift) { shiftMarking = nil }
+        if modifiers == [.control], event.keyCode == 46 { restoreMarks(); return true }
+        if modifiers == [.option], event.keyCode == 67 { invertFilesAndClearDirectories(); return true }
+        guard modifiers.isEmpty || modifiers == [.shift] else { return false }
+        let next: Int
+        switch event.keyCode {
+        case 114, 49:
+            guard modifiers.isEmpty else { return false }
+            toggleMarkAndAdvance()
+            return true
+        case 125: next = table.selectedRow + 1
+        case 126: next = table.selectedRow - 1
+        case 115: next = 0
+        case 119: next = table.numberOfRows - 1
+        case 116: next = table.selectedRow - pageRowCount
+        case 121: next = table.selectedRow + pageRowCount
+        default: return false
+        }
+        let nextRow = min(max(next, 0), max(0, table.numberOfRows - 1))
+        if modifiers.contains(.shift) {
+            guard !loading else { return true }
+            if shiftMarking == nil {
+                selection.saveMarks()
+                // Starting on `..` derives the gesture from the next real row, as in P1.
+                let startEntry = cursorEntry ?? entry(at: nextRow)
+                shiftMarking = !(startEntry.map { selection.markedIDs.contains($0.id) } ?? false)
+            }
+            // As with Shift+arrows, mark each departed row, excluding the destination.
+            let start = max(table.selectedRow, 0)
+            let rows: [Int]
+            if nextRow > start { rows = Array(start..<nextRow) }
+            else if nextRow < start { rows = Array(stride(from: start, to: nextRow, by: -1)) }
+            else { rows = [start] }
+            selection.setMarked(rows.compactMap { entry(at: $0)?.id }, marked: shiftMarking ?? true)
+            moveCursor(to: nextRow)
+            reloadMarks()
+        } else { moveCursor(to: nextRow) }
+        return true
+    }
+
+    private func handleSelectionMouse(_ event: NSEvent) -> Bool {
+        shiftMarking = nil
+        let row = table.row(at: table.convert(event.locationInWindow, from: nil))
+        guard row >= 0 else { return false }
+        if loading && !event.modifierFlags.intersection([.command, .shift]).isEmpty { return true }
+        if event.modifierFlags.contains(.command) {
+            selection.saveMarks()
+            if let entry = entry(at: row) { selection.toggle(entry.id) }
+        } else if event.modifierFlags.contains(.shift) {
+            selection.saveMarks()
+            let anchor = max(table.selectedRow, 0)
+            let marked = cursorEntry.map { !selection.markedIDs.contains($0.id) } ?? true
+            let ids = (min(anchor, row)...max(anchor, row)).compactMap { entry(at: $0)?.id }
+            selection.setMarked(ids, marked: marked)
+        } else { return false }
+        focus()
+        moveCursor(to: row)
+        reloadMarks()
+        return true
+    }
+
+    private func moveCursor(to requestedRow: Int) {
+        guard table.numberOfRows > 0 else {
+            table.deselectAll(nil)
+            selection.focus(nil)
+            updateSummary()
+            return
+        }
+        let row = min(max(requestedRow, 0), table.numberOfRows - 1)
+        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        selection.focus(entry(at: row)?.id)
+        table.scrollRowToVisible(row)
+        updateSummary()
+    }
+
+    private func reloadMarks() {
+        if sortOptions.sort == .selected {
+            resortKeepingCursor()
+            return
+        }
+        guard table.numberOfRows > 0 else { updateSummary(); return }
+        table.reloadData(forRowIndexes: IndexSet(integersIn: 0..<table.numberOfRows), columnIndexes: IndexSet(integer: 0))
+        updateSummary()
+    }
+    func entry(at row: Int) -> FileEntry? {
+        let index = row - offset
+        return visible.indices.contains(index) ? visible[index] : nil
+    }
+    func focus() { window?.makeFirstResponder(table) }
+    func focusPath() { onFocus?(self); window?.makeFirstResponder(pathField); pathField.selectText(nil) }
+    func focusFilter() { onFocus?(self); window?.makeFirstResponder(filterField) }
+    func clearFilter() { filterField.stringValue = ""; applyFilter(); focus() }
+
+    @objc func parent() {
+        onFocus?(self)
+        if isTemporary { leaveSearchResults(); return }
+        guard directory.path != "/" else { return }
+        load(directory.deletingLastPathComponent(), preserveSelection: false, selectName: directory.lastPathComponent)
+    }
+    @objc func goToPath() {
+        onFocus?(self)
+        let path = (pathField.stringValue as NSString).expandingTildeInPath
+        let url = path.hasPrefix("/") ? URL(fileURLWithPath: path) : directory.appendingPathComponent(path)
+        load(url, preserveSelection: false)
+        focus()
+    }
+    @objc func openSelection() {
+        guard !loading else { return }
+        if hasParent && table.selectedRow == 0 { parent(); return }
+        guard let entry = cursorEntry else { return }
+        if entry.isDirectory { load(entry.url, preserveSelection: false) }
+        else { onFileOpen?(entry) }
+    }
+    func goBack() {
+        if isTemporary { leaveSearchResults(); return }
+        guard let path = navigation.backPath, !loading else { return }
+        load(URL(fileURLWithPath: path), preserveSelection: false, historyAction: .back)
+    }
+    func goForward() {
+        if isTemporary { leaveSearchResults(); return }
+        guard let path = navigation.forwardPath, !loading else { return }
+        load(URL(fileURLWithPath: path), preserveSelection: false, historyAction: .forward)
+    }
+    func navigateHistory(to path: String) {
+        load(URL(fileURLWithPath: path), preserveSelection: false)
+        focus()
+    }
+    private func persistNavigation() {
+        if let data = try? JSONEncoder().encode(navigation) {
+            UserDefaults.standard.set(data, forKey: "panel.\(locationKey).history")
+        }
+    }
+
+    func focusQuickFind() {
+        onFocus?(self)
+        quickFindField.isHidden = false
+        window?.makeFirstResponder(quickFindField)
+        quickFindField.selectText(nil)
+    }
+    private func endQuickFind(focusTable: Bool = true) {
+        quickFindField.stringValue = ""
+        quickFindField.isHidden = true
+        if focusTable { focus() }
+    }
+    private func handleQuickFindKey(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if modifiers == [.option] || modifiers == [.option, .shift], let characters = event.charactersIgnoringModifiers,
+           !characters.isEmpty, characters.unicodeScalars.allSatisfy({ CharacterSet.letters.contains($0) }) {
+            focusQuickFind()
+            quickFindField.stringValue = characters
+            // Focus selects existing contents; put insertion at the end of the first letter.
+            (quickFindField.currentEditor() as? NSTextView)?.selectedRange = NSRange(location: characters.utf16.count, length: 0)
+            findQuickMatch(backwards: false, includeCurrent: true)
+            return true
+        }
+        if !quickFindField.isHidden, event.keyCode == 53 { endQuickFind(); return true }
+        if !quickFindField.isHidden, [36, 76].contains(event.keyCode),
+           modifiers == [.control] || modifiers == [.control, .shift] {
+            findNext(backwards: modifiers.contains(.shift))
+            return true
+        }
+        return false
+    }
+    func findNext(backwards: Bool = false) { findQuickMatch(backwards: backwards, includeCurrent: false) }
+    private func findQuickMatch(backwards: Bool, includeCurrent: Bool) {
+        guard !loading, !visible.isEmpty, !quickFindField.stringValue.isEmpty else { return }
+        do {
+            // Quick find accepts only * and ? as wildcards; all other filename text is literal.
+            let prefix = quickFindField.stringValue.precomposedStringWithCanonicalMapping.map { character -> String in
+                switch character {
+                case "*": return ".*"
+                case "?": return "."
+                default:
+                    return NSRegularExpression.escapedPattern(for: String(character))
+                        .replacingOccurrences(of: "/", with: "\\/")
+                }
+            }.joined()
+            let mask = try FileMask("/^" + prefix + "/i")
+            let matches = try mask.matchingNames(visible.map(\.name), timeLimit: 0.25)
+            let current = visible.firstIndex { $0.id == selection.cursorID } ?? (backwards ? 0 : visible.count - 1)
+            let firstStep = includeCurrent && cursorEntry != nil ? 0 : 1
+            for step in firstStep..<(visible.count + firstStep) {
+                let index = (current + (backwards ? -step : step) + visible.count * 2) % visible.count
+                if matches.contains(visible[index].name) {
+                    moveCursor(to: index + offset)
+                    quickFindField.toolTip = nil
+                    return
+                }
+            }
+            quickFindField.toolTip = "Совпадений нет"
+        } catch {
+            quickFindField.toolTip = error.localizedDescription
+        }
+    }
+    func controlTextDidChange(_ obj: Notification) {
+        onFocus?(self)
+        if let field = obj.object as? NSControl, field === quickFindField {
+            // Let the field editor own IME composition and normal macOS editing keys.
+            if let editor = quickFindField.currentEditor() as? NSTextView, editor.hasMarkedText() { return }
+            findQuickMatch(backwards: false, includeCurrent: true)
+        } else { applyFilter() }
+    }
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if control === quickFindField {
+            if textView.hasMarkedText() { return false }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) { endQuickFind(); return true }
+            let event = NSApp.currentEvent
+            let modifiers = event?.modifierFlags ?? []
+            // Control+Return can be translated to insertLineBreak/insertNewlineIgnoringFieldEditor.
+            if modifiers.contains(.control), let key = event?.keyCode, [36, 76].contains(key) {
+                findNext(backwards: modifiers.contains(.shift))
+                return true
+            }
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) { focus(); return true }
+            return false
+        }
+        guard control === filterField else { return false }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) { clearFilter(); return true }
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) { focus(); return true }
+        return false
+    }
+
+    func setSort(_ value: FileSort) {
+        var options = sortOptions
+        options.sort = value
+        setSortOptions(options)
+    }
+    func toggleSortDirection() {
+        var options = sortOptions
+        options.ascending.toggle()
+        setSortOptions(options)
+    }
+    func setSortOptions(_ options: FileSortOptions) {
+        sortOptions = options
+        if !isTemporary, let data = try? JSONEncoder().encode(options) {
+            UserDefaults.standard.set(data, forKey: "panel.\(locationKey).sort")
+        }
+        updateColumnTitles()
+        resortKeepingCursor()
+    }
+    private func resortKeepingCursor() {
+        let gesture = shiftMarking
+        entries = FileService.sorted(entries, options: sortOptions, markedIDs: selection.markedIDs)
+        applyFilter()
+        shiftMarking = gesture
+    }
+
+    func setDisplayMode(_ mode: PanelDisplayMode) {
+        displayMode = mode
+        if !isTemporary { UserDefaults.standard.set(mode.rawValue, forKey: "panel.\(locationKey).display") }
+        updateColumns()
+    }
+    func setVisibleColumns(_ ids: Set<String>) {
+        customColumnIDs = ids.intersection(Set(Self.columnDefinitions.map(\.id))).union(["name"])
+        customColumnIDs.remove("origin")
+        if !isTemporary { UserDefaults.standard.set(customColumnIDs.sorted(), forKey: "panel.\(locationKey).columns") }
+        setDisplayMode(.custom)
+    }
+    func setColorizeFiles(_ enabled: Bool) {
+        colorizeFiles = enabled
+        if !isTemporary { UserDefaults.standard.set(enabled, forKey: "panel.\(locationKey).colorize") }
+        table.reloadData()
+    }
+    private func updateColumns() {
+        switch displayMode {
+        case .brief: visibleColumnIDs = ["name"]
+        case .full: visibleColumnIDs = ["name", "size", "modified", "permissions", "owner"]
+        case .custom: visibleColumnIDs = customColumnIDs
+        }
+        if isTemporary { visibleColumnIDs.insert("origin") }
+        else { visibleColumnIDs.remove("origin") }
+        for column in table.tableColumns { column.isHidden = !visibleColumnIDs.contains(column.identifier.rawValue) }
+        updateColumnTitles()
+        table.sizeLastColumnToFit()
+    }
+    private func updateColumnTitles() {
+        for column in table.tableColumns {
+            let id = column.identifier.rawValue
+            let name = Self.columnDefinitions.first { $0.id == id }?.title ?? id
+            column.title = name + (sortOptions.sort.rawValue == id ? (sortOptions.ascending ? " ↑" : " ↓") : "")
+        }
+    }
+    private static let columnDefinitions: [(id: String, title: String, width: CGFloat)] = [
+        ("name", "Имя", 280), ("size", "Размер", 85), ("modified", "Изменён", 125),
+        ("extension", "Расширение", 90), ("created", "Создан", 125), ("accessed", "Открыт", 125),
+        ("permissions", "Права", 100), ("owner", "Владелец", 100),
+        ("origin", "Исходная папка", 320)
+    ]
+
+    private func applyFilter(resetSelection: Bool = false, selectName: String? = nil) {
+        let oldRow = table.selectedRow
+        let oldCursorID = selection.cursorID
+        let wasParent = hasParent && oldRow == 0
+        let query = filterField.stringValue
+        visible = query.isEmpty ? entries : entries.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        hasParent = !isTemporary && directory.path != "/" && query.isEmpty
+        // Filtering also drops hidden marks so file operations cannot target unseen rows.
+        selection.reconcile(validIDs: visible.map(\.id), reset: resetSelection)
+        if sortOptions.sort == .selected {
+            entries = FileService.sorted(entries, options: sortOptions, markedIDs: selection.markedIDs)
+            visible = query.isEmpty ? entries : entries.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        }
+        shiftMarking = nil
+        let row: Int
+        if let selectName, let index = visible.firstIndex(where: { $0.name == selectName }) { row = index + offset }
+        else if !resetSelection, wasParent, hasParent { row = 0 }
+        else if !resetSelection, let oldCursorID, let index = visible.firstIndex(where: { $0.id == oldCursorID }) { row = index + offset }
+        else { row = resetSelection ? 0 : max(oldRow, 0) }
+        synchronizingTable = true
+        table.reloadData()
+        moveCursor(to: row)
+        synchronizingTable = false
+        updateSummary()
+    }
+    private func updateActive() {
+        layer?.borderColor = (active ? Palette.accent.withAlphaComponent(0.7) : Palette.raised).cgColor
+        title.stringValue = "\(active ? "●" : "○")  \(locationKey == "left" ? "ЛЕВАЯ ПАНЕЛЬ" : "ПРАВАЯ ПАНЕЛЬ")\(active ? "  /  АКТИВНА" : "")"
+        if let temporaryTitle { title.stringValue += "  /  " + temporaryTitle }
+        title.textColor = active ? Palette.accent : Palette.muted
+        table.enumerateAvailableRowViews { row, _ in (row as? FileRow)?.active = self.active; row.needsDisplay = true }
+    }
+    private func updateSummary() {
+        let marked = visible.filter { selection.markedIDs.contains($0.id) }
+        let count = visible.filter(\.isDirectory).count
+        let total = "Папки: \(count)  ·  Файлы: \(visible.count - count)"
+        if marked.isEmpty {
+            summary.stringValue = total + (!isTemporary && showHidden ? "  ·  скрытые видны" : "")
+        } else {
+            let bytes = marked.filter { !$0.isDirectory }.reduce(Int64(0)) { $0 + $1.size }
+            summary.stringValue = "Отмечено: \(marked.count)  ·  \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))  ·  \(total)"
+        }
+        if isTemporary {
+            summary.stringValue += "  ·  Результатов: \(entries.count)"
+            if removedResultCount > 0 { summary.stringValue += "  ·  Недоступны/заменены: \(removedResultCount)" }
+        }
+    }
+    func numberOfRows(in tableView: NSTableView) -> Int { visible.count + offset }
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard !synchronizingTable else { return }
+        selection.focus(entry(at: table.selectedRow)?.id)
+        updateSummary()
+    }
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let view = FileRow(); view.active = active; return view
+    }
+    func tableView(_ tableView: NSTableView, didClick tableColumn: NSTableColumn) {
+        guard let value = FileSort(rawValue: tableColumn.identifier.rawValue) else { return }
+        if sortOptions.sort == value { toggleSortDirection() } else { setSort(value) }
+        onFocus?(self)
+    }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let column = tableColumn?.identifier.rawValue else { return nil }
+        let entry = entry(at: row)
+        let cell = NSTableCellView()
+        let text: String
+        switch column {
+        case "name": text = entry.map { $0.name + ($0.isSymbolicLink ? " ↗" : "") } ?? ".."
+        case "size": text = entry.map { $0.isDirectory ? "<папка>" : ByteCountFormatter.string(fromByteCount: $0.size, countStyle: .file) } ?? ""
+        case "extension": text = entry?.url.pathExtension ?? ""
+        case "created": text = entry?.created.map { Self.dateFormatter.string(from: $0) } ?? ""
+        case "accessed": text = entry?.accessed.map { Self.dateFormatter.string(from: $0) } ?? ""
+        case "permissions": text = entry?.permissions ?? ""
+        case "owner": text = entry?.owner ?? ""
+        case "origin": text = entry?.url.deletingLastPathComponent().path ?? ""
+        default: text = entry?.modified.map { Self.dateFormatter.string(from: $0) } ?? ""
+        }
+        let field = label(text, size: 12, color: column == "name" ? entryColor(entry) : Palette.muted)
+        field.translatesAutoresizingMaskIntoConstraints = false
+        if isTemporary { field.toolTip = entry?.url.path }
+        cell.addSubview(field)
+        cell.textField = field
+        var leading: CGFloat = 10
+        if column == "name" {
+            let icon = NSImageView()
+            icon.image = NSImage(systemSymbolName: entry == nil ? "arrow.turn.up.left" : entry!.isDirectory ? "folder.fill" : "doc", accessibilityDescription: nil)
+            icon.contentTintColor = entryColor(entry)
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(icon)
+            let marked = entry.map { selection.markedIDs.contains($0.id) } ?? false
+            let marker = label(marked ? "✓" : "", size: 12, color: Palette.accent, bold: true)
+            marker.setAccessibilityLabel(marked ? "Отмечен" : "Не отмечен")
+            marker.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(marker)
+            NSLayoutConstraint.activate([
+                marker.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 7),
+                marker.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                marker.widthAnchor.constraint(equalToConstant: 12)
+            ])
+            if marked { field.textColor = Palette.accent }
+            NSLayoutConstraint.activate([icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 25), icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor), icon.widthAnchor.constraint(equalToConstant: 15), icon.heightAnchor.constraint(equalToConstant: 15)])
+            leading = 49
+        }
+        NSLayoutConstraint.activate([field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: leading), field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8), field.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
+        return cell
+    }
+    private func entryColor(_ entry: FileEntry?) -> NSColor {
+        guard let entry else { return Palette.accent }
+        guard colorizeFiles else { return Palette.text }
+        if entry.isSymbolicLink { return NSColor(calibratedRed: 0.77, green: 0.62, blue: 1, alpha: 1) }
+        if entry.isDirectory { return .systemCyan }
+        if entry.permissions.contains("x") || entry.permissions.contains("s") || entry.permissions.contains("t") { return .systemGreen }
+        if ["zip", "gz", "bz2", "xz", "7z", "rar", "tar", "tgz", "dmg", "zst"].contains(entry.url.pathExtension.lowercased()) {
+            return NSColor(calibratedRed: 1, green: 0.77, blue: 0.42, alpha: 1)
+        }
+        return Palette.text
+    }
+    private static let dateFormatter: DateFormatter = {
+        let value = DateFormatter(); value.dateFormat = "dd.MM.yy HH:mm"; return value
+    }()
+}
