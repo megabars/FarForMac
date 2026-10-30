@@ -95,6 +95,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
         var state: State
         var summary: String
         var issues: [String]
+        var temporarySources: Bool? = nil
         var request: TransferRequest {
             TransferRequest(sources: sources.map { URL(fileURLWithPath: $0) }, destination: URL(fileURLWithPath: destination), move: move)
         }
@@ -106,6 +107,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
     var onFinished: ((TransferResult) -> Void)?
     var hasPendingOperations: Bool { jobs.contains { $0.state.pending } }
     private var jobs: [Job] = []
+    private var temporaryResources: [UUID: AnyObject] = [:]
     // Keep the enqueue-time source fingerprints captured by TransferRequest.
     private var runtimeRequests: [UUID: TransferRequest] = [:]
     private var activeID: UUID?
@@ -143,12 +145,12 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func enqueue(_ request: TransferRequest) {
-        guard !request.sources.isEmpty else { return }
+    @discardableResult func enqueue(_ request: TransferRequest, retaining resource: AnyObject? = nil) -> Bool {
+        guard !request.sources.isEmpty else { return false }
         guard canEnqueue?() ?? true else {
             heading.stringValue = "Добавление недоступно: дождитесь завершения текущего изменения файлов."
             showWindow(nil)
-            return
+            return false
         }
         guard jobs.filter({ $0.state.pending }).count < 100 else {
             let alert = NSAlert()
@@ -156,9 +158,11 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
             alert.informativeText = "Дождитесь завершения или отмените часть заданий перед добавлением новых."
             alert.beginSheetModal(for: window!)
             showWindow(nil)
-            return
+            return false
         }
-        let job = Job(id: UUID(), sources: request.sources.map(\.path), destination: request.destination.path, move: request.move, created: Date(), state: .queued, summary: "Ожидает выполнения", issues: [])
+        var job = Job(id: UUID(), sources: request.sources.map(\.path), destination: request.destination.path, move: request.move, created: Date(), state: .queued, summary: "Ожидает выполнения", issues: [])
+        job.temporarySources = resource != nil
+        temporaryResources[job.id] = resource
         runtimeRequests[job.id] = request
         jobs.append(job)
         trimJournal()
@@ -167,6 +171,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
         showWindow(nil)
         onChange?()
         startNext()
+        return true
     }
 
     func cancelAll() {
@@ -174,6 +179,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
             jobs[index].state = .cancelled
             jobs[index].summary = "Отменено до начала выполнения."
             runtimeRequests.removeValue(forKey: jobs[index].id)
+            temporaryResources.removeValue(forKey: jobs[index].id)
         }
         cancelActive()
         persist()
@@ -294,9 +300,10 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
     private func finish(_ result: TransferResult, id: UUID) {
         guard activeID == id, let index = jobs.firstIndex(where: { $0.id == id }) else { return }
         jobs[index].state = result.cancelled ? .cancelled : result.failed > 0 ? (result.completed > 0 ? .partial : .failed) : result.skipped > 0 ? .partial : .completed
-        jobs[index].summary = result.summary
+        jobs[index].summary = result.summary + (jobs[index].temporarySources == true ? " Для повтора снова извлеките объекты из архива." : "")
         jobs[index].issues = result.issues
         runtimeRequests.removeValue(forKey: id)
+        temporaryResources.removeValue(forKey: id)
         activeID = nil; cancellation = nil; cancelDecision = nil; decisionAlert = nil
         conflictPolicies.removeAll()
         heading.stringValue = jobs[index].state.title + ": " + jobs[index].title
@@ -401,12 +408,13 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
         if jobs[index].state == .queued {
             jobs[index].state = .cancelled; jobs[index].summary = "Отменено до начала выполнения."
             runtimeRequests.removeValue(forKey: jobs[index].id)
+            temporaryResources.removeValue(forKey: jobs[index].id)
         } else if jobs[index].id == activeID { cancelActive() }
         persist(); refreshUI(); onChange?()
     }
     @objc private func cancelAllAction() { cancelAll() }
     @objc private func retrySelected() {
-        guard let index = selectedIndex, !jobs[index].state.pending else { return }
+        guard let index = selectedIndex, !jobs[index].state.pending, jobs[index].temporarySources != true else { return }
         enqueue(jobs[index].request)
     }
     @objc private func clearHistory() {
@@ -434,7 +442,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
         }
         let job = jobs[index]
         cancelButton.isEnabled = job.state == .queued || job.state == .running
-        retryButton.isEnabled = !job.state.pending
+        retryButton.isEnabled = !job.state.pending && job.temporarySources != true
         let date = DateFormatter.localizedString(from: job.created, dateStyle: .short, timeStyle: .medium)
         details.string = "\(job.title)\n\(date) • \(job.state.title)\nНазначение: \(job.destination)\nИсточники:\n\(job.sources.joined(separator: "\n"))\n\n\(job.summary)" + (job.issues.isEmpty ? "" : "\n\nОшибки и замечания:\n" + job.issues.joined(separator: "\n"))
     }

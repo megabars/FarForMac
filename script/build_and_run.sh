@@ -30,14 +30,16 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>FarForMac</string>
 <key>CFBundleDisplayName</key><string>FarForMac</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>0.2.0</string>
+<key>CFBundleVersion</key><string>2</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSHumanReadableCopyright</key><string>FarForMac — independent macOS file manager.</string>
 </dict></plist>
 PLIST
+mkdir -p "$APP_BUNDLE/Contents/Resources"
+cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$APP_BUNDLE/Contents/Resources/THIRD_PARTY_NOTICES.md"
 codesign --force --sign - "$APP_BUNDLE"
 case "$MODE" in
     --build-only) echo "$APP_BUNDLE" ;;

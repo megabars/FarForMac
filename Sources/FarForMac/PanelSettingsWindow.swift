@@ -25,6 +25,7 @@ final class PanelSettingsWindow: NSWindowController {
     private let caseSensitive = NSButton(checkboxWithTitle: "Учитывать регистр", target: nil, action: nil)
     private let natural = NSButton(checkboxWithTitle: "Естественный порядок: file2 перед file10", target: nil, action: nil)
     private let colors = NSButton(checkboxWithTitle: "Раскрашивать папки, ссылки, программы и архивы", target: nil, action: nil)
+    private let resetWidths = NSButton(checkboxWithTitle: "Восстановить стандартные ширины колонок", target: nil, action: nil)
     private var columns: [String: NSButton] = [:]
     private let modes: [PanelDisplayMode] = [.brief, .full, .custom]
 
@@ -52,7 +53,7 @@ final class PanelSettingsWindow: NSWindowController {
         rows.orientation = .vertical; rows.alignment = .leading; rows.spacing = 10
         for view in [heading, note, horizontal([label("Сортировать по", bold: true), sortPicker]), ascending, directories, caseSensitive, natural, horizontal([label("Режим", bold: true), modePicker]), colors] { rows.addArrangedSubview(view) }
         rows.addArrangedSubview(label("Колонки в своём режиме (имя всегда видно)", bold: true))
-        let columnNames = [("size", "Размер"), ("modified", "Изменён"), ("extension", "Расширение"), ("created", "Создан"), ("accessed", "Доступ"), ("permissions", "Права POSIX"), ("owner", "Владелец")]
+        let columnNames = [("size", "Размер"), ("modified", "Изменён"), ("extension", "Расширение"), ("created", "Создан"), ("accessed", "Доступ"), ("permissions", "Права POSIX"), ("owner", "Владелец"), ("description", "Описание")]
         for chunk in stride(from: 0, to: columnNames.count, by: 3) {
             let group = horizontal([])
             for (id, title) in columnNames[chunk..<min(chunk + 3, columnNames.count)] {
@@ -64,6 +65,7 @@ final class PanelSettingsWindow: NSWindowController {
         }
         let hint = label("При большом числе колонок доступна горизонтальная прокрутка.", size: 11, color: Palette.muted)
         rows.addArrangedSubview(hint)
+        rows.addArrangedSubview(resetWidths)
         let apply = NSButton(title: "Применить", target: self, action: #selector(applySettings))
         apply.bezelStyle = .rounded; apply.keyEquivalent = "\r"
         let cancel = NSButton(title: "Отмена", target: self, action: #selector(cancelSettings))
@@ -94,6 +96,7 @@ final class PanelSettingsWindow: NSWindowController {
             panel.setVisibleColumns(Set(columns.compactMap { $0.value.state == .on ? $0.key : nil }).union(["name"]))
         }
         panel.setColorizeFiles(colors.state == .on)
+        if resetWidths.state == .on { panel.resetColumnWidths() }
         close()
     }
 }

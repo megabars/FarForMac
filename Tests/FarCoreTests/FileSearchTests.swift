@@ -287,9 +287,21 @@ struct FileSearchTests {
         var options = SearchOptions(roots: [tree.root])
         options.contentMode = .regex; options.contentQuery = "^(a+)+$"
         let cancellation = SearchCancellation()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.005) { cancellation.cancel() }
+        // A dedicated cancellation thread avoids competing with concurrent regex
+        // tests on the global pool. Start its delay only when the file is reached.
+        let ready = DispatchSemaphore(value: 0), reachedFile = DispatchSemaphore(value: 0)
+        let cancelThread = Thread {
+            ready.signal()
+            guard reachedFile.wait(timeout: .now() + 2) == .success else { return }
+            Thread.sleep(forTimeInterval: 0.005)
+            cancellation.cancel()
+        }
+        cancelThread.qualityOfService = .userInteractive
+        cancelThread.start(); ready.wait()
         let start = ProcessInfo.processInfo.systemUptime
-        let summary = SearchEngine.run(SearchRequest(options: options), cancellation: cancellation) { _ in }
+        let summary = SearchEngine.run(SearchRequest(options: options), cancellation: cancellation) { event in
+            if case .progress(let progress) = event, progress.currentPath.hasSuffix("hard.txt") { reachedFile.signal() }
+        }
         #expect(summary.cancelled)
         #expect(summary.matches == 0)
         #expect(summary.errors == 0)

@@ -45,7 +45,7 @@ public final class SearchCancellation: @unchecked Sendable {
     public var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
 }
 
-public struct SearchResult: Identifiable, Sendable {
+public struct SearchResult: Identifiable, Codable, Sendable {
     public var id: String { url.path }
     public let url: URL
     public let name: String
@@ -57,6 +57,20 @@ public struct SearchResult: Identifiable, Sendable {
     public let lineNumber: Int?
     fileprivate let stamp: SearchStamp
     fileprivate let contentStamp: SearchStamp?
+
+    /// Captures a manually added temporary-panel item without descending directories.
+    public static func capture(_ url: URL) throws -> SearchResult {
+        let url = url.standardizedFileURL
+        var value = stat()
+        guard url.isFileURL, lstat(url.path, &value) == 0 else {
+            throw SearchProblem("Объект недоступен: «\(url.path)».")
+        }
+        let stamp = SearchStamp(value)
+        guard let kind = stamp.kind else { throw SearchProblem("Этот тип объекта не поддерживается временной панелью.") }
+        return SearchResult(url: url, name: url.lastPathComponent, isDirectory: kind == .directory,
+                            isSymbolicLink: kind == .symbolicLink, size: stamp.size, modified: stamp.modified,
+                            snippet: nil, lineNumber: nil, stamp: stamp, contentStamp: nil)
+    }
 
     /// Rejects stale results before navigation, viewing or editing. A content result also
     /// verifies the followed target, including size and nanosecond modification time.
@@ -136,7 +150,7 @@ private struct SearchProblem: LocalizedError {
 }
 private struct SearchStopped: Error {}
 
-fileprivate struct SearchStamp: Equatable, Sendable {
+fileprivate struct SearchStamp: Equatable, Codable, Sendable {
     let device: dev_t
     let inode: ino_t
     let mode: mode_t
