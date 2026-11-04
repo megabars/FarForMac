@@ -66,15 +66,24 @@ No notarization or Gatekeeper acceptance is claimed until these checks succeed.
 
 ## Validation matrix and upgrade check
 
-CI is configured for `macos-14` and `macos-15-intel`, labels documented in
-[GitHub runner images](https://github.com/actions/runner-images). No hosted CI
-run has been performed as part of local implementation. It runs core tests,
-bundle validation, and a UI startup smoke on its actual
-recorded macOS/architecture runners. A green workflow proves only those recorded
-environments. Artifacts are separate architecture builds, not a universal app.
-macOS 14 minimum support, both processor families, external disks, TCC prompts,
-and clean-machine installation need actual successful runs; hosted runner names
-alone are not evidence. UI smoke requires a graphical login session.
+CI targets `macos-15` (arm64) and `macos-15-intel` (x86_64), with explicit
+Xcode 16.4 and Python 3.12. GitHub retired macOS 14 hosted images on 2026-11-02;
+see [runner images](https://github.com/actions/runner-images). The deployment
+target remains macOS 14, whose runtime compatibility still needs a separate host.
+
+The first hosted runs failed; fixes and subsequent results are recorded in
+[ACCEPTANCE.md](ACCEPTANCE.md). Each matrix job checks its actual architecture,
+runs core tests, packages and validates its bundle, and runs internal AppKit smoke.
+Python fixtures use the selected `python3` (or `FAR_TEST_PYTHON` override), report
+startup errors, and publish their ready ports atomically. A green run proves only
+its recorded OS/toolchain/architecture, not clean installation or manual UI use.
+
+CI stores build/test logs even on failure and retains artifacts for seven days.
+Documentation-only pushes do not start it; a manual dispatch remains available.
+Superseded runs on the same ref are cancelled. CI artifacts are separate
+architecture builds, not universal apps or published releases. External disks,
+TCC, sleep/wake, installation and migration still require actual checks.
+UI smoke requires a graphical login session.
 
 Before distribution, install the previous version in a disposable user account,
 set panel paths/preferences and a sample macro, close it normally, replace its

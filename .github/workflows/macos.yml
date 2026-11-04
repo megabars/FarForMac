@@ -1,35 +1,70 @@
 name: macOS validation
 on:
   push:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'docs/images/**'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'docs/images/**'
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: macos-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test-and-package:
-    # These runners are actual test environments, not a claim of macOS 14 coverage.
+    # macOS 14 hosted images retired on 2026-11-02. Deployment target 14
+    # remains unchanged; these runs do not establish macOS 14 compatibility.
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15-intel]
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Record actual environment
         run: |
           sw_vers
           uname -m
-          swift --version
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          test -d "$DEVELOPER_DIR"
+          xcrun swift --version
+          python3 --version
       - name: Core tests
-        run: script/test.sh
+        run: |
+          mkdir -p dist/validation
+          set -o pipefail
+          script/test.sh 2>&1 | tee dist/validation/core-tests.log
       - name: Build and validate release bundle
-        run: script/package_release.sh
+        run: |
+          set -o pipefail
+          script/package_release.sh 2>&1 | tee dist/validation/package.log
       - name: UI smoke
-        run: script/ui_smoke.sh
+        run: |
+          set -o pipefail
+          script/ui_smoke.sh 2>&1 | tee dist/validation/ui-smoke.log
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: FarForMac-${{ matrix.os }}
+          retention-days: 7
           path: |
             dist/*.zip
             dist/*.sha256
             dist/ui-smoke.json
+            dist/validation/*.log

@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import FarCore
 
-@Suite
+@Suite(.serialized)
 final class WebRemoteProviderTests {
     @Test func testMLSDUsesFactsAndPreservesNames() throws {
         let entries = try FTPRemoteProvider.parseListing(Data("type=cdir; .\r\ntype=file;size=42;modify=20261030123456;unique=abc; leading space.txt\r\ntype=dir; folder\r\n".utf8), path: "/base")
@@ -65,14 +65,29 @@ final class WebRemoteProviderTests {
         var connection = fixture.connection(.webdav); connection.timeoutSeconds = 1
         let provider = WebRemoteProvider(connection: connection, password: "memory-only-secret")
         let destination = fixture.root.appendingPathComponent("slow-output")
-        let start = Date()
-        webExpectThrows(try provider.download(path: "/slow", to: destination, resumeOffset: 0, cancellation: TransferCancellation(), progress: { _ in }))
-        #expect(Date().timeIntervalSince(start) < 2.5)
+        try Data("untouched".utf8).write(to: destination)
+        webExpectThrows(try provider.download(path: "/slow", to: destination, resumeOffset: 0, cancellation: TransferCancellation(), progress: { _ in })) { error in
+            // URLSession reports its timeout directly; verify the cause rather
+            // than measuring scheduling delays on a shared CI machine.
+            let failure = error as NSError
+            #expect(failure.domain == NSURLErrorDomain)
+            #expect(failure.code == NSURLErrorTimedOut)
+        }
+        #expect(try Data(contentsOf: destination) == Data("untouched".utf8))
+        // Give cancellation its own timeout so a transport timeout cannot satisfy
+        // this assertion on a busy runner. Existing destination bytes must survive.
+        connection.timeoutSeconds = 5
+        let cancellable = WebRemoteProvider(connection: connection, password: "memory-only-secret")
+        try Data("untouched".utf8).write(to: destination)
         let cancellation = TransferCancellation()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) { cancellation.cancel() }
-        let cancelledStart = Date()
-        webExpectThrows(try provider.download(path: "/slow", to: destination, resumeOffset: 0, cancellation: cancellation, progress: { _ in }))
-        #expect(Date().timeIntervalSince(cancelledStart) < 1)
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 0.15)
+            cancellation.cancel()
+        }
+        webExpectThrows(try cancellable.download(path: "/slow", to: destination, resumeOffset: 0, cancellation: cancellation, progress: { _ in })) { error in
+            #expect(error as? NetworkError == .cancelled)
+        }
+        #expect(try Data(contentsOf: destination) == Data("untouched".utf8))
     }
 
     @Test func testUntrustedCertificatesRejectedBeforeCredentials() throws {
@@ -153,18 +168,45 @@ private final class WebRemoteFixture {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("far-web-fixture-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let script = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("NetworkFixtures/web_remote_fixture.py")
-        process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = [script.path, root.path] + (tls ? ["tls"] : [])
-        process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-        try process.run()
+        // Respect the CI-selected Python rather than Apple's developer-tools shim.
+        // FAR_TEST_PYTHON also allows a specific interpreter in local runs.
+        let python = ProcessInfo.processInfo.environment["FAR_TEST_PYTHON"] ?? "python3"
+        process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [python, "-u", script.path, root.path] + (tls ? ["tls"] : [])
+        let diagnostics = root.appendingPathComponent("stderr.log")
+        _ = FileManager.default.createFile(atPath: diagnostics.path, contents: nil)
+        let stderr = try FileHandle(forWritingTo: diagnostics)
+        defer { try? stderr.close() }
+        process.standardOutput = FileHandle.nullDevice; process.standardError = stderr
+        do { try process.run() } catch {
+            try? FileManager.default.removeItem(at: root)
+            throw error
+        }
         let ready = root.appendingPathComponent("ports.json")
-        let deadline = Date().addingTimeInterval(5)
+        // Bound the handshake while allowing interpreter startup under CI load.
+        let startupTimeout: TimeInterval = 10
+        let deadline = ProcessInfo.processInfo.systemUptime + startupTimeout
+        let requiredPorts = tls ? ["http", "ftp", "https", "ftps"] : ["http", "ftp"]
         var values: [String: Int]?
-        while Date() < deadline && process.isRunning {
-            if let data = try? Data(contentsOf: ready), let result = try? JSONDecoder().decode([String: Int].self, from: data) { values = result; break }
+        while ProcessInfo.processInfo.systemUptime < deadline && process.isRunning {
+            if let data = try? Data(contentsOf: ready),
+               let result = try? JSONDecoder().decode([String: Int].self, from: data),
+               requiredPorts.allSatisfy({ (1...65535).contains(result[$0] ?? 0) }) {
+                values = result; break
+            }
             Thread.sleep(forTimeInterval: 0.02)
         }
-        guard let values else { process.terminate(); throw NSError(domain: "WebRemoteFixture", code: 1, userInfo: [NSLocalizedDescriptionKey: "Local fixture did not start."]) }
+        guard let values else {
+            let timedOut = process.isRunning
+            if timedOut { process.terminate() }
+            process.waitUntilExit()
+            let detail = (try? String(contentsOf: diagnostics, encoding: .utf8)) ?? ""
+            try? FileManager.default.removeItem(at: root)
+            let reason = timedOut ? "readiness handshake timed out after \(Int(startupTimeout)) seconds" : "exited with status \(process.terminationStatus)"
+            throw NSError(domain: "WebRemoteFixture", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Local fixture (\(python)) \(reason). stderr: \(detail.isEmpty ? "<empty>" : detail)"
+            ])
+        }
         ports = values
     }
     func connection(_ kind: NetworkProtocol) -> NetworkConnection {

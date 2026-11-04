@@ -187,7 +187,7 @@ if os.environ.get("FAR_WEB_FIXTURE_EXPORT_STATE") == "1":
     threading.Thread(target=export_state, daemon=True).start()
 if len(sys.argv) > 2 and sys.argv[2] == "tls":
     key = os.path.join(root, "key.pem"); cert = os.path.join(root, "cert.pem")
-    subprocess.run(["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-subj", "/CN=localhost", "-days", "1"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-subj", "/CN=localhost", "-days", "1"], check=True, timeout=4, stdout=subprocess.DEVNULL)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.load_cert_chain(cert, key)
     httpsd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DAV)
     httpsd.socket = context.wrap_socket(httpsd.socket, server_side=True)
@@ -208,5 +208,9 @@ if len(sys.argv) > 2 and sys.argv[2] == "tls":
     threading.Thread(target=httpsd.serve_forever, daemon=True).start()
     threading.Thread(target=tlsftpd.serve_forever, daemon=True).start()
     ports.update({"https": httpsd.server_port, "ftps": tlsftpd.server_address[1]})
-with open(os.path.join(root, "ports.json"), "w") as f: json.dump(ports, f)
+# Publish readiness only after every requested listener (including TLS) exists.
+# Atomic replacement prevents clients from observing a partial JSON document.
+ready_path = os.path.join(root, "ports.json")
+with open(ready_path + ".tmp", "w") as f: json.dump(ports, f)
+os.replace(ready_path + ".tmp", ready_path)
 threading.Event().wait()

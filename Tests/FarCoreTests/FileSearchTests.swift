@@ -67,6 +67,37 @@ struct FileSearchTests {
     }
 
     @Test
+    func literalSearchHandlesLargeUnicodeContentAndEscapesRegexSyntax() throws {
+        let tree = try SearchTree()
+        // Literal matching has bounded input and no user-supplied regex syntax.
+        // A valid large file must not become a visible skip just because the
+        // worker is descheduled during another test's expensive regex search.
+        let query = "🙂[ПрИвЕт]+(tail).*"
+        try tree.file("large.txt", String(repeating: "я", count: 1_000_000) + "\n" + query)
+        var options = SearchOptions(roots: [tree.root])
+        options.contentMode = .literal
+        options.contentQuery = "🙂[привет]+(tail).*"
+        let found = collect(options)
+        #expect(found.issues.isEmpty)
+        let result = try #require(found.results.first)
+        #expect(result.lineNumber == 2)
+        #expect(result.snippet?.contains(query) == true)
+        options.contentQuery = "🙂[привет]+(tail).+"
+        let absent = collect(options)
+        #expect(absent.summary.matches == 0)
+        #expect(absent.issues.isEmpty)
+        let cancellation = SearchCancellation()
+        let cancelled = SearchEngine.run(SearchRequest(options: options), cancellation: cancellation) { event in
+            if case .progress(let progress) = event, progress.currentPath.hasSuffix("large.txt") {
+                cancellation.cancel()
+            }
+        }
+        #expect(cancelled.cancelled)
+        #expect(cancelled.matches == 0)
+        #expect(cancelled.errors == 0)
+    }
+
+    @Test
     func contentLineNumbersRecognizeUnicodeAndLegacyNewlines() throws {
         let tree = try SearchTree()
         var options = SearchOptions(roots: [tree.root])

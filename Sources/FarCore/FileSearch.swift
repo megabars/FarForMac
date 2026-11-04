@@ -447,24 +447,30 @@ private final class SearchWorker {
         }
         if cancellation.isCancelled { throw SearchStopped() }
         guard let expression = plan.content else { return nil }
-        let deadline = ProcessInfo.processInfo.systemUptime + 0.05
+        // Escaped literal patterns cannot backtrack catastrophically. Keep their
+        // existing byte/query bounds and cooperative cancellation, without charging
+        // time spent descheduled on a busy machine to a regex complexity budget.
+        // Only user-supplied regex syntax needs the 50 ms execution deadline.
+        let nsText = text as NSString
+        let searchRange = NSRange(location: 0, length: nsText.length)
+        let deadline: TimeInterval? = plan.options.contentMode == .regex
+            ? ProcessInfo.processInfo.systemUptime + 0.05 : nil
         var match: NSRange?
         var timedOut = false
         var internalError = false
         expression.enumerateMatches(in: text, options: [.reportProgress, .reportCompletion],
-                                    range: NSRange(text.startIndex..., in: text)) { result, flags, stop in
+                                    range: searchRange) { result, flags, stop in
             if self.cancellation.isCancelled { stop.pointee = true }
-            else if ProcessInfo.processInfo.systemUptime >= deadline { timedOut = true; stop.pointee = true }
+            else if let deadline, ProcessInfo.processInfo.systemUptime >= deadline { timedOut = true; stop.pointee = true }
             else if flags.contains(.internalError) { internalError = true; stop.pointee = true }
             else if let result { match = result.range; stop.pointee = true }
         }
         if cancellation.isCancelled { throw SearchStopped() }
-        if timedOut || ProcessInfo.processInfo.systemUptime >= deadline {
+        if timedOut || deadline.map({ ProcessInfo.processInfo.systemUptime >= $0 }) == true {
             throw SearchProblem("Содержимое пропущено: превышено время проверки выражения (50 мс).")
         }
         if internalError { throw SearchProblem("Содержимое пропущено: ошибка выполнения регулярного выражения.") }
         guard let match else { return nil }
-        let nsText = text as NSString
         // Bound the snippet even for files consisting of a single very long line.
         var start = max(0, match.location - 80)
         var end = min(nsText.length, max(match.location + min(match.length, 160), match.location + 80))
