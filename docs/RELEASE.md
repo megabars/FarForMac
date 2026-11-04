@@ -71,8 +71,12 @@ Xcode 16.4 and Python 3.12. GitHub retired macOS 14 hosted images on 2026-11-02;
 see [runner images](https://github.com/actions/runner-images). The deployment
 target remains macOS 14, whose runtime compatibility still needs a separate host.
 
-The first hosted runs failed; fixes and subsequent results are recorded in
-[ACCEPTANCE.md](ACCEPTANCE.md). Each matrix job checks its actual architecture,
+The first hosted runs failed. After fixes,
+[run 41843216015](https://github.com/megabars/FarForMac/actions/runs/41843216015) succeeded
+on both arm64 macOS 15.8.2 and x86_64 macOS 15.7.9: each passed 291 core tests,
+the DNS-independent fixture regression, release packaging/verification and 19
+internal UI checks. Both used Xcode 16.4 / Swift 6.1.2 / Python 3.12.10.
+Exact results and remaining limitations are recorded in [ACCEPTANCE.md](ACCEPTANCE.md). Each matrix job checks its actual architecture,
 runs core tests, packages and validates its bundle, and runs internal AppKit smoke.
 Python fixtures use the selected `python3` (or `FAR_TEST_PYTHON` override), report
 startup errors, and publish their ready ports atomically. A green run proves only
