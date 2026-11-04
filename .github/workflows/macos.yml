@@ -33,8 +33,8 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Record actual environment
@@ -45,6 +45,11 @@ jobs:
           test -d "$DEVELOPER_DIR"
           xcrun swift --version
           python3 --version
+      - name: Loopback fixture startup without DNS
+        run: |
+          mkdir -p dist/validation
+          set -o pipefail
+          python3 -m unittest discover -s Tests/NetworkFixtures -v 2>&1 | tee dist/validation/fixture-startup.log
       - name: Core tests
         run: |
           mkdir -p dist/validation
@@ -58,7 +63,7 @@ jobs:
         run: |
           set -o pipefail
           script/ui_smoke.sh 2>&1 | tee dist/validation/ui-smoke.log
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: FarForMac-${{ matrix.os }}

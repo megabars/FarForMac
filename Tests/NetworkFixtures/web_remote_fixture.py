@@ -1,4 +1,8 @@
 """Loopback-only FTP + DAV conformance fixture, no third-party dependencies."""
+import sys
+print("web fixture: interpreter started", file=sys.stderr, flush=True)
+import faulthandler
+faulthandler.dump_traceback_later(5)
 import base64
 import http.server
 import json
@@ -7,12 +11,15 @@ import socket
 import socketserver
 import ssl
 import subprocess
-import sys
 import threading
 import time
 import urllib.parse
 import xml.sax.saxutils
 
+def startup_phase(message):
+    print("web fixture: " + message, file=sys.stderr, flush=True)
+
+startup_phase("stdlib imports complete")
 root = sys.argv[1]
 files = {"/hello space.txt": b"hello remote world"}
 files.update({"/root.txt": b"Loopback FTP and WebDAV test file.\n", "/Тестовая папка/Привет.txt": "Привет из локальной тестовой папки.\n".encode()})
@@ -168,7 +175,16 @@ class FTP(socketserver.StreamRequestHandler):
             elif command == "QUIT": self.send("221 Bye"); return
             else: self.send("502 Unsupported")
 
-httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DAV)
+class LoopbackHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind calls socket.getfqdn(), which can block on the
+        # host's DNS resolver even for 127.0.0.1. This fixture needs no DNS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+startup_phase("binding HTTP and FTP listeners")
+httpd = LoopbackHTTPServer(("127.0.0.1", 0), DAV)
 ftpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), FTP)
 directories.add("/unsupported")
 threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -186,10 +202,12 @@ if os.environ.get("FAR_WEB_FIXTURE_EXPORT_STATE") == "1":
             time.sleep(0.2)
     threading.Thread(target=export_state, daemon=True).start()
 if len(sys.argv) > 2 and sys.argv[2] == "tls":
+    startup_phase("generating TLS certificate")
     key = os.path.join(root, "key.pem"); cert = os.path.join(root, "cert.pem")
     subprocess.run(["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-subj", "/CN=localhost", "-days", "1"], check=True, timeout=4, stdout=subprocess.DEVNULL)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.load_cert_chain(cert, key)
-    httpsd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DAV)
+    startup_phase("binding HTTPS and FTPS listeners")
+    httpsd = LoopbackHTTPServer(("127.0.0.1", 0), DAV)
     httpsd.socket = context.wrap_socket(httpsd.socket, server_side=True)
     class AuthTLS(socketserver.StreamRequestHandler):
         def handle(self):
@@ -210,7 +228,10 @@ if len(sys.argv) > 2 and sys.argv[2] == "tls":
     ports.update({"https": httpsd.server_port, "ftps": tlsftpd.server_address[1]})
 # Publish readiness only after every requested listener (including TLS) exists.
 # Atomic replacement prevents clients from observing a partial JSON document.
+startup_phase("publishing ready manifest")
 ready_path = os.path.join(root, "ports.json")
 with open(ready_path + ".tmp", "w") as f: json.dump(ports, f)
 os.replace(ready_path + ".tmp", ready_path)
+faulthandler.cancel_dump_traceback_later()
+startup_phase("ready")
 threading.Event().wait()
