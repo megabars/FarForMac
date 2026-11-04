@@ -1,0 +1,35 @@
+name: macOS validation
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test-and-package:
+    # These runners are actual test environments, not a claim of macOS 14 coverage.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record actual environment
+        run: |
+          sw_vers
+          uname -m
+          swift --version
+      - name: Core tests
+        run: script/test.sh
+      - name: Build and validate release bundle
+        run: script/package_release.sh
+      - name: UI smoke
+        run: script/ui_smoke.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FarForMac-${{ matrix.os }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/ui-smoke.json

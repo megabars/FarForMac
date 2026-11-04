@@ -3,19 +3,19 @@ import FarCore
 
 extension AppDelegate: NSMenuDelegate {
     var maskGroups: [String: String] {
-        get { UserDefaults.standard.dictionary(forKey: "maskGroups") as? [String: String] ?? ["text": "*.txt;*.md;*.swift;*.json;*.xml", "archives": "*.zip;*.tar;*.gz;*.7z;*.rar", "images": "*.png;*.jpg;*.jpeg;*.gif;*.heic"] }
+        get { AppPreferences.defaults.dictionary(forKey: "maskGroups") as? [String: String] ?? ["text": "*.txt;*.md;*.swift;*.json;*.xml", "archives": "*.zip;*.tar;*.gz;*.7z;*.rar", "images": "*.png;*.jpg;*.jpeg;*.gif;*.heic"] }
         set {
-            UserDefaults.standard.set(newValue, forKey: "maskGroups")
+            AppPreferences.defaults.set(newValue, forKey: "maskGroups")
             left?.maskGroups = newValue; right?.maskGroups = newValue
         }
     }
     var bookmarks: [String] {
-        get { UserDefaults.standard.stringArray(forKey: "bookmarks") ?? [] }
-        set { UserDefaults.standard.set(Array(newValue.prefix(100)), forKey: "bookmarks") }
+        get { AppPreferences.defaults.stringArray(forKey: "bookmarks") ?? [] }
+        set { AppPreferences.defaults.set(Array(newValue.prefix(100)), forKey: "bookmarks") }
     }
     var quickFolders: [String: String] {
-        get { UserDefaults.standard.dictionary(forKey: "quickFolders") as? [String: String] ?? [:] }
-        set { UserDefaults.standard.set(newValue, forKey: "quickFolders") }
+        get { AppPreferences.defaults.dictionary(forKey: "quickFolders") as? [String: String] ?? [:] }
+        set { AppPreferences.defaults.set(newValue, forKey: "quickFolders") }
     }
     func addBookmark() {
         let path = active.directory.path

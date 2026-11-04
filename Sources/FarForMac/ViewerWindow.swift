@@ -128,6 +128,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func showWindow(_ sender: Any?) {
+        if let view = window?.contentView { UIAccessibility.apply(to: view) }
         retainedWhileOpen = self
         super.showWindow(sender)
         window?.makeFirstResponder(textView)
@@ -572,6 +573,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
             let consumed = MainActor.assumeIsolated {
                 guard let self, event.window === self.window, self.window?.isKeyWindow == true,
                       self.window?.attachedSheet == nil else { return false }
+                if CommandWorkspace.shared.handle(event) { return true }
                 let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
                 let key = event.keyCode
                 if flags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" {
@@ -633,7 +635,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     }
 
     private static func readHistory() -> [History] {
-        guard let data = UserDefaults.standard.data(forKey: historyKey), let entries = try? JSONDecoder().decode([History].self, from: data) else { return [] }
+        guard let data = AppPreferences.defaults.data(forKey: historyKey), let entries = try? JSONDecoder().decode([History].self, from: data) else { return [] }
         return Array(entries.prefix(100)).map { entry in
             var entry = entry; entry.bookmarks = Array(entry.bookmarks.prefix(20)); return entry
         }
@@ -654,7 +656,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         entry.bookmarks = Array(entry.bookmarks.prefix(20))
         if let index { entries[index] = entry } else { entries.append(entry) }
         entries.sort { $0.accessed > $1.accessed }
-        if let data = try? JSONEncoder().encode(Array(entries.prefix(100))) { UserDefaults.standard.set(data, forKey: Self.historyKey) }
+        if let data = try? JSONEncoder().encode(Array(entries.prefix(100))) { AppPreferences.defaults.set(data, forKey: Self.historyKey) }
         refreshHistoryMenus()
     }
 
@@ -731,4 +733,26 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
 @MainActor
 private func NSButtonWithTag(_ tag: Int) -> NSButton {
     let button = NSButton(); button.tag = tag; return button
+}
+
+extension ViewerWindow {
+    static func registerAutomation(in workspace: CommandWorkspace) {
+        workspace.register("viewer.wrap", title: "Перенос строк в просмотрщике", contexts: [.viewer], recordable: true) {
+            guard let viewer = NSApp.keyWindow?.windowController as? ViewerWindow, viewer.cancellation == nil else { throw CommandRegistryError.contextMismatch }
+            viewer.wrapButton.state = viewer.wraps ? .off : .on; viewer.wrapChanged()
+        }
+        for (id, title) in [("viewer.mode", "Текст / hex"), ("viewer.next", "Следующее совпадение"), ("viewer.previous", "Предыдущее совпадение")] {
+            workspace.register(id, title: title, contexts: [.viewer]) {
+                guard let viewer = NSApp.keyWindow?.windowController as? ViewerWindow, viewer.cancellation == nil else { throw CommandRegistryError.contextMismatch }
+                if id == "viewer.mode" { viewer.mode.selectItem(at: viewer.isHex ? 0 : 1); viewer.modeChanged() }
+                else if id == "viewer.next" { viewer.nextRequested() }
+                else { viewer.previousRequested() }
+            }
+        }
+    }
+    func automationKey(_ event: NSEvent) -> String? {
+        let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        return event.keyCode == 120 && flags.isEmpty ? "viewer.wrap" : nil
+    }
+    var extensionText: String { textView.string }
 }

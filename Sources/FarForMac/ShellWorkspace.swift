@@ -45,7 +45,7 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         self.showTerminal = showTerminal; self.togglePanels = togglePanels
         self.refreshPanels = refreshPanels; self.report = report
         super.init()
-        do { history = try CommandHistory.load() } catch { historyWritable = false; report("История не загружена; исходный файл сохранён: \(error.localizedDescription)") }
+        do { history = try CommandHistory.load(from: AppRuntime.historyURL) } catch { historyWritable = false; report("История не загружена; исходный файл сохранён: \(error.localizedDescription)") }
         input.placeholderString = "Команда в активной папке · Enter — выполнить · Tab — путь"
         input.setAccessibilityLabel("Командная строка")
         input.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
@@ -233,15 +233,16 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     private func saveHistory() {
         guard historyWritable else { return }
         let snapshot = history
+        let historyURL = AppRuntime.historyURL
         historyQueue.async { [weak self] in
-            do { try snapshot.save() } catch { let message = error.localizedDescription; DispatchQueue.main.async { self?.report(message) } }
+            do { try snapshot.save(to: historyURL) } catch { let message = error.localizedDescription; DispatchQueue.main.async { self?.report(message) } }
         }
     }
     func controlTextDidChange(_ notification: Notification) { historyPosition = -1 }
     private func setCommand(_ value: String) { input.stringValue = value; historyPosition = -1; focusCommand() }
     func showUserMenu() {
         do {
-            let loaded = try UserCommandStore().loadMenu(in: context().activeDirectory)
+            let loaded = try AppRuntime.commandStore.loadMenu(in: context().activeDirectory)
             let menu = NSMenu(title: "Пользовательское меню")
             menu.addItem(withTitle: loaded.isLocal ? "Локальное: \(loaded.source.path)" : "Общее меню", action: nil, keyEquivalent: "")
             func append(_ entries: [UserMenuEntry], to menu: NSMenu) {
@@ -279,11 +280,11 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     }
     @objc func configureCommands() {
         if let configWindow, configWindow.window?.isVisible == true { configWindow.showWindow(nil); return }
-        configWindow = UserCommandsWindow(); configWindow?.showWindow(nil)
+        configWindow = UserCommandsWindow(store: AppRuntime.commandStore); configWindow?.showWindow(nil)
     }
     func association(for file: URL, action: UserCommandAction) -> Bool {
         do {
-            let entries = try UserCommandStore().loadGlobal().matchingAssociations(for: file.lastPathComponent, action: action)
+            let entries = try AppRuntime.commandStore.loadGlobal().matchingAssociations(for: file.lastPathComponent, action: action)
             guard !entries.isEmpty else { return false }
             let alert = NSAlert(); alert.messageText = "Ассоциация: \(file.lastPathComponent)"
             let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 480, height: 26)); popup.addItems(withTitles: entries.map(\.title)); alert.accessoryView = popup

@@ -42,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         queue.onFinished = { [weak self] result in
             self?.status.stringValue = result.summary
             self?.refresh()
+            self?.refreshLocalPanelsIfIdle()
         }
         return queue
     }()
@@ -58,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.backgroundColor = Palette.background
         window.delegate = self
         window.isReleasedWhenClosed = false
-        window.setFrameAutosaveName("FarMac.main")
+        if !AppRuntime.isSmoke { window.setFrameAutosaveName("FarMac.main") }
         window.center()
 
         let brand = label("FarForMac", size: 23, color: Palette.accent, bold: true)
@@ -71,8 +72,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let operations = toolbarButton("Операции", symbol: "list.bullet.rectangle", action: "operations")
         let toolbar = inset(horizontal([branding, spacer, home, volumes, terminal, hidden, operations], spacing: 12), x: 18, y: 15)
 
-        let defaults = UserDefaults.standard
+        let defaults = AppPreferences.defaults
         func location(_ key: String) -> URL {
+            if let fixture = AppRuntime.smokeDirectory { return fixture }
             if let path = defaults.string(forKey: "panel.\(key)"), FileManager.default.fileExists(atPath: path) { return URL(fileURLWithPath: path) }
             return FileManager.default.homeDirectoryForCurrentUser
         }
@@ -153,9 +155,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.makeKeyAndOrderFront(nil)
         active.focus()
         NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.async { [weak self] in self?.offerEditorRecovery(automatic: true) }
+        if !AppRuntime.isSmoke { DispatchQueue.main.async { [weak self] in self?.offerEditorRecovery(automatic: true) } }
+        configureAutomation()
+        installWorkspaceObservers()
+        applyInterfacePreferences()
+        if AppRuntime.isSmoke { Task { await runUISmoke() } }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, NSApp.keyWindow != nil else { return event }
+            if CommandWorkspace.shared.handle(event) { return nil }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if self.window.isKeyWindow, self.terminalVisible, self.shellWorkspace.isRunning,
                !flags.contains(.command) {
@@ -219,7 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     private func offerEditorRecovery(automatic: Bool) {
         do {
-            let recovery = try EditorRecoveryStore().loadAvailable()
+            let recovery = try AppRuntime.recoveryStore.loadAvailable()
             let records = recovery.records.filter { !restoredDrafts.contains($0.id) }
             let notice = recovery.warnings.prefix(3).joined(separator: "\n")
             if !notice.isEmpty { status.stringValue = "Некоторые черновики не прочитаны; исходные записи сохранены." }
@@ -421,6 +428,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         folderFunctionButton?.isEnabled = !archive
         folderFunctionButton?.title = temporary ? "F7  Убрать" : "F7  Папка"
         folderFunctionButton?.toolTip = temporary ? "F7 — убрать ссылку из временной панели, сохранив файл." : "F7 — создать папку."
+        for button in archiveFunctionButtons.values { button.title = L10n.text(button.title) }
+        if let button = folderFunctionButton { button.title = L10n.text(button.title) }
     }
     private func updateAuxiliaryPanels() {
         updateFunctionLabels()
@@ -441,7 +450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let controller = SortGroupsWindow(groups: active.sortGroups, maskGroups: maskGroups) { [weak self] groups in
             guard let self else { return }
             do {
-                UserDefaults.standard.set(try groups.jsonData(), forKey: "panel.sortGroups")
+                AppPreferences.defaults.set(try groups.jsonData(), forKey: "panel.sortGroups")
                 self.left.sortGroups = groups; self.right.sortGroups = groups
             } catch { self.showError(error) }
         }
@@ -497,7 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         left.active = panel === left
         right.active = panel === right
         shellWorkspace?.updateDirectory()
-        UserDefaults.standard.set(panel.locationKey, forKey: "session.activePanel")
+        AppPreferences.defaults.set(panel.locationKey, forKey: "session.activePanel")
         updateFunctionLabels()
     }
     private func setTerminalVisible(_ visible: Bool) {
@@ -550,6 +559,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func functionMenu(_ sender: NSMenuItem) { if sender.tag == 1 { help() } else { performFunction(sender.tag) } }
     private let filePanelCommands: Set<String> = ["mark", "markAll", "clearMarks", "invertMarks", "invertAll", "markMask", "unmarkMask", "restoreMarks", "sameExtension", "unmarkExtension", "sameName", "unmarkName", "invertFiles", "quickFind", "findNext", "findPrevious", "filter", "fileDescription", "rename", "copyCursor", "batchRename", "properties", "symbolicLink", "hardLink", "deletePermanently"]
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(showInterfacePreferences(_:)) { return NSApp.modalWindow == nil }
         if menuItem.action == #selector(functionMenu(_:)), menuItem.tag == 8 {
             menuItem.title = active?.isRemote == true ? "Удалить с сервера…" : active?.isArchive == true ? "Удалить из архива…" : "В Корзину…"
         }
@@ -593,7 +603,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         return true
     }
 
+    private func configureAutomation() {
+        let workspace = CommandWorkspace.shared
+        workspace.configure(window: window) { [weak self] text in self?.status.stringValue = text }
+        let recorded: Set<String> = ["mark", "markAll", "clearMarks", "invertMarks", "invertAll", "invertFiles", "restoreMarks", "sameExtension", "unmarkExtension", "sameName", "unmarkName", "reverseSort", "brief", "full", "custom"]
+        func registerMenu(_ menu: NSMenu) {
+            for item in menu.items {
+                if let submenu = item.submenu { registerMenu(submenu) }
+                guard item.action == #selector(command(_:)), let id = item.representedObject as? String,
+                      workspace.registry.descriptor(for: CommandID(rawValue: "panel." + id)) == nil else { continue }
+                workspace.register("panel." + id, title: item.title, contexts: [.panel], recordable: recorded.contains(id)) { [weak self] in
+                    guard let self, self.window.isKeyWindow,
+                          self.window.attachedSheet == nil else { throw CommandRegistryError.contextMismatch }
+                    if recorded.contains(id) && (self.busy || self.active.loading || self.active.isArchive || self.active.isRemote || self.active.contentMode != .files || self.terminalVisible) { throw CommandRegistryError.contextMismatch }
+                    let validation = NSMenuItem(title: "", action: #selector(self.command(_:)), keyEquivalent: "")
+                    validation.representedObject = id
+                    guard ["operations", "cancelOperations", "networkCancel", "archiveCancel"].contains(id) || self.validateMenuItem(validation) else { throw CommandRegistryError.contextMismatch }
+                    self.performPanelCommand(id)
+                }
+            }
+        }
+        if let menu = NSApp.mainMenu { registerMenu(menu) }
+        for function in 1...10 {
+            workspace.register("panel.f\(function)", title: "F\(function)", contexts: [.panel]) { [weak self] in
+                guard let self else { throw CommandRegistryError.contextMismatch }
+                self.performFunctionDirect(function)
+            }
+        }
+        workspace.register("panel.switch", title: "Переключить панель", contexts: [.panel], recordable: true) { [weak self] in
+            guard let self, !self.busy, !self.terminalVisible else { throw CommandRegistryError.contextMismatch }
+            self.activate(self.passive); self.active.focus()
+        }
+        for (id, title, delta) in [("panel.down", "Курсор вниз", 1), ("panel.up", "Курсор вверх", -1)] {
+            workspace.register(id, title: title, contexts: [.panel], recordable: true) { [weak self] in
+                guard let self, !self.busy, !self.active.loading, !self.active.isArchive, !self.active.isRemote,
+                      self.active.contentMode == .files, !self.terminalVisible else { throw CommandRegistryError.contextMismatch }
+                self.active.automationMoveCursor(delta)
+            }
+        }
+        workspace.panelKey = { [weak self] event in
+            guard let self, !self.terminalVisible, self.window.firstResponder === self.active.table,
+                  !self.active.isArchive, !self.active.isRemote, self.active.contentMode == .files else { return nil }
+            let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            if flags == [.command], event.keyCode == 0 { return "panel.markAll" }
+            if flags == [.control], event.keyCode == 46 { return "panel.restoreMarks" }
+            guard flags.isEmpty else { return nil }
+            switch event.keyCode {
+            case 48: return "panel.switch"
+            case 49, 114: return "panel.mark"
+            case 125: return "panel.down"
+            case 126: return "panel.up"
+            default: return nil
+            }
+        }
+        TextFileWindow.registerAutomation(in: workspace)
+        ViewerWindow.registerAutomation(in: workspace)
+        workspace.register("dialog.help", title: "Справка диалога", contexts: [.dialog]) { [weak self] in self?.help() }
+        ExtensionWorkspace.shared.panelEntries = { [weak self] in
+            guard let self, !self.active.loading, !self.active.isArchive, !self.active.isRemote else { throw CommandRegistryError.contextMismatch }
+            return self.active.selectedEntries.map { ExtensionEntry(name: $0.name, isDirectory: $0.isDirectory, size: Int64($0.size)) }
+        }
+    }
+
     func performFunction(_ function: Int) {
+        if CommandWorkspace.shared.dispatch("panel.f\(function)") { return }
+        performFunctionDirect(function)
+    }
+    private func performFunctionDirect(_ function: Int) {
         guard !busy, window.attachedSheet == nil else { NSSound.beep(); return }
         if terminalVisible && shellWorkspace.isRunning && ![1, 2, 9, 10].contains(function) { NSSound.beep(); return }
         if active.contentMode != .files && [3, 4, 5, 6, 7, 8].contains(function) {
@@ -635,6 +711,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func command(_ sender: Any) {
         guard window != nil, window.isKeyWindow, window.attachedSheet == nil else { return }
         let id = (sender as? NSButton)?.identifier?.rawValue ?? (sender as? NSMenuItem)?.representedObject as? String ?? ""
+        if CommandWorkspace.shared.dispatch("panel." + id) { return }
+        performPanelCommand(id)
+    }
+    private func performPanelCommand(_ id: String) {
         if active.isArchive || active.isRemote, (filePanelCommands.contains(id) && id != "copyCursor") || ["search", "temporaryAdd", "temporaryRemove", "temporaryLocate", "saveSession", "panelSettings", "brief", "full", "custom", "reverseSort"].contains(id) { NSSound.beep(); return }
         if filePanelCommands.contains(id), active.contentMode != .files { NSSound.beep(); return }
         switch id {
@@ -720,7 +800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case "hidden":
             let value = !active.showHidden
             left.showHidden = value; right.showHidden = value
-            UserDefaults.standard.set(value, forKey: "showHidden")
+            AppPreferences.defaults.set(value, forKey: "showHidden")
             refresh()
         case "choose": chooseDirectory()
         case "terminal":
@@ -1102,6 +1182,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if !session.confirmClose() { return .terminateCancel }
         }
         if !network.confirmTermination() { return .terminateCancel }
+        CommandWorkspace.shared.stopPlayback()
+        ExtensionWorkspace.shared.cancel()
         network.finalizeTermination()
         archiveEdits.forEach { $0.finalizeClose() }
         toolWindows.compactMap { $0 as? MetadataEditingWindow }.forEach { $0.finalizeClose() }
@@ -1123,7 +1205,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.makeKeyAndOrderFront(nil); return true
     }
     func applicationDidBecomeActive(_ notification: Notification) {
-        if window != nil && !busy { refresh() }
+        if window != nil { refreshAfterWake = true; refreshLocalPanelsIfIdle() }
+    }
+
+    private var interfacePreferences: UIPreferencesWindow?
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var refreshAfterWake = false
+
+    @objc private func showInterfacePreferences(_ sender: Any?) {
+        if interfacePreferences?.window?.isVisible != true {
+            interfacePreferences = UIPreferencesWindow { [weak self] in self?.applyInterfacePreferences() }
+        }
+        interfacePreferences?.showWindow(nil)
+        interfacePreferences?.window?.makeKeyAndOrderFront(nil)
+    }
+    private func applyInterfacePreferences() {
+        if let menu = NSApp.mainMenu { UIAccessibility.apply(menu: menu) }
+        for window in NSApp.windows {
+            window.backgroundColor = Palette.background
+            if let view = window.contentView { UIAccessibility.apply(to: view) }
+        }
+        window?.subtitle = L10n.text("Файловый менеджер")
+        left?.applyInterfacePreferences(); right?.applyInterfacePreferences()
+    }
+    private func installWorkspaceObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification,
+                     NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
+            workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                MainActor.assumeIsolated { self?.workspaceChanged(note) }
+            })
+        }
+    }
+    private func workspaceChanged(_ notification: Notification) {
+        guard !AppRuntime.isSmoke else { return }
+        if notification.name == NSWorkspace.willSleepNotification {
+            left.persistSession(); right.persistSession()
+            left.cancelInspection(); right.cancelInspection()
+            CommandWorkspace.shared.stopPlayback(); ExtensionWorkspace.shared.cancel()
+            refreshAfterWake = true
+            return
+        }
+        if notification.name == NSWorkspace.didUnmountNotification,
+           let volume = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL {
+            left.invalidateUnavailableVolume(volume); right.invalidateUnavailableVolume(volume)
+        }
+        // Never reconnect a network provider or replay a failed write merely because macOS woke.
+        refreshAfterWake = true
+        refreshLocalPanelsIfIdle()
+    }
+    private func refreshLocalPanelsIfIdle() {
+        guard refreshAfterWake, !busy, !toolMutationPending, !operationQueue.hasPendingOperations else { return }
+        refreshAfterWake = false
+        for panel in [left!, right!] where !panel.isArchive && !panel.isRemote {
+            if FileManager.default.isReadableFile(atPath: panel.directory.path) { panel.refresh() }
+            else { panel.invalidateUnavailableVolume(panel.directory) }
+        }
+    }
+    private func runUISmoke() async {
+        var checks: [String] = []
+        func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
+            if !condition() { throw NSError(domain: "Smoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+            checks.append(message)
+        }
+        do {
+            let deadline = Date().addingTimeInterval(20)
+            while (left.loading || right.loading) && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+            try require(!left.loading && !right.loading, "Both panels finish loading")
+            try require(left.directory == AppRuntime.smokeDirectory && right.directory == AppRuntime.smokeDirectory, "Panels use isolated fixtures")
+            try require(left.table.numberOfRows == 3 && right.table.numberOfRows == 3, "Real table views contain the expected files")
+            try require(window.contentView != nil && NSApp.mainMenu != nil, "Main window and command menu constructed")
+            try require(CommandWorkspace.shared.registry.descriptor(for: "panel.markAll") != nil, "Stable commands registered")
+            try require(left.table.accessibilityLabel()?.isEmpty == false, "Panel has an accessibility label")
+            let beforeNames = left.entries.map(\.name)
+            func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+            let views = descendants(left)
+            let popups = views.compactMap { $0 as? NSPopUpButton }
+            let popupState = popups.map { ($0.numberOfItems, $0.indexOfSelectedItem) }
+            let imageButtons = views.compactMap { $0 as? NSButton }.filter { $0.imagePosition == .imageOnly }
+            let imageState = imageButtons.map { ($0.title, $0.imagePosition, $0.font) }
+            let searchCell = left.filterField.cell as? NSSearchFieldCell
+            let searchTitle = searchCell?.searchButtonCell?.title
+            let cancelTitle = searchCell?.cancelButtonCell?.title
+            L10n.language = .english; UIPreferences.fontScale = 1.25; UIPreferences.highContrast = true
+            applyInterfacePreferences()
+            try require(NSApp.mainMenu?.items.contains(where: { $0.title == "Files" }) == true, "English main menu applied")
+            let scaledHeight = left.table.rowHeight
+            applyInterfacePreferences()
+            try require(left.table.rowHeight == scaledHeight && scaledHeight > 29, "Text scaling is idempotent")
+            try require(zip(popups, popupState).allSatisfy { $0.numberOfItems == $1.0 && $0.indexOfSelectedItem == $1.1 }, "Localization preserves popup items and selection")
+            try require(zip(imageButtons, imageState).allSatisfy { $0.title == $1.0 && $0.imagePosition == $1.1 && $0.font == $1.2 }, "Image-only buttons retain native presentation")
+            try require(searchCell?.searchButtonCell?.title == searchTitle && searchCell?.cancelButtonCell?.title == cancelTitle, "Search field internal buttons remain unchanged")
+            try require(left.entries.map(\.name) == beforeNames, "Localization preserves filenames")
+            if let index = left.entries.firstIndex(where: { $0.name == "Имя" }),
+               let cell = left.table.view(atColumn: 0, row: index + 1, makeIfNecessary: true) as? NSTableCellView {
+                try require(cell.textField?.stringValue == "Имя", "Filename matching UI vocabulary remains literal")
+            } else { throw NSError(domain: "Smoke", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing filename localization fixture"]) }
+            L10n.language = .russian; UIPreferences.fontScale = 1; UIPreferences.highContrast = false
+            applyInterfacePreferences()
+            try require(NSApp.mainMenu?.items.contains(where: { $0.title == "Файлы" }) == true, "Russian main menu restored")
+            activate(left); window.makeKeyAndOrderFront(nil); left.focus()
+            try CommandWorkspace.shared.macros.startRecording()
+            try CommandWorkspace.shared.macros.execute("panel.markAll", in: .panel)
+            let macro = try CommandWorkspace.shared.macros.stopRecording(name: "smoke")
+            try require(macro.steps.count == 1 && left.markedEntries.count == 2, "Panel command records and updates marks")
+            left.clearMarks()
+            try await CommandWorkspace.shared.macros.play(macro)
+            try require(left.markedEntries.count == 2, "Macro playback updates real panel marks")
+            left.invalidateUnavailableVolume(left.directory)
+            try require(left.selectedEntries.isEmpty && left.entries.isEmpty, "Unavailable volume invalidates stale entries")
+            left.refresh()
+            let recoveryDeadline = Date().addingTimeInterval(5)
+            while left.loading && Date() < recoveryDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
+            try require(left.entries.count == 2, "Panel recovers after resource returns")
+            left.persistSession()
+            try require(AppPreferences.defaults.data(forKey: "panel.left.session") != nil, "Session persists in isolated defaults")
+            shellWorkspace.stopForExit()
+            AppRuntime.finishSmoke(checks: checks)
+        } catch { shellWorkspace?.stopForExit(); AppRuntime.finishSmoke(checks: checks, error: error.localizedDescription) }
     }
 
     func setupMenu() {
@@ -1131,6 +1330,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let appItem = NSMenuItem(); bar.addItem(appItem)
         let appMenu = NSMenu(); appItem.submenu = appMenu
         appMenu.addItem(withTitle: "О FarForMac", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let preferences = NSMenuItem(title: "Доступность и язык…", action: #selector(showInterfacePreferences(_:)), keyEquivalent: ",")
+        preferences.target = self; appMenu.addItem(preferences)
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Скрыть FarForMac", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(withTitle: "Выйти из FarForMac", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -1184,7 +1385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             item.target = self; item.representedObject = id; commands.addItem(item)
         }
         let navigation = submenu("Панели")
-        for (name, id, key) in [("Описание файла…", "fileDescription", ""), ("Группы сортировки…", "sortGroups", ""), ("Файловая панель", "panelFiles", ""), ("Дерево каталогов · Ctrl+T", "panelTree", ""), ("Информационная панель · Ctrl+L", "panelInfo", ""), ("Быстрый просмотр · Ctrl+Q", "panelQuickView", ""), ("Сравнить каталоги…", "compareDirectories", ""), ("Добавить выбранное во временную соседнюю панель", "temporaryAdd", ""), ("Убрать из временной панели (без удаления файлов)", "temporaryRemove", ""), ("Перейти к исходной папке", "temporaryLocate", ""), ("Сохранить сессию панелей", "saveSession", ""), ("Перейти к пути…", "path", "l"), ("Выбрать папку…", "choose", "o"), ("Назад", "back", "["), ("Вперёд", "forward", "]"), ("Быстрый поиск по имени", "quickFind", ""), ("Следующее совпадение", "findNext", ""), ("Предыдущее совпадение", "findPrevious", ""), ("Фильтр текущей папки", "filter", "f"), ("Обновить", "refresh", "r"), ("Показать / скрыть скрытые файлы", "hidden", "."), ("Открыть этот путь в соседней панели", "syncToOther", ""), ("Взять путь соседней панели", "syncFromOther", ""), ("Настройки активной панели…", "panelSettings", ","), ("Открыть Терминал здесь", "terminal", "t"), ("Показать в Finder", "reveal", "")] {
+        for (name, id, key) in [("Описание файла…", "fileDescription", ""), ("Группы сортировки…", "sortGroups", ""), ("Файловая панель", "panelFiles", ""), ("Дерево каталогов · Ctrl+T", "panelTree", ""), ("Информационная панель · Ctrl+L", "panelInfo", ""), ("Быстрый просмотр · Ctrl+Q", "panelQuickView", ""), ("Сравнить каталоги…", "compareDirectories", ""), ("Добавить выбранное во временную соседнюю панель", "temporaryAdd", ""), ("Убрать из временной панели (без удаления файлов)", "temporaryRemove", ""), ("Перейти к исходной папке", "temporaryLocate", ""), ("Сохранить сессию панелей", "saveSession", ""), ("Перейти к пути…", "path", "l"), ("Выбрать папку…", "choose", "o"), ("Назад", "back", "["), ("Вперёд", "forward", "]"), ("Быстрый поиск по имени", "quickFind", ""), ("Следующее совпадение", "findNext", ""), ("Предыдущее совпадение", "findPrevious", ""), ("Фильтр текущей папки", "filter", "f"), ("Обновить", "refresh", "r"), ("Показать / скрыть скрытые файлы", "hidden", "."), ("Открыть этот путь в соседней панели", "syncToOther", ""), ("Взять путь соседней панели", "syncFromOther", ""), ("Настройки активной панели…", "panelSettings", ""), ("Открыть Терминал здесь", "terminal", "t"), ("Показать в Finder", "reveal", "")] {
             let item = NSMenuItem(title: name, action: #selector(command(_:)), keyEquivalent: key)
             item.target = self; item.representedObject = id; navigation.addItem(item)
         }
@@ -1202,6 +1403,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let archives = submenu("Архив")
         for (title, id) in [("Открыть как архив · Ctrl+PageDown", "archiveOpen"), ("Закрыть архив", "archiveClose"), ("Создать ZIP / TAR…", "archiveCreate"), ("Извлечь выбранное…", "archiveExtract"), ("Добавить выбранное в соседний архив…", "archiveAdd"), ("Удалить выбранное из архива…", "archiveDelete"), ("Отменить архивную операцию", "archiveCancel")] { archives.addItem(menuCommand(title, id)) }
         NSApp.windowsMenu = windows
+        CommandWorkspace.shared.installMenu(in: bar)
+        ExtensionWorkspace.shared.installMenu(in: bar)
         NSApp.mainMenu = bar
     }
 }
@@ -1209,6 +1412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 @main
 enum FarForMacMain {
     @MainActor static func main() {
+        do { try AppRuntime.configure() } catch { fputs("\(error.localizedDescription)\n", stderr); exit(2) }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.setActivationPolicy(.regular)

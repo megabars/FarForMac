@@ -59,7 +59,8 @@ public enum FileService {
         _ directory: URL,
         showHidden: Bool,
         sort: FileSort = .name,
-        ascending: Bool = true
+        ascending: Bool = true,
+        sortResult: Bool = true
     ) throws -> [FileEntry] {
         try validateDirectory(directory)
         let manager = FileManager.default
@@ -91,7 +92,7 @@ public enum FileService {
                         ?? (attributes[.ownerAccountID] as? NSNumber)?.stringValue ?? ""
                 )
             }
-            return sorted(entries, options: FileSortOptions(sort: sort, ascending: ascending))
+            return sortResult ? sorted(entries, options: FileSortOptions(sort: sort, ascending: ascending)) : entries
         } catch {
             throw OperationError("Не удалось прочитать каталог «\(directory.path)»: \(error.localizedDescription)")
         }

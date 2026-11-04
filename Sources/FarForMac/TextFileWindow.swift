@@ -33,6 +33,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     func saveForArchiveCommit() -> Bool { save() }
     func closeArchiveWorkingCopyWithoutSaving() { pendingDiscard = true; window?.close() }
 
+    private let recoveryStore = AppRuntime.recoveryStore
     private let editable: Bool
     private let onView: ((URL, Int64, ViewerEncoding) -> Bool)?
     private var sourceURL: URL?
@@ -62,7 +63,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     }
     private static let historyDefaultsKey = "editor.history.v1"
     private static func historyRecords() -> [HistoryRecord] {
-        guard let data = UserDefaults.standard.data(forKey: historyDefaultsKey) else { return [] }
+        guard let data = AppPreferences.defaults.data(forKey: historyDefaultsKey) else { return [] }
         return (try? JSONDecoder().decode([HistoryRecord].self, from: data)) ?? []
     }
     private static func historyRecord(_ url: URL) -> HistoryRecord? {
@@ -74,7 +75,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
                                    encoding: snapshot.format.encoding, position: textView.selectedRange().location, date: Date())
         var records = Self.historyRecords().filter { $0.path != record.path }; records.append(record)
         records.sort { $0.date > $1.date }
-        if let data = try? JSONEncoder().encode(Array(records.prefix(100))) { UserDefaults.standard.set(data, forKey: Self.historyDefaultsKey) }
+        if let data = try? JSONEncoder().encode(Array(records.prefix(100))) { AppPreferences.defaults.set(data, forKey: Self.historyDefaultsKey) }
     }
     private var keyMonitor: Any?
     private var activationObserver: NSObjectProtocol?
@@ -159,7 +160,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    static func pendingRecoveries() throws -> [EditorRecoveryRecord] { try EditorRecoveryStore().loadAll() }
+    static func pendingRecoveries() throws -> [EditorRecoveryRecord] { try AppRuntime.recoveryStore.loadAll() }
 
     private static func makeWindow() -> NSWindow {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 720),
@@ -171,6 +172,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
 
 
     override func showWindow(_ sender: Any?) {
+        if let view = window?.contentView { UIAccessibility.apply(to: view) }
         retainedWhileOpen = self; window?.delegate = self
         super.showWindow(sender); window?.makeFirstResponder(textView)
         textView.scrollRangeToVisible(textView.selectedRange())
@@ -178,6 +180,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
                 guard let self, event.window === self.window, self.window?.attachedSheet == nil,
                       self.window?.isKeyWindow == true else { return event }
+                if CommandWorkspace.shared.handle(event) { return nil }
                 return self.handleKey(event) ? nil : event
             }
         }
@@ -234,7 +237,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.containerSize = textView.maxSize; textView.textContainer?.widthTracksTextView = false
         textView.string = contents; textView.delegate = self
-        textView.indentSelection = { [weak self] outdent in self?.indent(outdent: outdent) }
+        textView.indentSelection = { outdent in CommandWorkspace.shared.dispatch(outdent ? "editor.outdent" : "editor.indent") }
         scroll.documentView = textView
         ruler = EditorLineRuler(scrollView: scroll, editor: textView)
         scroll.verticalRulerView = ruler; scroll.hasVerticalRuler = true; scroll.rulersVisible = true
@@ -406,10 +409,10 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
 
     private func clearRecovery() {
         recoveryWork?.cancel(); recoveryWork = nil
-        let id = recoveryID
+        let id = recoveryID, store = recoveryStore
         recoveryQueue.async { [weak self] in
             do {
-                try EditorRecoveryStore().remove(id: id)
+                try store.remove(id: id)
                 DispatchQueue.main.async { [weak self] in self?.recoveryWarning = ""; self?.updateState() }
             } catch {
                 let message = "Черновик восстановления не удалён: " + error.localizedDescription
@@ -422,9 +425,10 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         guard retainedArchiveWorkspace == nil, retainedRemoteWorkspace == nil, editable, isDirty else { clearRecovery(); return }
         let record = EditorRecoveryRecord(id: recoveryID, sourceURL: sourceURL, text: textView.string, format: format,
                                           selection: textView.selectedRange().location, baseIdentity: snapshot?.identity)
+        let store = recoveryStore
         let work = DispatchWorkItem { [weak self] in
             do {
-                try EditorRecoveryStore().save(record)
+                try store.save(record)
                 DispatchQueue.main.async { [weak self] in self?.recoveryWarning = ""; self?.updateState() }
             } catch {
                 let message = "Черновик не сохранён: " + error.localizedDescription
@@ -519,7 +523,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         persistHistory()
         recoveryWork?.cancel()
         if pendingDiscard || !isDirty {
-            do { try recoveryQueue.sync { try EditorRecoveryStore().remove(id: recoveryID) } }
+            do { try recoveryQueue.sync { try recoveryStore.remove(id: recoveryID) } }
             catch { showError("Черновик восстановления не удалён", error) }
         } else {
             // Finish a successful save's queued removal before Cmd-Q exits.
@@ -821,5 +825,51 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         default: return false
         }
         return true
+    }
+}
+
+extension TextFileWindow {
+    static func registerAutomation(in workspace: CommandWorkspace) {
+        for (id, title) in [("editor.indent", "Увеличить отступ"), ("editor.outdent", "Уменьшить отступ"), ("editor.lineNumbers", "Номера строк"), ("editor.selectAll", "Выделить весь текст")] {
+            workspace.register(id, title: title, contexts: [.editor], recordable: true) {
+                guard let editor = NSApp.keyWindow?.windowController as? TextFileWindow, !editor.closed else { throw CommandRegistryError.contextMismatch }
+                switch id {
+                case "editor.indent", "editor.outdent":
+                    guard editor.editable else { throw CommandRegistryError.contextMismatch }
+                    let edit = try EditorEditing.indent(in: editor.textView.string, selection: editor.textView.selectedRange(), tabSize: editor.tabSize, useSpaces: editor.useSpaces, outdent: id == "editor.outdent")
+                    guard editor.withinBufferLimit(edit.text) else { throw EditorError.tooLarge }
+                    editor.apply(edit, action: title)
+                case "editor.lineNumbers": editor.toggleLineNumbers(nil)
+                default: editor.textView.selectAll(nil)
+                }
+            }
+        }
+        for (id, title) in [("editor.save", "Сохранить документ"), ("editor.find", "Найти в документе"), ("editor.replace", "Заменить в документе"), ("editor.goto", "Перейти к строке")] {
+            workspace.register(id, title: title, contexts: [.editor]) {
+                guard let editor = NSApp.keyWindow?.windowController as? TextFileWindow else { throw CommandRegistryError.contextMismatch }
+                switch id {
+                case "editor.save": editor.saveDocument(nil)
+                case "editor.find": editor.findDocument(nil)
+                case "editor.replace": editor.replaceDocument(nil)
+                default: editor.gotoDocument(nil)
+                }
+            }
+        }
+    }
+    func automationKey(_ event: NSEvent) -> String? {
+        guard window?.firstResponder === textView else { return nil }
+        let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if flags == [.option], event.keyCode == 34 { return "editor.indent" }
+        if flags == [.option], event.keyCode == 32 { return "editor.outdent" }
+        if flags == [.control], event.keyCode == 99 { return "editor.lineNumbers" }
+        if flags == [.command], event.keyCode == 0 { return "editor.selectAll" }
+        return nil
+    }
+    var extensionText: String { textView.string }
+    var extensionRevision: Int { generation }
+    func applyExtensionText(_ text: String, revision: Int, title: String) throws {
+        guard !closed, editable, generation == revision, window?.isVisible == true else { throw ExtensionAPIError("Документ изменился или закрыт. Повторите запуск расширения.") }
+        guard withinBufferLimit(text) else { throw EditorError.tooLarge }
+        replaceBuffer(text, selection: NSRange(location: 0, length: 0), action: title)
     }
 }

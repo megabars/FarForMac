@@ -1,24 +1,25 @@
 import AppKit
 import FarCore
 
+@MainActor
 enum Palette {
-    static let background = NSColor(calibratedRed: 0.035, green: 0.065, blue: 0.13, alpha: 1)
-    static let panel = NSColor(calibratedRed: 0.055, green: 0.095, blue: 0.18, alpha: 1)
-    static let raised = NSColor(calibratedRed: 0.085, green: 0.14, blue: 0.24, alpha: 1)
-    static let accent = NSColor(calibratedRed: 0.32, green: 0.88, blue: 0.78, alpha: 1)
-    static let text = NSColor(calibratedRed: 0.88, green: 0.92, blue: 0.98, alpha: 1)
-    static let muted = NSColor(calibratedRed: 0.53, green: 0.63, blue: 0.77, alpha: 1)
+    static var background: NSColor { UIPreferences.color(NSColor(calibratedRed: 0.035, green: 0.065, blue: 0.13, alpha: 1), contrast: .black) }
+    static var panel: NSColor { UIPreferences.color(NSColor(calibratedRed: 0.055, green: 0.095, blue: 0.18, alpha: 1), contrast: .black) }
+    static var raised: NSColor { UIPreferences.color(NSColor(calibratedRed: 0.085, green: 0.14, blue: 0.24, alpha: 1), contrast: NSColor(calibratedWhite: 0.12, alpha: 1)) }
+    static var accent: NSColor { UIPreferences.color(NSColor(calibratedRed: 0.32, green: 0.88, blue: 0.78, alpha: 1), contrast: .yellow) }
+    static var text: NSColor { UIPreferences.color(NSColor(calibratedRed: 0.88, green: 0.92, blue: 0.98, alpha: 1), contrast: .white) }
+    static var muted: NSColor { UIPreferences.color(NSColor(calibratedRed: 0.53, green: 0.63, blue: 0.77, alpha: 1), contrast: NSColor(calibratedWhite: 0.85, alpha: 1)) }
 }
 
-func label(_ value: String, size: CGFloat = 12, color: NSColor = Palette.text, bold: Bool = false) -> NSTextField {
+@MainActor func label(_ value: String, size: CGFloat = 12, color: NSColor? = nil, bold: Bool = false) -> NSTextField {
     let field = NSTextField(labelWithString: value)
     field.font = .monospacedSystemFont(ofSize: size, weight: bold ? .semibold : .regular)
-    field.textColor = color
+    field.textColor = color ?? Palette.text
     field.lineBreakMode = .byTruncatingMiddle
     return field
 }
 
-func vertical(_ views: [NSView], spacing: CGFloat = 0) -> NSStackView {
+@MainActor func vertical(_ views: [NSView], spacing: CGFloat = 0) -> NSStackView {
     let stack = NSStackView(views: views)
     stack.orientation = .vertical
     stack.alignment = .leading
@@ -27,7 +28,7 @@ func vertical(_ views: [NSView], spacing: CGFloat = 0) -> NSStackView {
     return stack
 }
 
-func horizontal(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView {
+@MainActor func horizontal(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView {
     let stack = NSStackView(views: views)
     stack.orientation = .horizontal
     stack.alignment = .centerY
@@ -35,7 +36,7 @@ func horizontal(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView {
     return stack
 }
 
-func inset(_ content: NSView, x: CGFloat = 14, y: CGFloat = 10, color: NSColor? = nil) -> NSView {
+@MainActor func inset(_ content: NSView, x: CGFloat = 14, y: CGFloat = 10, color: NSColor? = nil) -> NSView {
     let wrapper = NSView()
     if let color { wrapper.wantsLayer = true; wrapper.layer?.backgroundColor = color.cgColor }
     content.translatesAutoresizingMaskIntoConstraints = false
@@ -193,7 +194,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     init(directory: URL, key: String) {
         self.directory = directory
         self.locationKey = key
-        let defaults = UserDefaults.standard
+        let defaults = AppPreferences.defaults
         if let data = defaults.data(forKey: "panel.\(key).history"),
            let saved = try? JSONDecoder().decode(PanelNavigation.self, from: data) {
             self.navigation = saved
@@ -261,8 +262,8 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
             column.headerCell.font = .systemFont(ofSize: 11, weight: .medium)
             table.addTableColumn(column)
         }
-        table.autosaveName = "FarMac.\(key).columns"
-        table.autosaveTableColumns = true
+        if !AppRuntime.isSmoke { table.autosaveName = "FarMac.\(key).columns" }
+        table.autosaveTableColumns = !AppRuntime.isSmoke
         updateColumns()
         let scroll = fileScroll
         scroll.documentView = table
@@ -402,7 +403,9 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         updateActive(); onSelectionChange?(self)
     }
     @objc private func modeChanged() {
-        setContentMode(PanelContentMode.allCases[modePicker.indexOfSelectedItem]); focus()
+        let index = modePicker.indexOfSelectedItem
+        guard PanelContentMode.allCases.indices.contains(index) else { return }
+        setContentMode(PanelContentMode.allCases[index]); focus()
     }
     func setContentMode(_ mode: PanelContentMode) {
         if isRemote { leaveRemote(focus: false) }
@@ -453,6 +456,25 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         auxiliary.update(mode: mode, directory: contentMode == .tree ? directory : source,
                          selected: selected, showHidden: showHidden)
     }
+    func applyInterfacePreferences() {
+        table.backgroundColor = Palette.panel
+        pathField.textColor = Palette.text
+        table.setAccessibilityLabel(UIAccessibility.panelName(locationKey))
+        pathField.setAccessibilityLabel(UIAccessibility.panelName(locationKey) + ", " + L10n.text("Путь"))
+        filterField.setAccessibilityLabel(UIAccessibility.panelName(locationKey) + ", " + L10n.text("Фильтр"))
+        quickFindField.setAccessibilityLabel(L10n.text("Быстрый поиск"))
+        updateColumnTitles()
+        table.reloadData()
+    }
+    func invalidateUnavailableVolume(_ volume: URL) {
+        guard !isArchive, !isRemote, !isTemporary else { return }
+        let path = directory.standardizedFileURL.path, root = volume.standardizedFileURL.path
+        guard path == root || path.hasPrefix(root + "/") else { return }
+        generation += 1; loading = false; cancelInspection()
+        entries = []; descriptions = [:]
+        applyFilter(resetSelection: true)
+        summary.stringValue = L10n.language == .english ? "Folder unavailable. Refresh when the volume returns." : "Папка недоступна. Обновите после подключения тома."
+    }
     func cancelInspection() { auxiliary.cancel() }
     func persistSession() {
         guard !loading else { return }
@@ -461,7 +483,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
                                  temporaryItems: isTemporary ? Array(searchResults.values) : nil,
                                  directoryCursorID: directorySnapshot?.selection.cursorID,
                                  directoryFilter: directorySnapshot?.filter ?? "")
-        do { UserDefaults.standard.set(try saved.encoded(), forKey: "panel.\(locationKey).session") }
+        do { AppPreferences.defaults.set(try saved.encoded(), forKey: "panel.\(locationKey).session") }
         catch { onError?(error) }
     }
     private func restorePendingSession() {
@@ -577,7 +599,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         for column in table.tableColumns {
             if let width = snapshot.columnWidths[column.identifier.rawValue] { column.width = width }
         }
-        table.autosaveTableColumns = true
+        table.autosaveTableColumns = !AppRuntime.isSmoke
         updateActive()
         applyFilter()
         if snapshot.cursorRow >= 0 { moveCursor(to: snapshot.cursorRow) }
@@ -656,12 +678,14 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         loading = true
         summary.stringValue = "Чтение папки…"
         let hidden = showHidden
+        let options = sortOptions, groups = sortGroups, masks = maskGroups, marks = selection.markedIDs
         Task {
             do {
                 let result = try await Task.detached(priority: .userInitiated) {
-                    let files = try FileService.list(target, showHidden: hidden)
-                    do { return (files, try FileDescriptions.load(directory: target).descriptions, "") }
-                    catch { return (files, [String: String](), "Описания: " + error.localizedDescription) }
+                    let raw = try FileService.list(target, showHidden: hidden, sortResult: false)
+                    let sorted = Self.sortedSnapshot(raw, options: options, marks: marks, groups: groups, masks: masks)
+                    do { return (sorted.0, try FileDescriptions.load(directory: target).descriptions, "", sorted.1) }
+                    catch { return (sorted.0, [String: String](), "Описания: " + error.localizedDescription, sorted.1) }
                 }.value
                 guard token == generation else { return }
                 let resetSelection = target != directory || !preserveSelection
@@ -677,10 +701,15 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
                 }
                 if historyAction != .restore { persistNavigation() }
                 directory = target
-                entries = sortedEntries(result.0)
+                if sortOptions == options && sortGroups == groups && maskGroups == masks && selection.markedIDs == marks {
+                    entries = result.0; sortGroupNotice = result.3
+                } else {
+                    // A user changed the ordering while I/O ran; preserve their latest choice.
+                    entries = sortedEntries(result.0)
+                }
                 descriptions = result.1; descriptionNotice = result.2
                 pathField.stringValue = target.path
-                UserDefaults.standard.set(target.path, forKey: "panel.\(locationKey)")
+                AppPreferences.defaults.set(target.path, forKey: "panel.\(locationKey)")
                 loading = false
                 applyFilter(resetSelection: resetSelection, selectName: selectName)
                 restorePendingSession()
@@ -819,6 +848,10 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     private var pageRowCount: Int {
         max(1, Int((table.enclosingScrollView?.contentSize.height ?? table.visibleRect.height) / (table.rowHeight + table.intercellSpacing.height)))
     }
+    func automationMoveCursor(_ delta: Int) {
+        shiftMarking = nil
+        moveCursor(to: min(max(0, table.selectedRow + delta), max(0, table.numberOfRows - 1)))
+    }
     private func handleSelectionKey(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
         if !modifiers.contains(.shift) { shiftMarking = nil }
@@ -953,7 +986,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
     private func persistNavigation() {
         if let data = try? JSONEncoder().encode(navigation) {
-            UserDefaults.standard.set(data, forKey: "panel.\(locationKey).history")
+            AppPreferences.defaults.set(data, forKey: "panel.\(locationKey).history")
         }
     }
 
@@ -1059,23 +1092,28 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     func setSortOptions(_ options: FileSortOptions) {
         sortOptions = options
         if !isTemporary, let data = try? JSONEncoder().encode(options) {
-            UserDefaults.standard.set(data, forKey: "panel.\(locationKey).sort")
+            AppPreferences.defaults.set(data, forKey: "panel.\(locationKey).sort")
         }
         updateColumnTitles()
         resortKeepingCursor()
     }
     private func sortedEntries(_ source: [FileEntry]) -> [FileEntry] {
-        let sorted = FileService.sorted(source, options: sortOptions, markedIDs: selection.markedIDs)
-        sortGroupNotice = ""
-        guard sortGroups.enabled, sortOptions.sort == .name || sortOptions.sort == .extension else { return sorted }
+        let result = Self.sortedSnapshot(source, options: sortOptions, marks: selection.markedIDs, groups: sortGroups, masks: maskGroups)
+        sortGroupNotice = result.1
+        return result.0
+    }
+    nonisolated private static func sortedSnapshot(_ source: [FileEntry], options: FileSortOptions,
+        marks: Set<String>, groups: SortGroups, masks: [String: String]) -> ([FileEntry], String) {
+        let sorted = FileService.sorted(source, options: options, markedIDs: marks)
+        guard groups.enabled, options.sort == .name || options.sort == .extension else { return (sorted, "") }
         do {
-            let ranks = try sortGroups.ranks(for: sorted.map(\.name), maskGroups: maskGroups)
-            return sorted.enumerated().sorted { a, b in
-                if sortOptions.directoriesFirst, a.element.isDirectory != b.element.isDirectory { return a.element.isDirectory }
+            let ranks = try groups.ranks(for: sorted.map(\.name), maskGroups: masks)
+            return (sorted.enumerated().sorted { a, b in
+                if options.directoriesFirst, a.element.isDirectory != b.element.isDirectory { return a.element.isDirectory }
                 let ar = ranks[a.element.name] ?? 0, br = ranks[b.element.name] ?? 0
                 return ar == br ? a.offset < b.offset : ar < br
-            }.map(\.element)
-        } catch { sortGroupNotice = "Группы сортировки: " + error.localizedDescription; return sorted }
+            }.map(\.element), "")
+        } catch { return (sorted, "Группы сортировки: " + error.localizedDescription) }
     }
     private func resortKeepingCursor() {
         let gesture = shiftMarking
@@ -1086,7 +1124,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
 
     func setDisplayMode(_ mode: PanelDisplayMode) {
         displayMode = mode
-        if !isTemporary { UserDefaults.standard.set(mode.rawValue, forKey: "panel.\(locationKey).display") }
+        if !isTemporary { AppPreferences.defaults.set(mode.rawValue, forKey: "panel.\(locationKey).display") }
         updateColumns()
     }
     func resetColumnWidths() {
@@ -1097,12 +1135,12 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     func setVisibleColumns(_ ids: Set<String>) {
         customColumnIDs = ids.intersection(Set(Self.columnDefinitions.map(\.id))).union(["name"])
         customColumnIDs.remove("origin")
-        if !isTemporary { UserDefaults.standard.set(customColumnIDs.sorted(), forKey: "panel.\(locationKey).columns") }
+        if !isTemporary { AppPreferences.defaults.set(customColumnIDs.sorted(), forKey: "panel.\(locationKey).columns") }
         setDisplayMode(.custom)
     }
     func setColorizeFiles(_ enabled: Bool) {
         colorizeFiles = enabled
-        if !isTemporary { UserDefaults.standard.set(enabled, forKey: "panel.\(locationKey).colorize") }
+        if !isTemporary { AppPreferences.defaults.set(enabled, forKey: "panel.\(locationKey).colorize") }
         table.reloadData()
     }
     private func updateColumns() {
@@ -1121,7 +1159,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         for column in table.tableColumns {
             let id = column.identifier.rawValue
             let name = Self.columnDefinitions.first { $0.id == id }?.title ?? id
-            column.title = name + (sortOptions.sort.rawValue == id ? (sortOptions.ascending ? " ↑" : " ↓") : "")
+            column.title = L10n.text(name) + (sortOptions.sort.rawValue == id ? (sortOptions.ascending ? " ↑" : " ↓") : "")
         }
     }
     private static let columnDefinitions: [(id: String, title: String, width: CGFloat)] = [
@@ -1231,7 +1269,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
             cell.addSubview(icon)
             let marked = entry.map { selection.markedIDs.contains($0.id) } ?? false
             let marker = label(marked ? "✓" : "", size: 12, color: Palette.accent, bold: true)
-            marker.setAccessibilityLabel(marked ? "Отмечен" : "Не отмечен")
+            marker.setAccessibilityLabel(L10n.text(marked ? "Помечено" : "Не помечено"))
             marker.translatesAutoresizingMaskIntoConstraints = false
             cell.addSubview(marker)
             NSLayoutConstraint.activate([
@@ -1244,11 +1282,18 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
             leading = 49
         }
         NSLayoutConstraint.activate([field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: leading), field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8), field.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
+        if column == "name", let entry {
+            cell.setAccessibilityLabel(UIAccessibility.fileRow(name: entry.name, isDirectory: entry.isDirectory,
+                isMarked: selection.markedIDs.contains(entry.id), isSymbolicLink: entry.isSymbolicLink))
+        }
+        // Cell content is a filename/metadata, never translatable UI copy.
+        field.identifier = NSUserInterfaceItemIdentifier("user-content")
+        UIAccessibility.apply(to: cell)
         return cell
     }
     private func entryColor(_ entry: FileEntry?) -> NSColor {
         guard let entry else { return Palette.accent }
-        guard colorizeFiles else { return Palette.text }
+        guard colorizeFiles, !UIPreferences.highContrast else { return Palette.text }
         if entry.isSymbolicLink { return NSColor(calibratedRed: 0.77, green: 0.62, blue: 1, alpha: 1) }
         if entry.isDirectory { return .systemCyan }
         if entry.permissions.contains("x") || entry.permissions.contains("s") || entry.permissions.contains("t") { return .systemGreen }

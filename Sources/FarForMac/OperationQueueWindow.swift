@@ -137,7 +137,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
         window.backgroundColor = Palette.background
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.setFrameAutosaveName("FarMac.operationQueue")
+        if !AppRuntime.isSmoke { window.setFrameAutosaveName("FarMac.operationQueue") }
         window.center()
         configureUI()
         restoreJournal()
@@ -469,10 +469,10 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
     }
 
     private func persist() {
-        if let data = try? JSONEncoder().encode(jobs) { UserDefaults.standard.set(data, forKey: journalKey) }
+        if let data = try? JSONEncoder().encode(jobs) { AppPreferences.defaults.set(data, forKey: journalKey) }
     }
     private func restoreJournal() {
-        guard let data = UserDefaults.standard.data(forKey: journalKey), let restored = try? JSONDecoder().decode([Job].self, from: data) else { return }
+        guard let data = AppPreferences.defaults.data(forKey: journalKey), let restored = try? JSONDecoder().decode([Job].self, from: data) else { return }
         jobs = Array(restored.suffix(100))
         for index in jobs.indices where jobs[index].state.pending {
             jobs[index].state = .interrupted

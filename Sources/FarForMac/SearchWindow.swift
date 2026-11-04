@@ -94,7 +94,7 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
         window.center()
         configureContent()
         var options = SearchOptions(roots: [directory])
-        if let data = UserDefaults.standard.data(forKey: Self.parametersKey),
+        if let data = AppPreferences.defaults.data(forKey: Self.parametersKey),
            let saved = try? JSONDecoder().decode(SearchOptions.self, from: data) { options = saved }
         restore(options)
         refreshActions()
@@ -308,7 +308,7 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
 
     private func persistParameters() {
         guard let options = try? readOptions(), let data = try? JSONEncoder().encode(options) else { return }
-        UserDefaults.standard.set(data, forKey: Self.parametersKey)
+        AppPreferences.defaults.set(data, forKey: Self.parametersKey)
     }
 
     @objc private func startSearch() {
