@@ -96,8 +96,10 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
         var summary: String
         var issues: [String]
         var temporarySources: Bool? = nil
+        var propagateDescriptions: Bool? = nil
+        var descriptionEncodings: [String: FileDescriptionEncoding]? = nil
         var request: TransferRequest {
-            TransferRequest(sources: sources.map { URL(fileURLWithPath: $0) }, destination: URL(fileURLWithPath: destination), move: move)
+            TransferRequest(sources: sources.map { URL(fileURLWithPath: $0) }, destination: URL(fileURLWithPath: destination), move: move, propagateDescriptions: propagateDescriptions ?? false, descriptionEncodings: descriptionEncodings ?? [:])
         }
         var title: String { "\(move ? "Перенос" : "Копирование"): \(sources.count == 1 ? URL(fileURLWithPath: sources[0]).lastPathComponent : "\(sources.count) исходных объектов")" }
     }
@@ -162,6 +164,8 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
         }
         var job = Job(id: UUID(), sources: request.sources.map(\.path), destination: request.destination.path, move: request.move, created: Date(), state: .queued, summary: "Ожидает выполнения", issues: [])
         job.temporarySources = resource != nil
+        job.propagateDescriptions = request.propagateDescriptions
+        job.descriptionEncodings = request.descriptionEncodings
         temporaryResources[job.id] = resource
         runtimeRequests[job.id] = request
         jobs.append(job)
@@ -299,7 +303,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
 
     private func finish(_ result: TransferResult, id: UUID) {
         guard activeID == id, let index = jobs.firstIndex(where: { $0.id == id }) else { return }
-        jobs[index].state = result.cancelled ? .cancelled : result.failed > 0 ? (result.completed > 0 ? .partial : .failed) : result.skipped > 0 ? .partial : .completed
+        jobs[index].state = result.cancelled ? .cancelled : result.failed > 0 ? (result.completed > 0 ? .partial : .failed) : result.skipped > 0 || !result.issues.isEmpty ? .partial : .completed
         jobs[index].summary = result.summary + (jobs[index].temporarySources == true ? " Для повтора снова извлеките объекты из архива." : "")
         jobs[index].issues = result.issues
         runtimeRequests.removeValue(forKey: id)
@@ -486,5 +490,42 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
             jobs.remove(at: index)
         }
     }
+    static func runDescriptionQueueUISmokeChecks() async throws -> [String] {
+        guard AppRuntime.isSmoke, let root = AppRuntime.smokeStateDirectory else { throw PanelSessionError("Queue smoke requires isolated state") }
+        let folder = root.appendingPathComponent("description-queue-" + UUID().uuidString)
+        let from = folder.appendingPathComponent("source"), to = folder.appendingPathComponent("target")
+        try FileManager.default.createDirectory(at: from, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: to, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = from.appendingPathComponent("one.txt"), bytes = Data("keep source and copied bytes".utf8)
+        try bytes.write(to: file)
+        try Data([0xff]).write(to: from.appendingPathComponent("descript.ion"))
+        let queue = FileOperationQueue()
+        let oldJournal = AppPreferences.defaults.data(forKey: queue.journalKey)
+        defer {
+            queue.close()
+            if let oldJournal { AppPreferences.defaults.set(oldJournal, forKey: queue.journalKey) }
+            else { AppPreferences.defaults.removeObject(forKey: queue.journalKey) }
+        }
+        guard queue.enqueue(TransferRequest(sources: [file], destination: to, move: true, propagateDescriptions: true)) else {
+            throw PanelSessionError("Queue fixture did not enqueue")
+        }
+        let deadline = Date().addingTimeInterval(8)
+        while queue.hasPendingOperations && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        guard !queue.hasPendingOperations, let job = queue.jobs.last, job.state == .partial,
+              !job.issues.isEmpty, try Data(contentsOf: file) == bytes,
+              try Data(contentsOf: to.appendingPathComponent("one.txt")) == bytes else {
+            queue.cancelAll(); throw PanelSessionError("Description warning must leave copied data/source and a partial queue result")
+        }
+        let restored = try JSONDecoder().decode(Job.self, from: JSONEncoder().encode(job))
+        guard restored.request.propagateDescriptions else { throw PanelSessionError("Queue lost description policy") }
+        var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(job)) as! [String: Any]
+        legacy.removeValue(forKey: "propagateDescriptions"); legacy.removeValue(forKey: "descriptionEncodings")
+        let old = try JSONDecoder().decode(Job.self, from: JSONSerialization.data(withJSONObject: legacy))
+        guard !old.request.propagateDescriptions, old.request.descriptionEncodings.isEmpty else { throw PanelSessionError("Legacy queue must preserve prior metadata behavior") }
+        return ["Description warning leaves source and copied bytes intact and marks queue job partial",
+                "Queued description policy survives serialization and legacy jobs retain prior behavior"]
+    }
+
     private func bytes(_ count: Int64) -> String { ByteCountFormatter.string(fromByteCount: max(0, count), countStyle: .file) }
 }

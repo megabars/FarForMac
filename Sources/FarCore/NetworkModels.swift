@@ -7,6 +7,33 @@ public enum NetworkProtocol: String, Codable, CaseIterable, Sendable {
     public var isCleartext: Bool { self == .ftp || self == .webdav }
 }
 
+public enum SFTPAuthenticationMode: String, Codable, CaseIterable, Sendable {
+    case keyAgent, password, interactive
+}
+
+/// An explicitly resolved SSH gateway. Passwords and interactive answers are never stored here.
+public struct SFTPJumpHost: Codable, Equatable, Sendable {
+    public var host: String
+    public var port: Int
+    public var username: String
+    public var privateKeyPath: String?
+    public var authenticationMode: SFTPAuthenticationMode
+
+    public init(host: String, port: Int = 22, username: String, privateKeyPath: String? = nil, authenticationMode: SFTPAuthenticationMode = .keyAgent) {
+        self.host = host; self.port = port; self.username = username; self.privateKeyPath = privateKeyPath
+        self.authenticationMode = authenticationMode
+    }
+    private enum CodingKeys: String, CodingKey { case host, port, username, privateKeyPath, authenticationMode }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        host = try values.decode(String.self, forKey: .host)
+        port = try values.decode(Int.self, forKey: .port)
+        username = try values.decode(String.self, forKey: .username)
+        privateKeyPath = try values.decodeIfPresent(String.self, forKey: .privateKeyPath)
+        authenticationMode = try values.decodeIfPresent(SFTPAuthenticationMode.self, forKey: .authenticationMode) ?? .keyAgent
+    }
+}
+
 /// Connection metadata only. Passwords and key passphrases never belong here.
 public struct NetworkConnection: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
@@ -17,11 +44,32 @@ public struct NetworkConnection: Codable, Equatable, Identifiable, Sendable {
     public var username: String
     public var rootPath: String
     public var privateKeyPath: String?
+    public var sftpAuthenticationMode: SFTPAuthenticationMode
+    public var sftpJumpHosts: [SFTPJumpHost]
     public var timeoutSeconds: Double
     public init(id: UUID = UUID(), name: String = "", kind: NetworkProtocol, host: String, port: Int? = nil,
-                username: String = "", rootPath: String = "/", privateKeyPath: String? = nil, timeoutSeconds: Double = 30) {
+                username: String = "", rootPath: String = "/", privateKeyPath: String? = nil, timeoutSeconds: Double = 30, sftpAuthenticationMode: SFTPAuthenticationMode = .keyAgent, sftpJumpHosts: [SFTPJumpHost] = []) {
         self.id = id; self.name = name; self.kind = kind; self.host = host; self.port = port ?? kind.defaultPort
+        self.sftpAuthenticationMode = sftpAuthenticationMode
+        self.sftpJumpHosts = sftpJumpHosts
         self.username = username; self.rootPath = rootPath; self.privateKeyPath = privateKeyPath; self.timeoutSeconds = timeoutSeconds
+    }
+    private enum CodingKeys: String, CodingKey {
+        case id, name, kind, host, port, username, rootPath, privateKeyPath, timeoutSeconds, sftpAuthenticationMode, sftpJumpHosts
+    }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        kind = try values.decode(NetworkProtocol.self, forKey: .kind)
+        host = try values.decode(String.self, forKey: .host)
+        port = try values.decode(Int.self, forKey: .port)
+        username = try values.decode(String.self, forKey: .username)
+        rootPath = try values.decode(String.self, forKey: .rootPath)
+        privateKeyPath = try values.decodeIfPresent(String.self, forKey: .privateKeyPath)
+        timeoutSeconds = try values.decode(Double.self, forKey: .timeoutSeconds)
+        sftpAuthenticationMode = try values.decodeIfPresent(SFTPAuthenticationMode.self, forKey: .sftpAuthenticationMode) ?? .keyAgent
+        sftpJumpHosts = try values.decodeIfPresent([SFTPJumpHost].self, forKey: .sftpJumpHosts) ?? []
     }
     public func validate() throws {
         guard !host.isEmpty, host.utf8.count <= 253, !host.hasPrefix("-"),
@@ -34,11 +82,23 @@ public struct NetworkConnection: Codable, Equatable, Identifiable, Sendable {
         if let key = privateKeyPath, !key.isEmpty {
             guard key.hasPrefix("/"), !key.contains("\0"), !key.contains("\n"), !key.contains("\r") else { throw NetworkError.invalidConnection("Укажите абсолютный путь к закрытому ключу.") }
         }
+        guard sftpJumpHosts.count <= 4, kind == .sftp || sftpJumpHosts.isEmpty else {
+            throw NetworkError.invalidConnection("Цепочка SSH доступна только для SFTP и содержит не более четырёх шлюзов.")
+        }
+        var endpoints: Set<String> = ["\(host.lowercased()):\(port)"]
+        for jump in sftpJumpHosts {
+            guard !jump.username.isEmpty,
+                  !jump.username.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }),
+                  endpoints.insert("\(jump.host.lowercased()):\(jump.port)").inserted else {
+                throw NetworkError.invalidConnection("Проверьте пользователя SSH-шлюза; повторяющиеся серверы в цепочке запрещены.")
+            }
+            try NetworkConnection(kind: .sftp, host: jump.host, port: jump.port, username: jump.username, privateKeyPath: jump.privateKeyPath).validate()
+        }
     }
     public var displayName: String { name.isEmpty ? "\(kind.rawValue)://\(host):\(port)" : name }
 }
 
-public struct RemoteEntry: Equatable, Sendable, Identifiable {
+public struct RemoteEntry: Codable, Equatable, Sendable, Identifiable {
     public let path: String
     public let isDirectory: Bool
     public let isSymbolicLink: Bool

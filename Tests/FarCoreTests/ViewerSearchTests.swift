@@ -5,6 +5,102 @@ import Testing
 @Suite
 struct ViewerSearchTests {
     @Test
+    func fuzzySearchMapsSourceBytesAndKeepsCaseAndOriginalWords() throws {
+        let text = "🙂café cafe\u{301} Æ ß 𝔇 ١ cat\u{301}s cat\u{301}"
+        let doc = try document(Data(text.utf8))
+        let query = ViewerSearchQuery(pattern: "cafe", fuzzy: true)
+        let first = try #require(try ViewerSearch.find(document: doc, query: query, from: 0))
+        #expect(first.byteRange == 4..<9)
+        #expect(try ViewerSearch.find(document: doc, query: query, from: first.byteRange.upperBound)?.byteRange == 10..<16)
+        for (pattern, original) in [("ae", "Æ"), ("s", "ß"), ("d", "𝔇"), ("1", "١")] {
+            let range = try #require(text.range(of: original))
+            let start = Int64(text[..<range.lowerBound].utf8.count)
+            #expect(try ViewerSearch.find(document: doc, query: .init(pattern: pattern, wholeWords: true, fuzzy: true), from: 0)?.byteRange == start..<(start + Int64(original.utf8.count)))
+        }
+        #expect(try ViewerSearch.find(document: doc, query: .init(pattern: "CAFE", caseSensitive: true, fuzzy: true), from: 0) == nil)
+        let lastStart = doc.size - Int64("cat\u{301}".utf8.count)
+        #expect(try ViewerSearch.find(document: doc, query: .init(pattern: "cat", wholeWords: true, fuzzy: true), from: 0)?.byteRange == lastStart..<doc.size)
+        let overlap = try document(Data("ábába".utf8))
+        #expect(try ViewerSearch.find(document: overlap, query: .init(pattern: "aba", fuzzy: true), from: overlap.size, direction: .backward)?.byteRange == 3..<7)
+    }
+
+    @Test
+    func fuzzyCrossesPagesInBothDirectionsWrapsAndPreservesUTF16Bytes() throws {
+        let prefix = String(repeating: " ", count: 65_535)
+        let doc = try document(Data((prefix + "e\u{301}Æ🙂 fin").utf8))
+        let query = ViewerSearchQuery(pattern: "eae🙂", fuzzy: true)
+        let expected = Int64(prefix.utf8.count)..<Int64(prefix.utf8.count + "e\u{301}Æ🙂".utf8.count)
+        #expect(try ViewerSearch.find(document: doc, query: query, from: 0)?.byteRange == expected)
+        #expect(try ViewerSearch.find(document: doc, query: query, from: 65_536, direction: .backward)?.byteRange == expected)
+        #expect(try ViewerSearch.find(document: doc, query: query, from: doc.size, wrap: true)?.wrapped == true)
+        #expect(try ViewerSearch.find(document: doc, query: query, from: 0, direction: .backward, wrap: true)?.byteRange == expected)
+        var utf16 = Data([0xFF, 0xFE])
+        for unit in "🙂e\u{301}Æ".utf16 { utf16.append(UInt8(truncatingIfNeeded: unit)); utf16.append(UInt8(unit >> 8)) }
+        let encoded = try document(utf16, encoding: .automatic)
+        #expect(try ViewerSearch.find(document: encoded, query: .init(pattern: "eae", fuzzy: true), from: 0)?.byteRange == 6..<12)
+        let legacy = try document(Data([0xE9, 0xC6, 0xDF]), encoding: .windows1252)
+        #expect(try ViewerSearch.find(document: legacy, query: .init(pattern: "eaess", fuzzy: true), from: 0)?.byteRange == 0..<3)
+    }
+
+    @Test
+    func fuzzyRetainsLongMarkRunsAndFailsExplicitlyAtItsBound() throws {
+        let marks = String(repeating: "\u{301}", count: 40_000)
+        let doc = try document(Data(("e" + marks + "Æ ").utf8))
+        #expect(try ViewerSearch.find(document: doc, query: .init(pattern: "eae", wholeWords: true, fuzzy: true), from: 0)?.byteRange == 0..<80_003)
+        let long = try document(Data(("e" + String(repeating: "\u{301}", count: ViewerSearch.maximumFuzzyContextUTF16 + 1) + "Æ").utf8))
+        #expect(throws: ViewerSearchError.fuzzyContextTooLong(offset: 0)) {
+            try ViewerSearch.find(document: long, query: .init(pattern: "eae", fuzzy: true), from: 0)
+        }
+        for mode in [ViewerSearchMode.regex, .hex] {
+            #expect(throws: ViewerSearchError.unsupportedFuzzyMode) { try ViewerSearch.validate(.init(pattern: "41", mode: mode, fuzzy: true)) }
+        }
+        #expect(throws: ViewerSearchError.emptyFoldedQuery) { try ViewerSearch.validate(.init(pattern: "\u{301}\u{308}", fuzzy: true)) }
+        let cancellation = ViewerCancellation()
+        #expect(throws: ViewerSearchError.cancelled) {
+            try ViewerSearch.find(document: doc, query: .init(pattern: "missing", fuzzy: true), from: 0, cancellation: cancellation) { _ in cancellation.cancel() }
+        }
+    }
+
+    @Test
+    func wholeWordsUseScalarContextAcrossPageAndOriginBoundaries() throws {
+        let text = "🙂Кот котик _кот кот\u{301} КОТ"
+        let doc = try document(Data(text.utf8))
+        let query = ViewerSearchQuery(pattern: "кот", wholeWords: true)
+        #expect(try ViewerSearch.find(document: doc, query: query, from: 0)?.byteRange == 4..<10)
+        let last = Int64(text.utf8.count - "КОТ".utf8.count)
+        #expect(try ViewerSearch.find(document: doc, query: query, from: 5)?.byteRange == last..<doc.size)
+        #expect(try ViewerSearch.find(document: doc, query: query, from: doc.size, direction: .backward)?.byteRange == last..<doc.size)
+        let splitWord = String(repeating: " ", count: 65_533) + "catapult cat"
+        let boundary = try document(Data(splitWord.utf8))
+        #expect(try ViewerSearch.find(document: boundary, query: .init(pattern: "cat", wholeWords: true), from: 0)?.byteRange == 65_542..<65_545)
+        #expect(try ViewerSearch.find(document: boundary, query: .init(pattern: "cat", wholeWords: true), from: 65_533)?.byteRange == 65_542..<65_545)
+        #expect(try ViewerSearch.find(document: boundary, query: .init(pattern: "cat", wholeWords: true), from: 65_542, direction: .backward) == nil)
+        let exact = try document(Data((String(repeating: " ", count: 65_533) + "cat ").utf8))
+        #expect(try ViewerSearch.find(document: exact, query: .init(pattern: "cat", wholeWords: true), from: 0)?.byteRange == 65_533..<65_536)
+        let supplementary = try document(Data("𐐀cat cat".utf8))
+        #expect(try ViewerSearch.find(document: supplementary, query: .init(pattern: "cat", wholeWords: true), from: 0)?.byteRange == 8..<11)
+        let regex = try document(Data("cats cat".utf8))
+        #expect(try ViewerSearch.find(document: regex, query: .init(pattern: "(cat)", mode: .regex, wholeWords: true), from: 0)?.byteRange == 5..<8)
+    }
+
+    @Test
+    func cyclicSearchWrapsOnceForLiteralRegexAndHex() throws {
+        let doc = try document(Data("first last".utf8))
+        for query in [ViewerSearchQuery(pattern: "first"), .init(pattern: "^first", mode: .regex), .init(pattern: "66 69 72 73 74", mode: .hex)] {
+            #expect(try ViewerSearch.find(document: doc, query: query, from: doc.size) == nil)
+            let result = try #require(try ViewerSearch.find(document: doc, query: query, from: doc.size, wrap: true))
+            #expect(result.byteRange == 0..<5); #expect(result.wrapped)
+            let backward = try #require(try ViewerSearch.find(document: doc, query: query, from: 0, direction: .backward, wrap: true))
+            #expect(backward.byteRange == 0..<5); #expect(backward.wrapped)
+        }
+        #expect(try ViewerSearch.find(document: doc, query: .init(pattern: "absent"), from: 5, wrap: true) == nil)
+        let token = ViewerCancellation(); token.cancel()
+        #expect(throws: ViewerSearchError.cancelled) {
+            try ViewerSearch.find(document: doc, query: .init(pattern: "first"), from: doc.size, wrap: true, cancellation: token)
+        }
+    }
+
+    @Test
     func literalCrossesPagesWithExactUnicodeByteRangesAndCase() throws {
         let prefix = String(repeating: "x", count: 65_534)
         let text = prefix + "🙂ПрИвЕт\nПривет"

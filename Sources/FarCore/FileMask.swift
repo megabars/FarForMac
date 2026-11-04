@@ -351,8 +351,15 @@ public struct FileMask: Sendable {
     private static func matches(_ tokens: [Token], _ characters: [String], deadline: Deadline) throws -> Bool {
         var previous = [Bool](repeating: false, count: characters.count + 1)
         previous[0] = true
-        for token in tokens {
+        for (tokenIndex, token) in tokens.enumerated() {
             try deadline.check()
+            // FAR CmpName's legacy mode accepts a final .* after an otherwise
+            // complete match, or a final . when the source has no dot at all.
+            // Keep the bounded DP matcher; these are terminal alternatives only.
+            if !characters.isEmpty, previous[characters.count], case .literal(".") = token {
+                if tokenIndex == tokens.count - 1, !characters.contains(".") { return true }
+                if tokenIndex == tokens.count - 2, case .star = tokens[tokenIndex + 1] { return true }
+            }
             var current = [Bool](repeating: false, count: characters.count + 1)
             if case .star = token {
                 current[0] = previous[0]

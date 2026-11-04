@@ -103,12 +103,28 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     private let fileScroll = NSScrollView()
     private let archiveContainer = NSView()
     private(set) var archivePanel: ArchivePanelView?
+    private(set) var archiveFrame: ArchiveNavigationFrame?
+    var onRemoteDisconnect: ((any RemoteProvider) -> Void)?
+    private var archiveNavigationStates: [ObjectIdentifier: ArchivePanelView.NavigationState] = [:]
+    private(set) var virtualPanel: VirtualResultsPanelView?
+    private var virtualDirectoryState: (filter: String, quickFind: String, quickFindHidden: Bool, sort: FileSortOptions)?
+    var isVirtual: Bool { virtualPanel != nil }
+    var virtualResults: [SearchMatch] { virtualPanel?.results ?? [] }
+    var selectedVirtualResults: [SearchMatch] { virtualPanel?.selectedResults ?? [] }
+    var cursorVirtualResult: SearchMatch? { virtualPanel?.cursorResult }
+    var onVirtualResultsChange: (([SearchMatch]) -> Void)?
+    private(set) var virtualLibrarySlot: Int?
+    var onVirtualLibrarySnapshot: ((Int, [SearchMatch]) -> Void)?
+    private var synchronizingVirtualLibrary = false
+    var onVirtualReveal: ((PanelView, SearchMatch) -> Void)?
+    var onVirtualOpen: ((PanelView, SearchMatch) -> Void)?
     private(set) var remotePanel: RemotePanelView?
     var isRemote: Bool { remotePanel != nil }
     var locationGeneration: Int { generation }
     var onRemoteRefresh: ((PanelView) -> Void)?
     var isArchive: Bool { archivePanel != nil }
     var onArchiveView: ((PanelView, String) -> Void)?
+    var onArchiveOpenNested: ((PanelView, String) -> Void)?
     var onArchiveRefresh: ((PanelView) -> Void)?
     var onArchiveSwitchPanel: (() -> Void)?
 
@@ -116,6 +132,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     private let modePicker = NSPopUpButton()
     private var auxiliaryColumnLayout: (widths: [String: CGFloat], autosave: Bool)?
     private var columnLayoutGeneration = 0
+    private var restoringColumnLayout = true
     private(set) var contentMode: PanelContentMode = .files
     var onSelectionChange: ((PanelView) -> Void)?
     var onContentModeChange: ((PanelView) -> Void)?
@@ -175,10 +192,16 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     private var metadataTask: Task<([FileEntry], [String]), Never>?
     private let returnButton = NSButton(title: "Вернуться к папке", target: nil, action: nil)
     var isTemporary: Bool { directorySnapshot != nil }
-    var temporaryTitle: String? { isTemporary ? "Временная панель" : nil }
+    private(set) var temporaryLibrarySlot: Int?
+    var onTemporaryLibrarySnapshot: ((Int, [SearchResult]) -> Void)?
+    var temporaryTitle: String? {
+        if isVirtual { return L10n.text("Временная панель") + (virtualLibrarySlot.map { " · \($0)" } ?? "") }
+        guard isTemporary else { return nil }
+        return "Временная панель" + (temporaryLibrarySlot.map { " · \($0)" } ?? "")
+    }
     var historyPaths: [String] { navigation.history }
-    var canGoBack: Bool { isTemporary || navigation.backPath != nil }
-    var canGoForward: Bool { navigation.forwardPath != nil }
+    var canGoBack: Bool { isVirtual || isTemporary || navigation.backPath != nil }
+    var canGoForward: Bool { !isVirtual && navigation.forwardPath != nil }
     var onFocus: ((PanelView) -> Void)?
     var onError: ((Error) -> Void)?
     var onFileOpen: ((FileEntry) -> Void)?
@@ -257,6 +280,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(definition.id))
             column.title = definition.title
             column.width = definition.width
+            column.maxWidth = 4096
             column.minWidth = definition.id == "name" ? 120 : (definition.id == "origin" ? 180 : 55)
             column.resizingMask = definition.id == "name" ? .autoresizingMask : .userResizingMask
             column.headerCell.font = .systemFont(ofSize: 11, weight: .medium)
@@ -265,6 +289,8 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         if !AppRuntime.isSmoke { table.autosaveName = "FarMac.\(key).columns" }
         table.autosaveTableColumns = !AppRuntime.isSmoke
         updateColumns()
+        restorePersistedColumnLayout()
+        restoringColumnLayout = false
         let scroll = fileScroll
         scroll.documentView = table
         scroll.hasVerticalScroller = true
@@ -313,6 +339,10 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func load(_ url: URL? = nil, preserveSelection: Bool = true, selectName: String? = nil) {
+        if isVirtual {
+            guard url != nil else { return }
+            leaveVirtualResults(focus: false)
+        }
         if isRemote { if url == nil { onRemoteRefresh?(self); return }; leaveRemote(focus: false) }
         if isArchive {
             if url == nil { onArchiveRefresh?(self); return }
@@ -322,9 +352,114 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         load(url, preserveSelection: preserveSelection, selectName: selectName, historyAction: .visit)
     }
 
-    func showRemote(_ browser: RemotePanelView) {
-        if isArchive { leaveArchive(focus: false) }
+    /// Ordinary search results begin an independent collection, without a common-slot link.
+    func showVirtualResults(_ results: [SearchMatch], focusPanel: Bool = true) throws {
+        try showVirtualResults(results, linkedSlot: nil, focusPanel: focusPanel)
+    }
+    func showVirtualLibrarySlot(_ slot: Int, matches: [SearchMatch], focusPanel: Bool = true) throws {
+        guard (0..<PersistentTemporaryPanels.slotCount).contains(slot) else { throw PanelSessionError(L10n.text("Номер общей панели должен быть от 0 до 9.")) }
+        try showVirtualResults(matches, linkedSlot: slot, focusPanel: focusPanel)
+    }
+    /// A store reload is authoritative. Suppress write-back while replacing both linked views.
+    func refreshVirtualLibrarySlot(_ slot: Int, references: [SavedSearchReference]) throws {
+        guard virtualLibrarySlot == slot, let virtualPanel else { return }
+        synchronizingVirtualLibrary = true
+        defer { synchronizingVirtualLibrary = false }
+        let existing = Dictionary(virtualPanel.results.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let replacements = references.map { reference -> SearchMatch in
+            if let live = existing[reference.id], case .saved = live { return .saved(reference) }
+            if let live = existing[reference.id], (try? SavedSearchReference(capturing: live)) == reference { return live }
+            return .saved(reference)
+        }
+        try virtualPanel.replaceReferences(replacements)
+    }
+    /// Upgrade only the exact descriptors that were restored; unrelated or changed
+    /// rows remain offline. The collection keeps cursor, marks and slot affiliation.
+    func applyRestoredVirtualMatches(_ matches: [SearchMatch]) throws {
+        guard let virtualPanel else { return }
+        let restored = Dictionary(matches.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let replacements = virtualPanel.results.map { current -> SearchMatch in
+            guard case .saved(let reference) = current, let live = restored[current.id],
+                  (try? SavedSearchReference(capturing: live)) == reference else { return current }
+            return live
+        }
+        try virtualPanel.replaceReferences(replacements)
+    }
+    private func notifyVirtualResultsChange(_ results: [SearchMatch]) {
+        guard !synchronizingVirtualLibrary else { return }
+        onVirtualResultsChange?(results)
+        if let slot = virtualLibrarySlot { onVirtualLibrarySnapshot?(slot, results) }
+    }
+    private func showVirtualResults(_ results: [SearchMatch], linkedSlot: Int?, focusPanel: Bool) throws {
+        // Validate before changing the existing slot affiliation.
+        guard Set(results.map(\.id)).count <= TemporarySearchCollection.maximumCount else { throw PanelSessionError(L10n.text("Во временной панели допускается не более 10 000 ссылок.")) }
+        virtualLibrarySlot = linkedSlot
+        if let virtualPanel {
+            generation += 1
+            try virtualPanel.replaceReferences(results)
+            updateActive()
+            if focusPanel { focus() }
+            return
+        }
+        let browser = try VirtualResultsPanelView(results: results)
         if isRemote { leaveRemote(focus: false) }
+        if isArchive { leaveArchive(focus: false) }
+        if isTemporary { _ = restoreDirectorySnapshot() }
+        setContentMode(.files)
+        columnLayoutGeneration += 1
+        if auxiliaryColumnLayout == nil {
+            auxiliaryColumnLayout = (Dictionary(uniqueKeysWithValues: table.tableColumns.map { ($0.identifier.rawValue, $0.width) }), table.autosaveTableColumns)
+        }
+        table.autosaveTableColumns = false; table.columnAutoresizingStyle = .noColumnAutoresizing
+        virtualDirectoryState = (filterField.stringValue, quickFindField.stringValue, quickFindField.isHidden, sortOptions)
+        endQuickFind(focusTable: false); metadataTask?.cancel(); metadataTask = nil
+        generation += 1; loading = false
+        virtualPanel = browser; browser.setSortOptions(sortOptions); browser.setActive(active)
+        browser.onFocus = { [weak self] in guard let self else { return }; self.onFocus?(self) }
+        browser.onClose = { [weak self] in self?.leaveVirtualResults() }
+        browser.onSwitchPanel = { [weak self] in self?.onArchiveSwitchPanel?() }
+        browser.onReveal = { [weak self] result in guard let self else { return }; self.onVirtualReveal?(self, result) }
+        browser.onAction = { [weak self] event in guard let self else { return false }; return self.handleQuickFindKey(event) || (self.onKey?(event) ?? false) }
+        browser.onChange = { [weak self] in guard let self else { return }; self.onSelectionChange?(self) }
+        browser.onResultsChange = { [weak self] in self?.notifyVirtualResultsChange($0) }
+        browser.translatesAutoresizingMaskIntoConstraints = false; archiveContainer.addSubview(browser)
+        NSLayoutConstraint.activate([browser.leadingAnchor.constraint(equalTo: archiveContainer.leadingAnchor), browser.trailingAnchor.constraint(equalTo: archiveContainer.trailingAnchor), browser.topAnchor.constraint(equalTo: archiveContainer.topAnchor), browser.bottomAnchor.constraint(equalTo: archiveContainer.bottomAnchor)])
+        fileScroll.isHidden = true; auxiliary.isHidden = true; archiveContainer.isHidden = false
+        filterField.stringValue = ""; filterField.placeholderString = "Фильтр результатов  ⌘F"; filterField.isHidden = false
+        quickFindField.isHidden = true; modePicker.isHidden = true
+        returnButton.isHidden = false; returnButton.title = "Вернуться к папке"
+        pathField.isEditable = false; pathField.stringValue = L10n.text("Временные результаты поиска · локальные файлы / архивы / сеть")
+        updateActive(); updateSummary(); onSelectionChange?(self)
+        notifyVirtualResultsChange(browser.results)
+        if focusPanel { focus() }
+    }
+    func appendVirtualResults(_ results: [SearchMatch]) throws {
+        if let virtualPanel { try virtualPanel.append(results) }
+        else { try showVirtualResults(results) }
+    }
+    func removeVirtualSelection() { virtualPanel?.removeSelection() }
+    func leaveVirtualResults(focus: Bool = true) {
+        guard let browser = virtualPanel else { return }
+        generation += 1; virtualLibrarySlot = nil
+        browser.removeFromSuperview(); browser.releaseReferences(); virtualPanel = nil; archiveContainer.isHidden = true
+        fileScroll.isHidden = false; filterField.isHidden = false; modePicker.isHidden = false
+        filterField.stringValue = virtualDirectoryState?.filter ?? ""; filterField.placeholderString = "Фильтр в этой папке  ⌘F"
+        pathField.isEditable = true; pathField.stringValue = directory.path
+        returnButton.isHidden = true
+        quickFindField.stringValue = virtualDirectoryState?.quickFind ?? ""
+        quickFindField.isHidden = virtualDirectoryState?.quickFindHidden ?? true
+        if let options = virtualDirectoryState?.sort { sortOptions = options }
+        virtualDirectoryState = nil
+        setContentMode(.files); updateActive(); updateSummary(); onSelectionChange?(self)
+        if focus { self.focus() }
+    }
+
+    func showRemote(_ browser: RemotePanelView) {
+        if isVirtual { leaveVirtualResults(focus: false) }
+        if isArchive { leaveArchive(focus: false) }
+        if let previous = remotePanel {
+            leaveRemote(focus: false, notifyDisconnect: previous.provider !== browser.provider)
+        }
         setContentMode(.files)
         columnLayoutGeneration += 1
         if auxiliaryColumnLayout == nil { auxiliaryColumnLayout = (Dictionary(uniqueKeysWithValues: table.tableColumns.map { ($0.identifier.rawValue, $0.width) }), table.autosaveTableColumns) }
@@ -342,14 +477,32 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         returnButton.isHidden = false; returnButton.title = "Отключиться"
         pathField.isEditable = false; updateRemoteCaption(); focus()
     }
-    func leaveRemote(focus: Bool = true) {
+    func leaveRemote(focus: Bool = true, notifyDisconnect: Bool = true) {
         guard let browser = remotePanel else { return }
+        generation += 1
         browser.removeFromSuperview(); remotePanel = nil; archiveContainer.isHidden = true
+        if notifyDisconnect { onRemoteDisconnect?(browser.provider) }
         fileScroll.isHidden = false; filterField.isHidden = false; modePicker.isHidden = false
         pathField.isEditable = true; pathField.stringValue = directory.path
         returnButton.title = "Вернуться к папке"; returnButton.isHidden = !isTemporary
         setContentMode(.files); updateActive(); updateSummary(); onSelectionChange?(self)
         if focus { self.focus() }
+    }
+    static func runNetworkLifecycleUISmokeChecks() throws -> [String] {
+        guard AppRuntime.isSmoke, let base = AppRuntime.smokeStateDirectory else { throw NetworkError.io("Missing smoke state") }
+        let panel = PanelView(directory: base, key: "network-lifecycle-" + UUID().uuidString)
+        let first = ProviderUISmokeFixture(), second = ProviderUISmokeFixture()
+        var disconnected: [ObjectIdentifier] = []
+        panel.onRemoteDisconnect = { disconnected.append(ObjectIdentifier($0)) }
+        panel.showRemote(RemotePanelView(provider: first, path: "/", entries: []))
+        panel.showRemote(RemotePanelView(provider: first, path: "/docs", entries: []))
+        guard disconnected.isEmpty else { throw NetworkError.io("Same-provider reveal closed SSH") }
+        panel.showRemote(RemotePanelView(provider: second, path: "/", entries: []))
+        guard disconnected == [ObjectIdentifier(first)] else { throw NetworkError.io("Provider replacement did not disconnect old session") }
+        let connectedGeneration = panel.locationGeneration
+        panel.leaveRemote(focus: false); panel.leaveRemote(focus: false); panel.cancelInspection()
+        guard disconnected == [ObjectIdentifier(first), ObjectIdentifier(second)], panel.locationGeneration == connectedGeneration + 1 else { throw NetworkError.io("Panel exit must disconnect exactly once and invalidate pending previews") }
+        return ["Replacing a remote browser with the same provider preserves connection", "Provider replacement and panel exit disconnect the previous provider exactly once"]
     }
     private func updateRemoteCaption() {
         guard let remotePanel else { return }
@@ -358,8 +511,27 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         updateActive(); onSelectionChange?(self)
     }
     func showArchive(_ snapshot: ArchiveSnapshot) {
+        showArchive(frame: ArchiveNavigationFrame(snapshot: snapshot))
+    }
+    func showArchive(frame: ArchiveNavigationFrame) {
+        if isVirtual { leaveVirtualResults(focus: false) }
+        let snapshot = frame.snapshot
         if isRemote { leaveRemote(focus: false) }
-        if let archivePanel { archivePanel.update(snapshot: snapshot); updateArchiveCaption(); return }
+        if let archivePanel {
+            var restoredState: ArchivePanelView.NavigationState?
+            if let previous = archiveFrame, previous !== frame {
+                if frame.parent === previous {
+                    archiveNavigationStates[ObjectIdentifier(previous)] = archivePanel.captureNavigationState()
+                } else if previous.parent === frame {
+                    restoredState = archiveNavigationStates.removeValue(forKey: ObjectIdentifier(frame))
+                } else { archiveNavigationStates.removeAll() }
+            }
+            archiveFrame = frame
+            archivePanel.frameDisplayPath = frame.displayPath
+            archivePanel.update(snapshot: snapshot)
+            if let restoredState { archivePanel.restoreNavigationState(restoredState) }
+            updateArchiveCaption(); return
+        }
         setContentMode(.files)
         columnLayoutGeneration += 1
         if auxiliaryColumnLayout == nil {
@@ -369,11 +541,14 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         endQuickFind(focusTable: false)
         metadataTask?.cancel(); generation += 1; loading = false
         let browser = ArchivePanelView(snapshot: snapshot)
+        archiveFrame = frame
+        browser.frameDisplayPath = frame.displayPath
         archivePanel = browser
         browser.onFocus = { [weak self] in guard let self else { return }; self.onFocus?(self) }
-        browser.onClose = { [weak self] in self?.leaveArchive() }
+        browser.onClose = { [weak self] in self?.closeArchiveLevel() }
         browser.onSwitchPanel = { [weak self] in self?.onArchiveSwitchPanel?() }
         browser.onView = { [weak self] path in guard let self else { return }; self.onArchiveView?(self, path) }
+        browser.onOpenArchive = { [weak self] path in guard let self else { return }; self.onArchiveOpenNested?(self, path) }
         browser.onDirectoryChange = { [weak self] in self?.updateArchiveCaption() }
         browser.setActive(active)
         browser.translatesAutoresizingMaskIntoConstraints = false; archiveContainer.addSubview(browser)
@@ -384,9 +559,19 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         pathField.isEditable = false
         updateArchiveCaption(); focus()
     }
+    func closeArchiveLevel() {
+        guard let frame = archiveFrame, let parent = frame.parent else { leaveArchive(); return }
+        // Returning is also possible after an external change: the saved parent
+        // remains readable as a listing, while all operations verify its snapshot.
+        let hasSavedState = archiveNavigationStates[ObjectIdentifier(parent)] != nil
+        showArchive(frame: parent)
+        if !hasSavedState, let path = frame.memberPath { archivePanel?.reveal(path: path) }
+        focus()
+    }
     func leaveArchive(focus: Bool = true) {
         guard let browser = archivePanel else { return }
-        browser.removeFromSuperview(); archivePanel = nil; archiveContainer.isHidden = true
+        browser.removeFromSuperview(); archivePanel = nil; archiveFrame = nil; archiveContainer.isHidden = true
+        archiveNavigationStates.removeAll()
         fileScroll.isHidden = false; filterField.isHidden = false; modePicker.isHidden = false
         pathField.isEditable = true; pathField.stringValue = directory.path
         returnButton.title = "Вернуться к папке"; returnButton.isHidden = !isTemporary
@@ -396,9 +581,10 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
     private func updateArchiveCaption() {
         guard let archivePanel else { return }
-        pathField.stringValue = archivePanel.snapshot.sourceURL.path + " !/" + archivePanel.currentDirectory
-        summary.stringValue = archivePanel.snapshot.isEncrypted
-            ? "Архив только для чтения · F3 просмотр · F5 извлечь с паролем"
+        pathField.stringValue = (archiveFrame?.displayPath ?? archivePanel.snapshot.sourceURL.path) + " !/" + archivePanel.currentDirectory
+        returnButton.title = archiveFrame?.parent == nil ? L10n.text("Закрыть архив") : L10n.text("К родительскому архиву")
+        summary.stringValue = archivePanel.snapshot.isReadOnly
+            ? L10n.text("Архив только для чтения · F3 просмотр · F5 извлечь")
             : "Архив · F3 просмотр · F4 рабочая копия · F5 извлечь · F8 удалить из архива"
         updateActive(); onSelectionChange?(self)
     }
@@ -408,6 +594,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         setContentMode(PanelContentMode.allCases[index]); focus()
     }
     func setContentMode(_ mode: PanelContentMode) {
+        if isVirtual { leaveVirtualResults(focus: false) }
         if isRemote { leaveRemote(focus: false) }
         if isArchive { leaveArchive(focus: false) }
         columnLayoutGeneration += 1
@@ -435,16 +622,100 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         if mode == .files, let saved = auxiliaryColumnLayout {
             restoreColumnWidths(saved.widths)
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.contentMode == .files, !self.isArchive, !self.isRemote,
+                guard let self, self.contentMode == .files, !self.isArchive, !self.isRemote, !self.isVirtual,
                       self.columnLayoutGeneration == layoutGeneration else { return }
                 self.window?.contentView?.layoutSubtreeIfNeeded()
-                self.table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+                self.updateColumnAutoresizing()
                 self.restoreColumnWidths(saved.widths)
                 self.table.autosaveTableColumns = !self.isTemporary && saved.autosave
                 self.auxiliaryColumnLayout = nil
             }
         }
     }
+    static func runColumnLayoutUISmokeChecks() async throws -> [String] {
+        guard AppRuntime.isSmoke, let root = AppRuntime.smokeStateDirectory else { throw PanelSessionError("Column layout smoke needs isolated defaults") }
+        let folder = root.appendingPathComponent("column-layout-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appendingPathComponent("one.txt"); try Data("one".utf8).write(to: file)
+        let key = "layout-smoke-" + UUID().uuidString
+        let panel = PanelView(directory: folder, key: key)
+        let firstWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 520), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        firstWindow.isReleasedWhenClosed = false; firstWindow.contentView = panel; firstWindow.orderFront(nil)
+        firstWindow.contentView?.layoutSubtreeIfNeeded()
+        defer { firstWindow.close() }
+        panel.load()
+        let deadline = Date().addingTimeInterval(5)
+        while panel.loading && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        guard !panel.loading, let size = panel.table.tableColumns.first(where: { $0.identifier.rawValue == "size" }),
+              let index = panel.table.tableColumns.firstIndex(where: { $0.identifier.rawValue == "size" }) else { throw PanelSessionError("Column fixture did not load") }
+        size.width = 198; panel.table.moveColumn(index, toColumn: 0); panel.persistSession()
+        guard let originalData = AppPreferences.defaults.data(forKey: panel.columnLayoutKey) else { throw PanelSessionError("Column geometry not persisted") }
+        let saved = try PanelColumnLayout.decode(originalData)
+        let recreated = PanelView(directory: folder, key: key)
+        let secondWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 520), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        secondWindow.isReleasedWhenClosed = false; secondWindow.contentView = recreated; secondWindow.orderFront(nil)
+        secondWindow.contentView?.layoutSubtreeIfNeeded()
+        defer { secondWindow.close() }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        guard recreated.table.tableColumns.first?.identifier.rawValue == "size",
+              recreated.table.tableColumns.first(where: { $0.identifier.rawValue == "size" })?.width == 198 else {
+            throw PanelSessionError("Recreated panel lost dragged order/resized width")
+        }
+        panel.showSearchResults([try SearchResult.capture(file)])
+        panel.table.tableColumns.first(where: { $0.identifier.rawValue == "origin" })?.width = 413
+        panel.persistSession()
+        guard let transientData = AppPreferences.defaults.data(forKey: panel.columnLayoutKey),
+              try PanelColumnLayout.decode(transientData) == saved else { throw PanelSessionError("Temporary origin column contaminated folder layout") }
+        _ = panel.restoreDirectorySnapshot()
+        panel.persistSession()
+        guard let restoredData = AppPreferences.defaults.data(forKey: panel.columnLayoutKey),
+              try PanelColumnLayout.decode(restoredData) == saved else { throw PanelSessionError("Returning from temporary panel changed saved geometry") }
+        AppPreferences.defaults.set(Data("invalid".utf8), forKey: panel.columnLayoutKey)
+        let recovered = PanelView(directory: folder, key: key)
+        guard recovered.table.tableColumns.contains(where: { $0.identifier.rawValue == "name" }) else { throw PanelSessionError("Invalid geometry broke panel construction") }
+        panel.cancelInspection(); recreated.cancelInspection(); recovered.cancelInspection()
+        return ["Column width and order survive panel reconstruction and real window layout using isolated preferences",
+                "Temporary panel origin layout does not overwrite saved folder columns",
+                "Invalid saved column layout falls back to available columns"]
+    }
+
+    private var columnLayoutKey: String { "panel.\(locationKey).columnLayout.v1" }
+    func tableViewColumnDidMove(_ notification: Notification) {
+        if auxiliaryColumnLayout == nil && !isTemporary && !isArchive && !isRemote && !isVirtual { updateColumnAutoresizing() }
+        persistColumnLayout()
+    }
+    private func updateColumnAutoresizing() {
+        // AppKit's first-column policy follows the physical column index. After
+        // a drag it must not stretch a user's explicitly sized metadata column.
+        table.columnAutoresizingStyle = table.tableColumns.first?.identifier.rawValue == "name" ? .firstColumnOnlyAutoresizingStyle : .noColumnAutoresizing
+    }
+    func tableViewColumnDidResize(_ notification: Notification) { persistColumnLayout() }
+    private func persistColumnLayout() {
+        guard !restoringColumnLayout, !isTemporary, !isArchive, !isRemote, !isVirtual,
+              contentMode == .files, auxiliaryColumnLayout == nil else { return }
+        let columns = table.tableColumns
+        guard let layout = try? PanelColumnLayout(order: columns.map { $0.identifier.rawValue },
+            widths: Dictionary(uniqueKeysWithValues: columns.map { ($0.identifier.rawValue, Double($0.width)) })),
+              let data = try? layout.encoded() else { return }
+        AppPreferences.defaults.set(data, forKey: columnLayoutKey)
+    }
+    private func restorePersistedColumnLayout() {
+        guard let data = AppPreferences.defaults.data(forKey: columnLayoutKey),
+              let layout = try? PanelColumnLayout.decode(data) else { return }
+        let wasRestoring = restoringColumnLayout; restoringColumnLayout = true
+        defer { restoringColumnLayout = wasRestoring }
+        for (position, id) in layout.orderedColumns(available: table.tableColumns.map { $0.identifier.rawValue }).enumerated() {
+            if let current = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == id }), current != position {
+                table.moveColumn(current, toColumn: position)
+            }
+        }
+        updateColumnAutoresizing()
+        for column in table.tableColumns {
+            if let width = layout.widths[column.identifier.rawValue] { column.width = max(column.minWidth, CGFloat(width)) }
+        }
+    }
+
     private func restoreColumnWidths(_ widths: [String: CGFloat]) {
         for column in table.tableColumns {
             if let width = widths[column.identifier.rawValue] { column.width = width }
@@ -467,7 +738,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         table.reloadData()
     }
     func invalidateUnavailableVolume(_ volume: URL) {
-        guard !isArchive, !isRemote, !isTemporary else { return }
+        guard !isArchive, !isRemote, !isTemporary, !isVirtual else { return }
         let path = directory.standardizedFileURL.path, root = volume.standardizedFileURL.path
         guard path == root || path.hasPrefix(root + "/") else { return }
         generation += 1; loading = false; cancelInspection()
@@ -477,6 +748,8 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
     func cancelInspection() { auxiliary.cancel() }
     func persistSession() {
+        guard !isVirtual else { return }
+        persistColumnLayout()
         guard !loading else { return }
         let saved = PanelSession(directory: directory.path, mode: contentMode,
                                  cursorID: selection.cursorID, filter: filterField.stringValue,
@@ -501,17 +774,21 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         if active { focus() }
     }
     func addTemporaryItems(_ additions: [SearchResult]) throws {
+        let slot = temporaryLibrarySlot
         let merged = try TemporaryPanelItems.merging(isTemporary ? Array(searchResults.values) : [], additions)
         showSearchResults(merged)
+        temporaryLibrarySlot = slot
+        if let slot { onTemporaryLibrarySnapshot?(slot, temporaryResults); updateActive() }
     }
     func removeTemporarySelection() {
         guard isTemporary, !loading else { return }
         let ids = Set(selection.operationIDs(orderedIDs: visible.map(\.id)))
         for id in ids { searchResults.removeValue(forKey: id) }
         entries.removeAll { ids.contains($0.id) }; applyFilter()
+        if let slot = temporaryLibrarySlot { onTemporaryLibrarySnapshot?(slot, temporaryResults) }
     }
     func markPaths(_ urls: [URL]) {
-        guard !isArchive && !isRemote, contentMode == .files, !loading else { return }
+        guard !isArchive && !isRemote && !isVirtual, contentMode == .files, !loading else { return }
         selection.saveMarks(); selection.clearMarks()
         let paths = Set(urls.map { $0.standardizedFileURL.path })
         selection.setMarked(visible.filter { paths.contains($0.url.standardizedFileURL.path) }.map(\.id), marked: true)
@@ -519,7 +796,15 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
 
     /// Results are a distinct, in-memory panel source; the directory and its history stay intact.
-    func showSearchResults(_ results: [SearchResult]) {
+    func showTemporaryLibrarySlot(_ slot: Int, items: [SearchResult], focus: Bool = true) {
+        guard (0..<TemporaryPanelLibrary.slotCount).contains(slot) else { return }
+        showSearchResults(items, focusPanel: focus)
+        temporaryLibrarySlot = slot; updateActive()
+    }
+    func showSearchResults(_ results: [SearchResult], focusPanel: Bool = true) {
+        if isVirtual { leaveVirtualResults(focus: false) }
+        if let slot = temporaryLibrarySlot { onTemporaryLibrarySnapshot?(slot, temporaryResults) }
+        temporaryLibrarySlot = nil
         if isRemote { leaveRemote(focus: false) }
         if isArchive { leaveArchive(focus: false) }
         setContentMode(.files)
@@ -557,7 +842,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         updateActive()
         applyFilter(resetSelection: true)
         refresh()
-        if !restoringSession { focus() }
+        if !restoringSession && focusPanel { focus() }
     }
 
     func leaveSearchResults() {
@@ -566,11 +851,15 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         focus()
     }
 
-    @objc private func returnToDirectory() { if isRemote { leaveRemote() } else if isArchive { leaveArchive() } else { leaveSearchResults() } }
+    @objc private func returnToDirectory() { if isVirtual { leaveVirtualResults() } else if isRemote { leaveRemote() } else if isArchive { closeArchiveLevel() } else { leaveSearchResults() } }
 
     @discardableResult
     private func restoreDirectorySnapshot() -> Bool {
         guard let snapshot = directorySnapshot else { return false }
+        let wasRestoringColumns = restoringColumnLayout; restoringColumnLayout = true
+        defer { restoringColumnLayout = wasRestoringColumns; persistColumnLayout() }
+        if let slot = temporaryLibrarySlot { onTemporaryLibrarySnapshot?(slot, temporaryResults) }
+        temporaryLibrarySlot = nil
         metadataTask?.cancel()
         metadataTask = nil
         generation += 1
@@ -607,6 +896,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
 
     func refresh() {
+        if isVirtual { return }
         if isRemote { onRemoteRefresh?(self); return }; if isArchive { onArchiveRefresh?(self); return }
         guard isTemporary else { load(); return }
         metadataTask?.cancel()
@@ -635,6 +925,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
             entries = sortedEntries(refreshed.0)
             loading = false
             applyFilter()
+            if let slot = temporaryLibrarySlot { onTemporaryLibrarySnapshot?(slot, temporaryResults) }
         }
     }
 
@@ -671,6 +962,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
 
     private func load(_ url: URL?, preserveSelection: Bool, selectName: String? = nil, historyAction: HistoryAction) {
+        guard !isVirtual else { return }
         restoreDirectorySnapshot()
         let target = (url ?? directory).standardizedFileURL
         generation += 1
@@ -679,12 +971,13 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         summary.stringValue = "Чтение папки…"
         let hidden = showHidden
         let options = sortOptions, groups = sortGroups, masks = maskGroups, marks = selection.markedIDs
+        let descriptionEncoding = DescriptionPreferences.encoding(for: target)
         Task {
             do {
                 let result = try await Task.detached(priority: .userInitiated) {
                     let raw = try FileService.list(target, showHidden: hidden, sortResult: false)
                     let sorted = Self.sortedSnapshot(raw, options: options, marks: marks, groups: groups, masks: masks)
-                    do { return (sorted.0, try FileDescriptions.load(directory: target).descriptions, "", sorted.1) }
+                    do { return (sorted.0, try FileDescriptions.load(directory: target, encoding: descriptionEncoding).descriptions, "", sorted.1) }
                     catch { return (sorted.0, [String: String](), "Описания: " + error.localizedDescription, sorted.1) }
                 }.value
                 guard token == generation else { return }
@@ -725,23 +1018,25 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
 
     var cursorEntry: FileEntry? {
-        guard !isArchive && !isRemote, contentMode == .files, !loading, let entry = entry(at: table.selectedRow), validateResults([entry]) else { return nil }
+        guard !isArchive && !isRemote && !isVirtual, contentMode == .files, !loading, let entry = entry(at: table.selectedRow), validateResults([entry]) else { return nil }
         return entry
     }
     var selectedEntries: [FileEntry] {
-        guard !isArchive && !isRemote, contentMode == .files, !loading else { return [] }
+        guard !isArchive && !isRemote && !isVirtual, contentMode == .files, !loading else { return [] }
         let ids = Set(selection.operationIDs(orderedIDs: visible.map(\.id)))
         let selected = visible.filter { ids.contains($0.id) }
         // Reject the entire requested batch if any source is stale; never fall back to the cursor.
         return validateResults(selected) ? selected : []
     }
     var markedEntries: [FileEntry] {
-        guard !isArchive && !isRemote, contentMode == .files, !loading else { return [] }
+        guard !isArchive && !isRemote && !isVirtual, contentMode == .files, !loading else { return [] }
         let marked = visible.filter { selection.markedIDs.contains($0.id) }
         return validateResults(marked) ? marked : []
     }
 
     /// Carry the original snapshots across dialogs so submission can recheck the same sources.
+    var temporaryResults: [SearchResult] { isTemporary ? entries.compactMap { searchResults[$0.id] } : [] }
+
     func capturedSearchResults(for entries: [FileEntry]) -> [SearchResult] {
         guard isTemporary else { return [] }
         return entries.compactMap { searchResults[$0.id] }
@@ -772,9 +1067,10 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         return false
     }
 
-    func saveSelectionForOperation() { selection.saveMarks(); shiftMarking = nil }
+    func saveSelectionForOperation() { if let virtualPanel { virtualPanel.saveSelectionForOperation(); return }; selection.saveMarks(); shiftMarking = nil }
 
     func toggleMarkAndAdvance() {
+        if let virtualPanel { virtualPanel.toggleMarkAndAdvance(); return }
         guard !loading else { return }
         shiftMarking = nil
         selection.saveMarks()
@@ -783,6 +1079,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         reloadMarks()
     }
     func markAll() {
+        if let virtualPanel { virtualPanel.markAll(); return }
         guard !loading else { return }
         selection.saveMarks()
         shiftMarking = nil
@@ -791,17 +1088,20 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
     /// Clearing after an operation keeps its pre-operation snapshot available to Ctrl+M.
     func clearMarks() {
+        if let virtualPanel { virtualPanel.clearMarks(); return }
         shiftMarking = nil
         selection.clearMarks()
         reloadMarks()
     }
     func restoreMarks() {
+        if let virtualPanel { virtualPanel.restoreMarks(); return }
         guard !loading else { return }
         shiftMarking = nil
         selection.restoreMarks(validIDs: visible.map(\.id))
         reloadMarks()
     }
     func invertMarks(includeDirectories: Bool = false) {
+        if let virtualPanel { virtualPanel.invertMarks(includeDirectories: includeDirectories); return }
         guard !loading else { return }
         selection.saveMarks()
         shiftMarking = nil
@@ -812,6 +1112,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
     func invertFilesAndClearDirectories() { invertMarks() }
     func selectSameExtension(mark: Bool) {
+        if let virtualPanel { virtualPanel.selectSameName(mark: mark, byExtension: true); return }
         guard let current = cursorEntry, !loading else { return }
         let ext = current.url.pathExtension
         let ids = visible.filter {
@@ -823,6 +1124,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         reloadMarks()
     }
     func selectSameName(mark: Bool) {
+        if let virtualPanel { virtualPanel.selectSameName(mark: mark, byExtension: false); return }
         guard let current = cursorEntry, !loading else { return }
         let base = current.url.deletingPathExtension().lastPathComponent
         let ids = visible.filter {
@@ -834,6 +1136,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         reloadMarks()
     }
     func applyMask(_ expression: String, mark: Bool, includeDirectories: Bool = false) throws {
+        if let virtualPanel { try virtualPanel.applyMask(expression, groups: maskGroups, mark: mark, includeDirectories: includeDirectories); return }
         let mask = try FileMask(expression, groups: maskGroups)
         guard !loading else { return }
         // Evaluate the complete batch before changing any marks; timeout is atomic.
@@ -849,6 +1152,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         max(1, Int((table.enclosingScrollView?.contentSize.height ?? table.visibleRect.height) / (table.rowHeight + table.intercellSpacing.height)))
     }
     func automationMoveCursor(_ delta: Int) {
+        if let virtualPanel { virtualPanel.moveCursor(by: delta); return }
         shiftMarking = nil
         moveCursor(to: min(max(0, table.selectedRow + delta), max(0, table.numberOfRows - 1)))
     }
@@ -939,22 +1243,25 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         updateSummary()
     }
     func entry(at row: Int) -> FileEntry? {
+        guard !isVirtual else { return nil }
         let index = row - offset
         return visible.indices.contains(index) ? visible[index] : nil
     }
-    func focus() { if let remotePanel { remotePanel.focus() } else if let archivePanel { archivePanel.focus() } else if contentMode == .files { window?.makeFirstResponder(table) } else { auxiliary.focus() } }
-    func focusPath() { onFocus?(self); window?.makeFirstResponder(pathField); pathField.selectText(nil) }
+    func focus() { if let virtualPanel { virtualPanel.focus() } else if let remotePanel { remotePanel.focus() } else if let archivePanel { archivePanel.focus() } else if contentMode == .files { window?.makeFirstResponder(table) } else { auxiliary.focus() } }
+    func focusPath() { guard !isVirtual else { return }; onFocus?(self); window?.makeFirstResponder(pathField); pathField.selectText(nil) }
     func focusFilter() { onFocus?(self); window?.makeFirstResponder(filterField) }
     func clearFilter() { filterField.stringValue = ""; applyFilter(); focus() }
 
     @objc func parent() {
         onFocus?(self)
-        if isRemote { leaveRemote(); return }; if isArchive { leaveArchive(); return }
+        if isVirtual { leaveVirtualResults(); return }
+        if isRemote { leaveRemote(); return }; if isArchive { closeArchiveLevel(); return }
         if isTemporary { leaveSearchResults(); return }
         guard directory.path != "/" else { return }
         load(directory.deletingLastPathComponent(), preserveSelection: false, selectName: directory.lastPathComponent)
     }
     @objc func goToPath() {
+        guard !isVirtual else { return }
         onFocus?(self)
         let path = (pathField.stringValue as NSString).expandingTildeInPath
         let url = path.hasPrefix("/") ? URL(fileURLWithPath: path) : directory.appendingPathComponent(path)
@@ -962,6 +1269,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         focus()
     }
     @objc func openSelection() {
+        if let virtualPanel { virtualPanel.revealSelection(); return }
         guard !loading else { return }
         if hasParent && table.selectedRow == 0 { parent(); return }
         guard let entry = cursorEntry else { return }
@@ -969,13 +1277,15 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         else { onFileOpen?(entry) }
     }
     func goBack() {
-        if isRemote { leaveRemote(); return }; if isArchive { leaveArchive(); return }
+        if isVirtual { leaveVirtualResults(); return }
+        if isRemote { leaveRemote(); return }; if isArchive { closeArchiveLevel(); return }
         if isTemporary { leaveSearchResults(); return }
         guard let path = navigation.backPath, !loading else { return }
         load(URL(fileURLWithPath: path), preserveSelection: false, historyAction: .back)
     }
     func goForward() {
-        if isRemote { leaveRemote(); return }; if isArchive { leaveArchive(); return }
+        if isVirtual { leaveVirtualResults(); return }
+        if isRemote { leaveRemote(); return }; if isArchive { closeArchiveLevel(); return }
         if isTemporary { leaveSearchResults(); return }
         guard let path = navigation.forwardPath, !loading else { return }
         load(URL(fileURLWithPath: path), preserveSelection: false, historyAction: .forward)
@@ -1022,6 +1332,11 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
     func findNext(backwards: Bool = false) { findQuickMatch(backwards: backwards, includeCurrent: false) }
     private func findQuickMatch(backwards: Bool, includeCurrent: Bool) {
+        if let virtualPanel {
+            do { try virtualPanel.find(quickFindField.stringValue, backwards: backwards, includeCurrent: includeCurrent) }
+            catch { quickFindField.toolTip = error.localizedDescription }
+            return
+        }
         guard !loading, !visible.isEmpty, !quickFindField.stringValue.isEmpty else { return }
         do {
             // Quick find accepts only * and ? as wildcards; all other filename text is literal.
@@ -1090,6 +1405,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         setSortOptions(options)
     }
     func setSortOptions(_ options: FileSortOptions) {
+        if let virtualPanel { sortOptions = options; virtualPanel.setSortOptions(options); return }
         sortOptions = options
         if !isTemporary, let data = try? JSONEncoder().encode(options) {
             AppPreferences.defaults.set(data, forKey: "panel.\(locationKey).sort")
@@ -1116,6 +1432,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         } catch { return (sorted, "Группы сортировки: " + error.localizedDescription) }
     }
     private func resortKeepingCursor() {
+        guard !isVirtual else { return }
         let gesture = shiftMarking
         entries = sortedEntries(entries)
         applyFilter()
@@ -1123,22 +1440,26 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
 
     func setDisplayMode(_ mode: PanelDisplayMode) {
+        guard !isVirtual else { return }
         displayMode = mode
         if !isTemporary { AppPreferences.defaults.set(mode.rawValue, forKey: "panel.\(locationKey).display") }
         updateColumns()
     }
     func resetColumnWidths() {
+        guard !isVirtual else { return }
         let widths = Dictionary(uniqueKeysWithValues: Self.columnDefinitions.map { ($0.id, $0.width) })
         if let saved = auxiliaryColumnLayout { auxiliaryColumnLayout = (widths, saved.autosave) }
         restoreColumnWidths(widths)
     }
     func setVisibleColumns(_ ids: Set<String>) {
+        guard !isVirtual else { return }
         customColumnIDs = ids.intersection(Set(Self.columnDefinitions.map(\.id))).union(["name"])
         customColumnIDs.remove("origin")
         if !isTemporary { AppPreferences.defaults.set(customColumnIDs.sorted(), forKey: "panel.\(locationKey).columns") }
         setDisplayMode(.custom)
     }
     func setColorizeFiles(_ enabled: Bool) {
+        guard !isVirtual else { return }
         colorizeFiles = enabled
         if !isTemporary { AppPreferences.defaults.set(enabled, forKey: "panel.\(locationKey).colorize") }
         table.reloadData()
@@ -1170,6 +1491,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     ]
 
     private func applyFilter(resetSelection: Bool = false, selectName: String? = nil) {
+        if let virtualPanel { virtualPanel.setFilter(filterField.stringValue); return }
         let oldRow = table.selectedRow
         let oldCursorID = selection.cursorID
         let wasParent = hasParent && oldRow == 0
@@ -1200,13 +1522,15 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         title.stringValue = "\(active ? "●" : "○")  \(locationKey == "left" ? "ЛЕВАЯ ПАНЕЛЬ" : "ПРАВАЯ ПАНЕЛЬ")\(active ? "  /  АКТИВНА" : "")"
         if isArchive { title.stringValue += "  /  АРХИВ" }
         if isRemote { title.stringValue += "  /  СЕТЬ" }
-        archivePanel?.setActive(active); remotePanel?.setActive(active)
+        if isVirtual { title.stringValue += "  /  ВРЕМЕННЫЕ РЕЗУЛЬТАТЫ" }
+        archivePanel?.setActive(active); remotePanel?.setActive(active); virtualPanel?.setActive(active)
         if let temporaryTitle { title.stringValue += "  /  " + temporaryTitle }
         if contentMode != .files { title.stringValue += "  /  " + contentMode.title }
         title.textColor = active ? Palette.accent : Palette.muted
         table.enumerateAvailableRowViews { row, _ in (row as? FileRow)?.active = self.active; row.needsDisplay = true }
     }
     private func updateSummary() {
+        if isVirtual { summary.stringValue = "Ссылки действуют только в текущем сеансе · исходные файлы сохраняются"; return }
         let marked = visible.filter { selection.markedIDs.contains($0.id) }
         let count = visible.filter(\.isDirectory).count
         let total = "Папки: \(count)  ·  Файлы: \(visible.count - count)"
@@ -1225,7 +1549,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
     func numberOfRows(in tableView: NSTableView) -> Int { visible.count + offset }
     func tableViewSelectionDidChange(_ notification: Notification) {
-        guard !synchronizingTable else { return }
+        guard !synchronizingTable, !isVirtual else { return }
         selection.focus(entry(at: table.selectedRow)?.id)
         updateSummary()
         onSelectionChange?(self)

@@ -1,7 +1,7 @@
 import Foundation
 
 /// WebDAV with validated TLS, no redirects, bounded XML, and streaming transfers.
-public final class WebRemoteProvider: RemoteConditionalDownloadProvider {
+public final class WebRemoteProvider: RemoteConditionalDownloadProvider, RemoteSearchDownloadProvider, RemoteBoundedDownloadProvider {
     public let connection: NetworkConnection
     private let password: String?
     public init(connection: NetworkConnection, password: String?) {
@@ -35,6 +35,26 @@ public final class WebRemoteProvider: RemoteConditionalDownloadProvider {
         try download(path: path, to: to, resumeOffset: resumeOffset, expectedVersion: nil, cancellation: cancellation, progress: progress)
     }
 
+    public func boundedDownload(path: String, to: URL, maximumBytes: Int64, cancellation: TransferCancellation,
+                                progress: @escaping (NetworkProgress) -> Void) throws {
+        guard (0...RemoteTransferLimits.maximumBytes).contains(maximumBytes) else { throw NetworkError.limitExceeded("Transfer download exceeds 1 TiB.") }
+        let entry = try stat(path: path, cancellation: cancellation)
+        let strong = entry?.version.flatMap { $0.hasPrefix("\"") && $0.hasSuffix("\"") ? $0 : nil }
+        if let strong { try validateStrongETag(strong) }
+        try download(path: path, to: to, resumeOffset: 0, expectedVersion: strong, maximumBytes: maximumBytes,
+                     cancellation: cancellation, progress: progress)
+    }
+    public func searchDownload(path: String, to: URL, maximumBytes: Int64, cancellation: TransferCancellation,
+                               progress: @escaping (NetworkProgress) -> Void) throws {
+        guard (0...Int64(64 * 1024 * 1024)).contains(maximumBytes) else { throw NetworkError.limitExceeded("Search download exceeds 64 MiB.") }
+        let entry = try stat(path: path, cancellation: cancellation)
+        let version = entry?.version
+        let strong = version.flatMap { $0.hasPrefix("\"") && $0.hasSuffix("\"") ? $0 : nil }
+        if let strong { try validateStrongETag(strong) }
+        try download(path: path, to: to, resumeOffset: 0, expectedVersion: strong, maximumBytes: maximumBytes,
+                     cancellation: cancellation, progress: progress)
+    }
+
     /// Retrieves bytes from one strong entity version. A failed precondition or
     /// an ignored range is rejected before the existing partial file is changed.
     public func conditionalDownload(path: String, to: URL, resumeOffset: Int64, expectedVersion: String,
@@ -44,7 +64,7 @@ public final class WebRemoteProvider: RemoteConditionalDownloadProvider {
                      cancellation: cancellation, progress: progress)
     }
 
-    private func download(path: String, to: URL, resumeOffset: Int64, expectedVersion: String?, cancellation: TransferCancellation,
+    private func download(path: String, to: URL, resumeOffset: Int64, expectedVersion: String?, maximumBytes: Int64? = nil, cancellation: TransferCancellation,
                           progress: @escaping (NetworkProgress) -> Void) throws {
         try webRemoteCheck(cancellation)
         guard resumeOffset >= 0 else { throw WebRemoteError("Invalid download offset.") }
@@ -58,7 +78,7 @@ public final class WebRemoteProvider: RemoteConditionalDownloadProvider {
         defer { try? file.close() }
         guard try file.seekToEnd() == UInt64(resumeOffset) || resumeOffset == 0 else { throw WebRemoteError("The partial download size changed.") }
         // Truncation waits until the server's status and range have been validated.
-        _ = try request("GET", path: path, headers: headers, file: file, offset: resumeOffset, expectedETag: expectedVersion,
+        _ = try request("GET", path: path, headers: headers, file: file, offset: resumeOffset, expectedETag: expectedVersion, maximumBytes: maximumBytes,
                         cancellation: cancellation, progress: progress)
     }
 
@@ -122,7 +142,7 @@ public final class WebRemoteProvider: RemoteConditionalDownloadProvider {
 
     private func request(_ method: String, path: String, headers: [String: String] = [:], body: Data? = nil,
                          upload: URL? = nil, file: FileHandle? = nil, offset: Int64 = 0,
-                         expectedETag: String? = nil,
+                         expectedETag: String? = nil, maximumBytes: Int64? = nil,
                          collectionURL: Bool = false,
                          cancellation: TransferCancellation, progress: @escaping (NetworkProgress) -> Void = { _ in }) throws -> DAVResponse {
         try webRemoteCheck(cancellation)
@@ -141,7 +161,7 @@ public final class WebRemoteProvider: RemoteConditionalDownloadProvider {
         config.urlCache = nil; config.httpCookieStorage = nil; config.urlCredentialStorage = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = timeout; config.timeoutIntervalForResource = timeout
-        let delegate = DAVRequestDelegate(method: method, path: path, file: file, offset: offset, expectedETag: expectedETag, progress: progress)
+        let delegate = DAVRequestDelegate(method: method, path: path, file: file, offset: offset, expectedETag: expectedETag, maximumBytes: maximumBytes, progress: progress)
         let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         let task: URLSessionTask
@@ -176,14 +196,15 @@ private final class DAVRequestDelegate: NSObject, URLSessionDataDelegate, URLSes
     let file: FileHandle?
     let offset: Int64
     let expectedETag: String?
+    let maximumBytes: Int64?
     let progress: (NetworkProgress) -> Void
     var response: HTTPURLResponse?
     var error: Error?
     var data = Data()
     var received: Int64 = 0
     var expectedDownloadLength: Int64?
-    init(method: String, path: String, file: FileHandle?, offset: Int64, expectedETag: String?, progress: @escaping (NetworkProgress) -> Void) {
-        self.method = method; self.path = path; self.file = file; self.offset = offset; self.expectedETag = expectedETag; self.progress = progress
+    init(method: String, path: String, file: FileHandle?, offset: Int64, expectedETag: String?, maximumBytes: Int64?, progress: @escaping (NetworkProgress) -> Void) {
+        self.method = method; self.path = path; self.file = file; self.offset = offset; self.expectedETag = expectedETag; self.maximumBytes = maximumBytes; self.progress = progress
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -223,6 +244,9 @@ private final class DAVRequestDelegate: NSObject, URLSessionDataDelegate, URLSes
                 error = WebRemoteError("The server did not return the requested download range (HTTP \(http.statusCode)).")
                 completionHandler(.cancel); return
             }
+            if let maximumBytes, let expectedDownloadLength, expectedDownloadLength > maximumBytes {
+                error = NetworkError.limitExceeded("Search response exceeds the expected file size."); completionHandler(.cancel); return
+            }
             do {
                 if offset == 0 { try file.truncate(atOffset: 0) }
                 try file.seek(toOffset: UInt64(offset))
@@ -231,8 +255,14 @@ private final class DAVRequestDelegate: NSObject, URLSessionDataDelegate, URLSes
         completionHandler(.allow)
     }
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard error == nil else { dataTask.cancel(); return }
         do {
-            if let file { try file.write(contentsOf: data) }
+            if let file {
+                if let maximumBytes, Int64(data.count) > maximumBytes - received {
+                    throw NetworkError.limitExceeded("Search response exceeds the expected file size.")
+                }
+                try file.write(contentsOf: data)
+            }
             else {
                 guard self.data.count + data.count <= 32 * 1024 * 1024 else { throw WebRemoteError("WebDAV response exceeds the 32 MB limit.") }
                 self.data.append(data)

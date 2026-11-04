@@ -13,9 +13,12 @@ final class ExtensionWorkspace: NSObject, NSMenuItemValidation {
         ("SHA-256 текста", "checksum", .command),
         ("Статистика выбранных файлов", "stats", .panel),
         ("Просмотр JSON с форматированием", "json", .viewer),
-        ("EditCase: ASCII ПРОПИСНЫЕ", "editcase-upper", .editor),
-        ("EditCase: ASCII строчные", "editcase-lower", .editor),
-        ("Align: выравнивание ASCII до 75 колонок", "align", .editor)
+        ("EditCase: ПРОПИСНЫЕ", "editcase-upper", .editor),
+        ("EditCase: строчные", "editcase-lower", .editor),
+        ("EditCase: Каждое Слово С Прописной", "editcase-title", .editor),
+        ("EditCase: иНВЕРСИЯ рЕГИСТРА", "editcase-toggle", .editor),
+        ("EditCase: циклическая смена регистра", "editcase-cyclic", .editor),
+        ("Align: форматировать выделенный блок…", "align", .editor)
     ]
     func installMenu(in bar: NSMenu) {
         let root = NSMenuItem(title: "Расширения", action: nil, keyEquivalent: "")
@@ -51,8 +54,43 @@ final class ExtensionWorkspace: NSObject, NSMenuItemValidation {
     }
     @objc private func runExample(_ sender: NSMenuItem) {
         let example = examples[sender.tag]
-        do { try start(ExtensionDescriptor(id: "builtin." + example.1, title: example.0, kind: example.2, executableURL: bundledScript(), arguments: [example.1])) }
+        do {
+            let options: ExtensionTextOptions?
+            if example.1 == "align" {
+                guard let configured = configureAlign() else { return }
+                options = configured
+            } else { options = nil }
+            try start(ExtensionDescriptor(id: "builtin." + example.1, title: example.0, kind: example.2, executableURL: bundledScript(), arguments: [example.1]), options: options)
+        }
         catch { report(error) }
+    }
+    private func configureAlign() -> ExtensionTextOptions? {
+        let owner = NSApp.keyWindow
+        let tabSize = (owner?.windowController as? TextFileWindow)?.extensionTabSize ?? 8
+        let defaults = AppPreferences.defaults
+        let width = NSTextField(string: String(defaults.object(forKey: "extension.align.width") as? Int ?? 75))
+        let reformat = NSButton(checkboxWithTitle: L10n.text("Переформатировать выделенный блок в абзац"), target: nil, action: nil)
+        let smart = NSButton(checkboxWithTitle: L10n.text("SmartMode: переносить короткие слова с конца строки"), target: nil, action: nil)
+        let justify = NSButton(checkboxWithTitle: L10n.text("Выровнять по правому краю"), target: nil, action: nil)
+        reformat.state = defaults.object(forKey: "extension.align.reformat") as? Bool == false ? .off : .on
+        smart.state = defaults.bool(forKey: "extension.align.smart") ? .on : .off
+        justify.state = defaults.bool(forKey: "extension.align.justify") ? .on : .off
+        let stack = NSStackView(views: [NSTextField(labelWithString: L10n.text("Правая граница (1–1000 символов):")), width, reformat, smart, justify])
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8
+        stack.setFrameSize(NSSize(width: 480, height: 145))
+        let alert = NSAlert(); alert.messageText = L10n.text("Align: параметры блока")
+        alert.informativeText = L10n.text("Обрабатываются целые выделенные строки. Переформатирование объединяет их в один абзац, пропуская пустые строки. Ширина считается по символам Unicode. Размер табуляции:") + " \(tabSize)."
+        alert.accessoryView = stack; alert.addButton(withTitle: L10n.text("Предпросмотр")); alert.addButton(withTitle: L10n.text("Отмена"))
+        defer { owner?.makeKeyAndOrderFront(nil) }
+        while alert.runModal() == .alertFirstButtonReturn {
+            guard let margin = Int(width.stringValue), (1...1000).contains(margin) else { NSSound.beep(); width.selectText(nil); continue }
+            defaults.set(margin, forKey: "extension.align.width")
+            defaults.set(reformat.state == .on, forKey: "extension.align.reformat")
+            defaults.set(smart.state == .on, forKey: "extension.align.smart")
+            defaults.set(justify.state == .on, forKey: "extension.align.justify")
+            return ExtensionTextOptions(rightMargin: margin, reformat: reformat.state == .on, smartMode: smart.state == .on, justify: justify.state == .on, tabSize: tabSize)
+        }
+        return nil
     }
     private struct Manifest: Decodable {
         let id: String
@@ -83,20 +121,25 @@ final class ExtensionWorkspace: NSObject, NSMenuItemValidation {
             try start(ExtensionDescriptor(id: manifest.id, title: manifest.title, apiVersion: manifest.apiVersion, kind: manifest.kind, executableURL: URL(fileURLWithPath: manifest.executable), arguments: manifest.arguments))
         } catch { report(error) }
     }
-    private func start(_ descriptor: ExtensionDescriptor) throws {
+    private func start(_ descriptor: ExtensionDescriptor, options: ExtensionTextOptions? = nil) throws {
         guard cancellation == nil else { throw ExtensionAPIError("Расширение уже работает.") }
         let editor = NSApp.keyWindow?.windowController as? TextFileWindow
         let viewer = NSApp.keyWindow?.windowController as? ViewerWindow
         let revision = editor?.extensionRevision
+        let snapshot: ExtensionEditorSnapshot?
+        if descriptor.kind == .editor, let editor {
+            let scope: ExtensionEditorSnapshot.Scope = descriptor.id.hasPrefix("builtin.editcase-") ? .selectionOrWord : (descriptor.id == "builtin.align" ? .selectedLines : .document)
+            snapshot = try ExtensionEditorSnapshot(text: editor.extensionText, selection: editor.extensionSelection, scope: scope)
+        } else { snapshot = nil }
         let request: ExtensionRequest
         if descriptor.kind == .panel {
             guard CommandWorkspace.shared.context == .panel, let panelEntries else { throw ExtensionAPIError("Откройте локальную файловую панель.") }
             request = ExtensionRequest(kind: .panel, entries: try panelEntries())
         } else {
             if descriptor.kind == .editor, editor?.isEditable != true { throw ExtensionAPIError("Откройте редактируемый документ.") }
-            guard let text = editor?.extensionText ?? viewer?.extensionText else { throw ExtensionAPIError("Откройте текст в редакторе или просмотрщике.") }
+            guard let text = snapshot?.text ?? editor?.extensionText ?? viewer?.extensionText else { throw ExtensionAPIError("Откройте текст в редакторе или просмотрщике.") }
             guard text.utf8.count <= 512 * 1024 else { throw ExtensionAPIError("Текст для расширения ограничен 512 КиБ. Просмотрщик передаёт только видимый загруженный блок.") }
-            request = ExtensionRequest(kind: descriptor.kind, text: text)
+            request = ExtensionRequest(kind: descriptor.kind, text: text, options: options)
         }
         let token = ExtensionCancellation(); cancellation = token
         CommandWorkspace.shared.status?("Расширение «\(descriptor.title)» работает…")
@@ -106,7 +149,7 @@ final class ExtensionWorkspace: NSObject, NSMenuItemValidation {
                 guard let self else { return }
                 self.cancellation = nil
                 guard !token.isCancelled else { return }
-                self.present(result.response, editor: editor, revision: revision)
+                self.present(result.response, editor: editor, revision: revision, snapshot: snapshot)
                 CommandWorkspace.shared.status?("Расширение «\(descriptor.title)» завершено.")
             } catch {
                 self?.cancellation = nil
@@ -115,12 +158,54 @@ final class ExtensionWorkspace: NSObject, NSMenuItemValidation {
             }
         }
     }
-    private func present(_ response: ExtensionResponse, editor: TextFileWindow?, revision: Int?) {
+    @discardableResult
+    private func present(_ response: ExtensionResponse, editor: TextFileWindow?, revision: Int?, snapshot: ExtensionEditorSnapshot?) -> ExtensionResultWindow {
         let controller = ExtensionResultWindow(response: response) { [weak editor] in
             guard let editor, let revision, let text = response.text else { throw ExtensionAPIError("Редактор закрыт.") }
-            try editor.applyExtensionText(text, revision: revision, title: response.title)
+            let replacement = try snapshot?.replacing(with: text, currentText: editor.extensionText) ?? text
+            try editor.applyExtensionText(replacement, revision: revision, title: response.title)
         }
         windows.removeAll { $0.window?.isVisible != true }; windows.append(controller); controller.showWindow(nil)
+        return controller
+    }
+    /// Real AppKit preview/apply/Undo path, using only the isolated smoke fixture.
+    static func runUISmokeChecks() throws -> [String] {
+        guard AppRuntime.isSmoke, let directory = AppRuntime.smokeStateDirectory else { throw ExtensionAPIError("Extension smoke requires isolated state.") }
+        let url = directory.appendingPathComponent("extension-selection.txt")
+        let original = "before ßeta after\r\nsecond line\r\n"
+        try Data(original.utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let editor = try TextFileWindow(url: url)
+        editor.showWindow(nil)
+        defer { editor.closeArchiveWorkingCopyWithoutSaving() }
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        guard let content = editor.window?.contentView,
+              let textView = descendants(content).compactMap({ $0 as? NSTextView }).first else { throw ExtensionAPIError("Missing editor text view.") }
+        textView.setSelectedRange((original as NSString).range(of: "ßeta"))
+        let snapshot = try ExtensionEditorSnapshot(text: editor.extensionText, selection: editor.extensionSelection, scope: .selectionOrWord)
+        let revision = editor.extensionRevision
+        let workspace = ExtensionWorkspace()
+        let preview = workspace.present(ExtensionResponse(kind: .editor, title: "Selection smoke", text: "SSETA"), editor: editor, revision: revision, snapshot: snapshot)
+        defer { preview.close() }
+        guard editor.extensionText == original else { throw ExtensionAPIError("Preview changed the editor before Apply.") }
+        textView.setSelectedRange((original as NSString).range(of: "second"))
+        guard let previewContent = preview.window?.contentView,
+              let apply = descendants(previewContent).compactMap({ $0 as? NSButton }).first else { throw ExtensionAPIError("Missing extension Apply button.") }
+        apply.performClick(nil)
+        guard editor.extensionText == "before SSETA after\r\nsecond line\r\n", !apply.isEnabled else {
+            throw ExtensionAPIError("Apply must replace the captured range once, including Unicode length expansion.")
+        }
+        textView.undoManager?.undo()
+        guard editor.extensionText == original else { throw ExtensionAPIError("Extension Undo must restore the entire original buffer.") }
+        // Undo restored equal bytes, but the document revision still makes the
+        // older asynchronous proposal stale. The production Apply guard rejects it.
+        do {
+            try editor.applyExtensionText(try snapshot.replacing(with: "STALE", currentText: editor.extensionText), revision: revision, title: "Stale smoke")
+            throw ExtensionAPIError("A stale extension revision was accepted after Undo.")
+        } catch {
+            guard editor.extensionText == original, editor.extensionRevision != revision else { throw error }
+        }
+        return ["Extension preview leaves editor unchanged until Apply", "Extension Apply uses captured selection despite later cursor movement", "Unicode extension replacement applies once and Undo restores original EOL", "Extension stale revision is rejected after Undo"]
     }
     private func report(_ error: Error) {
         let alert = NSAlert(); alert.messageText = "Расширение не выполнено"; alert.informativeText = error.localizedDescription; alert.addButton(withTitle: "Закрыть"); alert.runModal()

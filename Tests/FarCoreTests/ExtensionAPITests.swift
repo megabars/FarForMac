@@ -37,6 +37,40 @@ import Testing
             try ExtensionHost().invoke(descriptor, request: ExtensionRequest(kind: .command), cancellation: cancellation)
         }
     }
+    @Test func invocationOwnsInheritedHelpersAfterSuccessTimeoutAndCancellation() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ExtensionChildren-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let marker = directory.appendingPathComponent("orphan")
+        // Pass the path as an argv value; no shell interpolation of fixture paths.
+        let helper = "(i=0; while [ \"$i\" -lt 100 ]; do printf x >> \"$1\"; i=$((i+1)); sleep 0.03; done) & "
+        let response = "printf '%s' '{\"apiVersion\":1,\"kind\":\"command\",\"title\":\"Done\",\"text\":\"OK\",\"rows\":[]}'"
+        for ending in ["success", "timeout", "cancel", "oversize", "malformed"] {
+            let token = ExtensionCancellation()
+            let body: String
+            switch ending {
+            case "success": body = response
+            case "oversize": body = "while :; do printf 1234567890; done"
+            case "malformed": body = "printf invalid"
+            default: body = "sleep 5"
+            }
+            let descriptor = ExtensionDescriptor(id: "children", title: "Children", kind: .command,
+                executableURL: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", helper + body, "extension-test", marker.path])
+            if ending == "cancel" { DispatchQueue.global().asyncAfter(deadline: .now() + 0.04) { token.cancel() } }
+            do {
+                let invocation = try ExtensionHost(timeout: ending == "timeout" ? 0.12 : 3, maximumBytes: 1024).invoke(descriptor, request: ExtensionRequest(kind: .command), cancellation: token)
+                #expect(ending == "success")
+                #expect(invocation.response.text == "OK")
+            } catch {
+                #expect(ending != "success")
+            }
+            let before = (try? Data(contentsOf: marker)) ?? Data()
+            Thread.sleep(forTimeInterval: 0.15)
+            let after = (try? Data(contentsOf: marker)) ?? Data()
+            #expect(after == before, "Inherited helper kept writing after \(ending)")
+            try? FileManager.default.removeItem(at: marker)
+        }
+    }
     @Test func bundledExamples() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let script = root.appendingPathComponent("Examples/Extensions/text-tools.py")
@@ -59,17 +93,67 @@ import Testing
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let script = root.appendingPathComponent("Examples/Extensions/text-tools.py")
         let python = try selectedPython()
-        func transform(_ mode: String, _ text: String) throws -> String? {
+        func transform(_ mode: String, _ text: String, options: ExtensionTextOptions? = nil) throws -> String? {
             try ExtensionHost(timeout: 30).invoke(ExtensionDescriptor(id: mode, title: mode, kind: .editor,
-                executableURL: python, arguments: [script.path, mode]), request: ExtensionRequest(kind: .editor, text: text)).response.text
+                executableURL: python, arguments: [script.path, mode]), request: ExtensionRequest(kind: .editor, text: text, options: options)).response.text
         }
-        #expect(try transform("editcase-upper", "Hello éß Я\r\n") == "HELLO éß Я\r\n")
-        #expect(try transform("editcase-lower", "HELLO Éẞ Я\n") == "hello Éẞ Я\n")
-        #expect(try transform("align", "a b c\r\nx y\n") == "a" + String(repeating: " ", count: 36) + "b" + String(repeating: " ", count: 36) + "c\r\nx" + String(repeating: " ", count: 73) + "y\n")
-        #expect(try transform("align", "ab c d") == "ab" + String(repeating: " ", count: 36) + "c" + String(repeating: " ", count: 35) + "d")
-        for unchanged in ["one", " a b", "a b ", "a  b", "a\tb", "é a", String(repeating: "a", count: 73) + " b"] {
-            #expect(try transform("align", unchanged) == unchanged)
+        #expect(try transform("editcase-upper", "Hello éß Я\r\n") == "HELLO ÉSS Я\r\n")
+        #expect(try transform("editcase-lower", "HELLO Éẞ Я\n") == "hello éß я\n")
+        #expect(try transform("editcase-title", "hELLO ЯЗЫК foo_bar#ßeta\r\n") == "Hello Язык Foo_bar#SSeta\r\n")
+        #expect(try transform("editcase-toggle", "Hello Éẞ Яя ß") == "hELLO éß яЯ SS")
+        for (before, after) in [("hello world", "HELLO WORLD"), ("HELLO WORLD", "Hello World"),
+                                ("Hello World", "hello world"), ("A", "a"), ("a", "A"),
+                                ("hELLO", "Hello"), ("heLLo", "hello"), ("привет мир", "ПРИВЕТ МИР"),
+                                (" # ", " # ")] {
+            #expect(try transform("editcase-cyclic", before) == after)
         }
+        #expect(try transform("align", "  one two\r\n    three four five\r\n", options: .init(rightMargin: 15)) == "  one two three\r\n  four five\r\n")
+        #expect(try transform("align", "one\n\n two", options: .init(rightMargin: 8)) == "one two")
+        #expect(try transform("align", "abcdefg hijklm nopq", options: .init(rightMargin: 4)) == "abcdefg\nhijklm\nnopq")
+        #expect(try transform("align", "привет мир снова", options: .init(rightMargin: 10)) == "привет мир\nснова")
+        let smartText = "abcdefghijklmnopqrstu longer a nextword end"
+        #expect(try transform("align", smartText, options: .init(rightMargin: 31)) == "abcdefghijklmnopqrstu longer a\nnextword end")
+        #expect(try transform("align", smartText, options: .init(rightMargin: 31, smartMode: true)) == "abcdefghijklmnopqrstu longer\na nextword end")
+        #expect(try transform("align", "a  b c\r\nx y\n", options: .init(rightMargin: 10, reformat: false, justify: true)) == "a    b   c\r\nx        y\n")
+        #expect(try transform("align", "one two three four", options: .init(rightMargin: 10, justify: true)) == "one    two\nthree four")
+        #expect(try transform("align", "\tone two", options: .init(rightMargin: 16)) == "        one two")
+        #expect(try transform("align", "\tone two", options: .init(rightMargin: 16, tabSize: 2)) == "  one two")
+        #expect(try transform("align", "\tone two\r", options: .init(rightMargin: 5, reformat: false)) == "\tone two\r")
+        #expect(throws: (any Error).self) { try transform("align", "a b", options: .init(rightMargin: 0)) }
+    }
+
+    @Test func editorSnapshots() throws {
+        let original = "😀 first слово tail\r\nsecond line\r\nlast"
+        let source = original as NSString
+        let word = source.range(of: "слово")
+        let selected = try ExtensionEditorSnapshot(text: original, selection: word, scope: .selectionOrWord)
+        #expect(selected.text == "слово")
+        #expect(try selected.replacing(with: "СЛОВО", currentText: original) == "😀 first СЛОВО tail\r\nsecond line\r\nlast")
+        #expect(throws: (any Error).self) { try selected.replacing(with: "X", currentText: original + "!") }
+        let cursor = try ExtensionEditorSnapshot(text: original, selection: NSRange(location: word.location + 2, length: 0), scope: .selectionOrWord)
+        #expect(cursor.range == word)
+        let nearest = try ExtensionEditorSnapshot(text: "left   right", selection: NSRange(location: 5, length: 0), scope: .selectionOrWord)
+        #expect(nearest.text == "left")
+        let right = try ExtensionEditorSnapshot(text: "left   right", selection: NSRange(location: 6, length: 0), scope: .selectionOrWord)
+        #expect(right.text == "right")
+        let second = source.range(of: "second")
+        let block = try ExtensionEditorSnapshot(text: original, selection: NSRange(location: word.location, length: second.location - word.location), scope: .selectedLines)
+        #expect(block.text == "😀 first слово tail\r\n")
+        #expect(try block.replacing(with: "new\r\n", currentText: original) == "new\r\nsecond line\r\nlast")
+        #expect(throws: (any Error).self) { try ExtensionEditorSnapshot(text: original, selection: NSRange(location: 0, length: 0), scope: .selectedLines) }
+        #expect(throws: (any Error).self) { try ExtensionEditorSnapshot(text: original, selection: NSRange(location: NSNotFound, length: 1), scope: .document) }
+        #expect(throws: (any Error).self) { try ExtensionEditorSnapshot(text: original, selection: NSRange(location: 1, length: 0), scope: .selectionOrWord) }
+        let empty = try ExtensionEditorSnapshot(text: " # \nword", selection: NSRange(location: 1, length: 0), scope: .selectionOrWord)
+        #expect(empty.text.isEmpty)
+        let end = try ExtensionEditorSnapshot(text: "слово", selection: NSRange(location: 5, length: 0), scope: .selectionOrWord)
+        #expect(end.text == "слово")
+    }
+
+    @Test func versionOneOptionsAreOptional() throws {
+        let data = Data(#"{"apiVersion":1,"kind":"editor","text":"abc","entries":[]}"#.utf8)
+        #expect(try JSONDecoder().decode(ExtensionRequest.self, from: data).options == nil)
+        let request = ExtensionRequest(kind: .editor, text: "x", options: .init(rightMargin: 42, smartMode: true))
+        #expect(try JSONDecoder().decode(ExtensionRequest.self, from: JSONEncoder().encode(request)).options == request.options)
     }
 
     // These integration cases verify the example protocol and behavior with the

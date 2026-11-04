@@ -106,13 +106,13 @@ struct EditorDocumentTests {
     func lineEndingConversionRequiresExplicitChoiceAndReturnsSavedText() throws {
         let tree = try EditorTemporaryTree()
         let original = "one\r\ntwo\nthree\rfour\n"
-        for lineEnding in [EditorLineEnding.preserve, .lf, .crlf] {
+        for lineEnding in [EditorLineEnding.preserve, .lf, .crlf, .cr] {
             let url = tree.root.appendingPathComponent(lineEnding.rawValue)
             try Data(original.utf8).write(to: url)
             let snapshot = try EditorDocument.load(url: url)
             let format = EditorFormat(encoding: .utf8, bom: true, lineEnding: lineEnding)
             let saved = try EditorDocument.save(text: original, format: format, to: url, expected: snapshot)
-            let expected = lineEnding == .preserve ? original : (lineEnding == .lf ? "one\ntwo\nthree\nfour\n" : "one\r\ntwo\r\nthree\r\nfour\r\n")
+            let expected = lineEnding == .preserve ? original : (lineEnding == .lf ? "one\ntwo\nthree\nfour\n" : (lineEnding == .cr ? "one\rtwo\rthree\rfour\r" : "one\r\ntwo\r\nthree\r\nfour\r\n"))
             #expect(saved.text == expected)
             #expect(saved.data == Data([0xEF, 0xBB, 0xBF]) + Data(expected.utf8))
         }

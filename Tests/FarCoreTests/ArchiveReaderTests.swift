@@ -148,6 +148,8 @@ final class ArchiveReaderTests {
             } catch ArchiveWriteError.encryptedReadOnly {
                 // Encryption must be preserved by refusing unsupported updates.
             }
+            #expect(throws: ArchiveWriteError.self) { try ArchiveWriter.createDirectory(snapshot, path: "new") }
+            #expect(throws: ArchiveWriteError.self) { try ArchiveWriter.move(snapshot, entries: ["secret.txt": "renamed.txt"]) }
             #expect(try Data(contentsOf: url) == original)
             #expect(throws: ArchiveError.passwordRequired) { try ArchiveReader.extract(snapshot) }
             #expect(throws: ArchiveError.incorrectPassword) { try ArchiveReader.extract(snapshot, password: "wrong-password") }

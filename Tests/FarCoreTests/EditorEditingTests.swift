@@ -5,6 +5,121 @@ import Testing
 @Suite
 struct EditorEditingTests {
     @Test
+    func fuzzySearchAndReplacementUseOriginalUnicodeRanges() throws {
+        let text = "🙂résumé RÉSUMÉ resumeX _resume resume"
+        let query = EditorSearchQuery(pattern: "resume", wholeWords: true, fuzzy: true)
+        let results = try EditorEditing.allMatches(in: text, query: query)
+        #expect(results.matches.map(\.range) == [NSRange(location: 2, length: 8), NSRange(location: 11, length: 6), (text as NSString).range(of: "resume", options: .backwards)])
+        #expect(try EditorEditing.find(in: text, query: query, from: 0) == results.matches.first?.range)
+        #expect(try EditorEditing.find(in: text, query: query, from: text.utf16.count, direction: .backward) == results.matches.last?.range)
+        #expect(try EditorEditing.find(in: "Résumé", query: .init(pattern: "resume", caseSensitive: true, fuzzy: true), from: 0) == nil)
+        let edit = try EditorEditing.replaceAll(in: text, query: query, replacement: "CV")
+        #expect(edit.text == "🙂CV CV resumeX _resume CV")
+        #expect(edit.count == 3 && edit.selection == NSRange(location: edit.text.utf16.count - 2, length: 2))
+        #expect(try EditorEditing.replace(in: "🙂é", range: NSRange(location: 2, length: 2), query: .init(pattern: "e", fuzzy: true), replacement: "x") == "🙂x")
+        #expect(throws: EditorEditingError.rangeDoesNotMatch) {
+            try EditorEditing.replace(in: "é", range: NSRange(location: 0, length: 1), query: .init(pattern: "e", fuzzy: true), replacement: "x")
+        }
+        let ligatures = try EditorEditing.replaceAll(in: "ßß ﬁ Æ ①", query: .init(pattern: "s", fuzzy: true), replacement: "X")
+        #expect(ligatures.text == "XX ﬁ Æ ①" && ligatures.count == 2)
+    }
+
+    @Test
+    func fuzzyModesAndStylesRejectUnsupportedCombinationsExplicitly() throws {
+        for query in [EditorSearchQuery(pattern: "x", regex: true, fuzzy: true),
+                      .init(pattern: "x", regex: true, preserveStyle: true),
+                      .init(pattern: "x", fuzzy: true, preserveStyle: true)] {
+            #expect(throws: EditorEditingError.incompatibleSearchOptions) { try EditorEditing.validate(query) }
+            #expect(throws: EditorEditingError.incompatibleSearchOptions) { try EditorEditing.replaceAll(in: "x", query: query, replacement: "y") }
+        }
+        #expect(throws: EditorEditingError.foldedQueryIsEmpty) { try EditorEditing.validate(.init(pattern: "́", fuzzy: true)) }
+        #expect(try EditorEditing.allMatches(in: "é e e", query: .init(pattern: "e", fuzzy: true), limit: 2).truncated)
+    }
+
+    // Golden behavior adapted from Far Group © 2013 preservestyle.cpp inline tests.
+    // BSD 3-clause notice: THIRD_PARTY_NOTICES.md. Pinned source linked in EDITOR_REFERENCE.md.
+    @Test
+    func preserveStyleMatchesFARTokensAndCaseGoldenExamples() throws {
+        let examples: [(String, String, String, String)] = [
+            ("abc-def-ghi", "pq.RST.Xyz", "AbcDefGhi", "PqRstXyz"),
+            ("abc-def-ghi", "pq.RST.Xyz", "ABC_DEF_GHI", "PQ_RST_XYZ"),
+            ("abc-def-ghi", "pq.RST.Xyz", "abc.def.ghi", "pq.rst.xyz"),
+            ("abc-def-ghi", "pq.RST.Xyz", "abcDefGhi", "pqRstXyz"),
+            ("abc-def-ghi", "pq.RST.Xyz", "ABC_Def_Ghi", "PQ_Rst_Xyz"),
+            ("AA-B-C", "xxx.Yy.ZZ", "Aa_B_C", "Xxx_Yy_Zz"),
+            ("AA-B-C", "xxx.Yy.ZZ", "aa-b-c", "xxx-yy-zz"),
+            ("AA-B-C", "xxx.Yy.ZZ", "AA_B_C", "XXX_YY_ZZ"),
+            ("AA-B-C", "xxx.Yy.ZZ", "aa.B.C", "xxx.Yy.Zz"),
+            ("AA-B-C", "xxx.Yy.ZZ", "Aa.B.c", "Xxx.Yy.zz"),
+            ("abc-def-ghi", "pq.RST.uvw.Xyz", "Abc.def.ghi", "Pq.rst.uvw.xyz"),
+            ("abc-def-ghi", "pq.RST.uvw.Xyz", "ABC.Def.Ghi", "PQ.Rst.Uvw.Xyz"),
+            ("abc-def-ghi", "pq.RST.uvw.Xyz", "abc.Def.ghi", "pq.RST.uvw.Xyz"),
+            ("abc-def-ghi", "pq.RST.uvw.Xyz", "ABC.DEF.ghi", "PQ.RST.uvw.Xyz"),
+            ("A-B-C", "aa.Bb.cc.DD", "A_B_C", "Aa_Bb_Cc_Dd"),
+            ("A-B-C", "aa.Bb.cc.DD", "a-b-c", "aa-bb-cc-dd"),
+            ("A-B-C", "aa.Bb.cc.DD", "A.B.c", "Aa.Bb.cc.DD")
+        ]
+        for (pattern, replacement, source, expected) in examples {
+            let query = EditorSearchQuery(pattern: pattern, preserveStyle: true)
+            let matches = try EditorEditing.allMatches(in: source, query: query)
+            #expect(matches.matches.map(\.range) == [NSRange(location: 0, length: source.utf16.count)])
+            #expect(try EditorEditing.replace(in: source, range: matches.matches[0].range, query: query, replacement: replacement) == expected)
+            let edit = try EditorEditing.replaceAll(in: source, query: query, replacement: replacement)
+            #expect(edit.text == expected && edit.count == 1)
+            #expect(edit.selection == NSRange(location: 0, length: expected.utf16.count))
+        }
+    }
+
+    @Test
+    func preserveStyleUsesContextAndLiteralFallbackLikeFAR() throws {
+        let examples = [("ijk.Zzz", "mno.Pqr.Stu.Zzz"), ("AAA-ijk", "AAA-mno-pqr-stu"),
+                        ("aaa-ijk_ZZZ", "aaa-mno_PQR_STU_ZZZ"), ("AaaIjk", "AaaMnoPqrStu"),
+                        ("0_ijk_9", "0_mno_Pqr_Stu_9"), (">ijk<", ">mnopqrstu<")]
+        for (source, expected) in examples {
+            #expect(try EditorEditing.replaceAll(in: source, query: .init(pattern: "ijk", preserveStyle: true), replacement: "MnoPqrStu").text == expected)
+        }
+        // PreserveStyleReplaceString declines this internal camel boundary; strmix.cpp
+        // ordinary literal fallback keeps only the source's first letter case.
+        #expect(try EditorEditing.replaceAll(in: "Ab.cD", query: .init(pattern: "ab.cd", preserveStyle: true), replacement: "wx-yz").text == "Wx-yz")
+        #expect(try EditorEditing.replaceAll(in: "ab.cD", query: .init(pattern: "ab.cd", preserveStyle: true), replacement: "WX-YZ").text == "wX-YZ")
+        // Unknown mixed case remains unchanged rather than guessing a case style.
+        #expect(try EditorEditing.replaceAll(in: "mIxEd", query: .init(pattern: "mixed", preserveStyle: true), replacement: "NeW").text == "neW")
+    }
+
+    @Test
+    func preserveStyleFindAllReplaceAndBoundariesShareRanges() throws {
+        let text = "🙂UserName USER_NAME user-name _user_name user_nameX user.name"
+        let query = EditorSearchQuery(pattern: "user_name", wholeWords: true, preserveStyle: true)
+        let matches = try EditorEditing.allMatches(in: text, query: query)
+        #expect(matches.matches.count == 4)
+        for match in matches.matches {
+            #expect(try EditorEditing.find(in: text, query: query, from: match.range.location) == match.range)
+        }
+        #expect(try EditorEditing.find(in: text, query: query, from: text.utf16.count, direction: .backward) == matches.matches.last?.range)
+        let edit = try EditorEditing.replaceAll(in: text, query: query, replacement: "account_id")
+        #expect(edit.text == "🙂AccountId ACCOUNT_ID account-id _user_name user_nameX account.id")
+        #expect(edit.changes?.map(\.range) == matches.matches.map(\.range))
+        #expect(try EditorEditing.find(in: "USER_NAME", query: .init(pattern: "user_name", caseSensitive: true, preserveStyle: true), from: 0) == nil)
+        #expect(try EditorEditing.replaceAll(in: "userName user_name", query: .init(pattern: "user_name", preserveStyle: true), replacement: "").text == " ")
+    }
+
+    @Test
+    func preserveStyleBoundsAdversarialNearMatchesBeforeEditing() throws {
+        let pattern = "a_" + String(repeating: "b", count: 4094)
+        let source = String(repeating: "a_", count: 10_000)
+        let start = ProcessInfo.processInfo.systemUptime
+        #expect(throws: EditorEditingError.styleSearchLimit) {
+            try EditorEditing.replaceAll(in: source, query: .init(pattern: pattern, preserveStyle: true), replacement: "x")
+        }
+        #expect(ProcessInfo.processInfo.systemUptime - start < 2)
+        // A one-token match expanded into a large neighboring identifier must
+        // share the operation budget instead of rescanning it for every edit.
+        #expect(throws: EditorEditingError.styleSearchLimit) {
+            try EditorEditing.replaceAll(in: String(repeating: "a", count: 50_000), query: .init(pattern: "a", preserveStyle: true), replacement: "OneTwo")
+        }
+    }
+
+    @Test
     func searchesUnicodeWholeWordsAndOverlapsWithoutWrapping() throws {
         let text = "🙂Кот котик _кот кот\u{301} КОТ"
         let query = EditorSearchQuery(pattern: "кот", wholeWords: true)
@@ -16,6 +131,9 @@ struct EditorEditingTests {
         #expect(try EditorEditing.find(in: "ababa", query: .init(pattern: "aba", regex: true), from: 5, direction: .backward) == NSRange(location: 2, length: 3))
         #expect(try EditorEditing.find(in: "ababa", query: .init(pattern: "aba"), from: 2, direction: .backward) == NSRange(location: 0, length: 3))
         #expect(try EditorEditing.find(in: text, query: query, from: 0, direction: .backward) == nil)
+        for query in [EditorSearchQuery(pattern: "🙂"), .init(pattern: "🙂", fuzzy: true), .init(pattern: "🙂", preserveStyle: true)] {
+            #expect(try EditorEditing.find(in: "🙂🙂", query: query, from: 1, direction: .backward) == NSRange(location: 0, length: 2))
+        }
     }
 
     @Test

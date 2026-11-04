@@ -14,6 +14,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var viewers: [ViewerWindow] = []
     private let network = NetworkCoordinator()
     private let archiveOperations = ArchiveOperationController()
+    private let virtualOperations = NetworkOperationController()
+    private var lastVirtualResults: [SearchMatch] = []
+    private lazy var savedPanelRestore: SavedPanelRestoreController = {
+        let controller = SavedPanelRestoreController()
+        network.configureSavedPanelRestore(controller)
+        controller.onProgress = { [weak self] index, total, path in
+            self?.status.stringValue = "Восстановление \(index)/\(total): \(path)"
+        }
+        return controller
+    }()
+    private var persistentPanelsWindow: PersistentTemporaryPanelsWindow?
     private var archiveEdits: [ArchiveEditCommitWindow] = []
 
     private var restoredDrafts: Set<UUID> = []
@@ -24,6 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var folderFunctionButton: NSButton?
     private var archiveFunctionButtons: [Int: NSButton] = [:]
     private var comparisonWindow: DirectoryComparisonWindow?
+    private var temporaryPanelsWindow: TemporaryPanelsWindow?
+    private var synchronizingTemporaryPanels = false
     private var keyMonitor: Any?
     private var busy = false
     var settingsWindow: PanelSettingsWindow?
@@ -31,7 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var searchWindow: SearchWindow?
     private var toolWindows: [NSWindowController] = []
     private var toolMutationPending: Bool {
-        network.isWorking || archiveOperations.isWorking || archiveEdits.contains(where: { $0.isWorking }) || toolWindows.contains { ($0 as? FileToolsWindowController)?.hasPendingMutation == true }
+        searchWindow?.isProviderSearching == true || savedPanelRestore.isWorking || virtualOperations.isWorking || network.isWorking || archiveOperations.isWorking || archiveEdits.contains(where: { $0.isWorking }) || toolWindows.contains { ($0 as? FileToolsWindowController)?.hasPendingMutation == true }
     }
     private lazy var operationQueue: FileOperationQueue = {
         let queue = FileOperationQueue()
@@ -86,17 +99,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         network.onChanged = { [weak self] in self?.refresh() }
         for panel in [left!, right!] {
             panel.onRemoteRefresh = { [weak self] panel in self?.network.refresh(panel) }
+            panel.onRemoteDisconnect = { [weak self] provider in
+                guard let self else { return }
+                let retained = self.lastVirtualResults.contains { match in
+                    if case .remote(_, let captured) = match { return captured === provider }; return false
+                } || self.searchWindow?.retainsRemoteProvider(provider) == true || [self.left!, self.right!].contains { panel in
+                    panel.virtualResults.contains { if case .remote(_, let captured) = $0 { return captured === provider }; return false }
+                }
+                if !retained { self.network.disconnected(provider) }
+            }
             panel.showHidden = defaults.bool(forKey: "showHidden")
             panel.maskGroups = maskGroups
             if let data = defaults.data(forKey: "panel.sortGroups"), let groups = try? SortGroups.decode(data, maskGroups: maskGroups) { panel.sortGroups = groups }
+            panel.onTemporaryLibrarySnapshot = { [weak self] slot, items in
+                guard let self, !self.synchronizingTemporaryPanels else { return }
+                self.temporaryPanelsWindow?.updateLinkedSlot(slot, items: items)
+            }
             panel.onFocus = { [weak self] pane in self?.activate(pane) }
             panel.onError = { [weak self] error in self?.showError(error) }
+            panel.onVirtualReveal = { [weak self] panel, match in self?.activate(panel); self?.revealSearchMatch(match) }
+            panel.onVirtualOpen = { [weak self] panel, match in self?.activate(panel); self?.openSearchMatch(match, editable: false) }
+            panel.onVirtualResultsChange = { [weak self] matches in
+                guard let self, !self.synchronizingTemporaryPanels else { return }
+                self.lastVirtualResults = matches
+                self.persistentTemporaryPanels().persistLastMixed(matches)
+            }
+            panel.onVirtualLibrarySnapshot = { [weak self] slot, matches in
+                guard let self, !self.synchronizingTemporaryPanels else { return }
+                self.persistentTemporaryPanels().updateLinkedSlot(slot, items: matches)
+            }
             panel.onArchiveView = { [weak self] panel, path in self?.openArchiveMember(panel, path: path, editable: false) }
+            panel.onArchiveOpenNested = { [weak self] panel, path in self?.openNestedArchive(panel, path: path) }
             panel.onArchiveRefresh = { [weak self] panel in self?.refreshArchive(panel) }
             panel.onArchiveSwitchPanel = { [weak self] in guard let self else { return }; self.activate(self.passive); self.active.focus() }
             panel.onFileOpen = { [weak self, weak panel] entry in
                 guard let self, let panel else { return }
-                if ["zip", "tar", "7z", "rar", "tgz", "gz", "bz2", "xz"].contains(entry.url.pathExtension.lowercased()) {
+                if ArchivePanelView.isArchiveName(entry.url.lastPathComponent) {
                     self.openArchive(entry.url, in: panel); return
                 }
                 if !self.shellWorkspace.association(for: entry.url, action: .execute) { NSWorkspace.shared.open(entry.url) }
@@ -125,7 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         panelsContainer = panelsWrapper
         shellWorkspace = ShellWorkspace(context: { [weak self] in
             guard let self else { return UserCommandContext(currentFile: nil, markedFiles: [], activeDirectory: URL(fileURLWithPath: "/"), passiveDirectory: URL(fileURLWithPath: "/")) }
-            return UserCommandContext(currentFile: self.active.cursorEntry?.url, markedFiles: self.active.markedEntries.map(\.url), activeDirectory: self.active.directory, passiveDirectory: self.passive.directory)
+            return UserCommandContext(currentFile: self.active.cursorEntry?.url, markedFiles: self.active.markedEntries.map(\.url), activeDirectory: self.active.directory, passiveDirectory: self.passive.directory, passiveCurrentFile: self.passive.cursorEntry?.url, passiveMarkedFiles: self.passive.markedEntries.map(\.url))
         }, navigate: { [weak self] url in self?.active.load(url, preserveSelection: false) }, openFile: { [weak self] url, editable in
             _ = self?.openDocument(url, editable: editable)
         }, showTerminal: { [weak self] in self?.setTerminalVisible(true) }, togglePanels: { [weak self] in self?.toggleTerminal() }, refreshPanels: { [weak self] in self?.refresh() }, report: { [weak self] text in self?.status.stringValue = text })
@@ -156,6 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         active.focus()
         NSApp.activate(ignoringOtherApps: true)
         if !AppRuntime.isSmoke { DispatchQueue.main.async { [weak self] in self?.offerEditorRecovery(automatic: true) } }
+        lastVirtualResults = persistentTemporaryPanels().savedLastMixed.map(SearchMatch.saved)
         configureAutomation()
         installWorkspaceObservers()
         applyInterfacePreferences()
@@ -218,7 +257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let editor = TextFileWindow(newIn: active.directory, onView: { [weak self] url, offset, encoding in
             self?.openDocument(url, editable: false, byteOffset: offset, encoding: encoding) ?? false
         })
-        editors.removeAll { $0.window?.isVisible == false }
+        editors.removeAll { $0.window?.isVisible == false && $0.retainedArchiveWorkspace == nil && $0.retainedRemoteWorkspace == nil }
         editors.append(editor); editor.showWindow(nil)
     }
 
@@ -263,20 +302,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     private func openArchive(_ url: URL, in panel: PanelView) {
         guard !busy, !toolMutationPending else { return }
-        let originalDirectory = panel.directory
+        let generation = panel.locationGeneration
         archiveOperations.open(url) { [weak self, weak panel] result in
             guard let self, let panel else { return }
             switch result {
             case .success(let snapshot):
-                guard panel.directory == originalDirectory else { return }
+                guard panel.locationGeneration == generation else { return }
                 self.activate(panel); panel.showArchive(snapshot)
                 self.status.stringValue = "Архив открыт. Enter — папка/просмотр; F5 — извлечь."
             case .failure(let error): self.archiveFailure(error)
             }
         }
     }
+    private func openNestedArchive(_ panel: PanelView, path: String) {
+        guard !busy, !toolMutationPending, let frame = panel.archiveFrame,
+              frame.snapshot.entries.contains(where: { $0.path == path && !$0.isDirectory }) else { return }
+        archiveOperations.openNested(frame, path: path) { [weak self, weak panel] result in
+            guard let self, let panel, panel.archiveFrame === frame else { return }
+            switch result {
+            case .success(let child):
+                panel.showArchive(frame: child)
+                self.status.stringValue = L10n.text("Вложенный архив открыт только для чтения. F5 — извлечь; Esc — к родительскому архиву.")
+            case .failure(let error): self.archiveFailure(error)
+            }
+        }
+    }
     private func refreshArchive(_ panel: PanelView, completion: @escaping () -> Void = {}) {
         guard !toolMutationPending, !busy, let archive = panel.archivePanel else { completion(); return }
+        if panel.archiveFrame?.parent != nil {
+            defer { completion() }
+            do { try archive.snapshot.verifyCurrent(); archive.update(snapshot: archive.snapshot) }
+            catch { archiveFailure(error) }
+            return
+        }
         let url = archive.snapshot.sourceURL
         archiveOperations.open(url) { [weak self, weak panel, weak archive] result in
             defer { completion() }
@@ -294,21 +352,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         status.stringValue = "Архив сохранён: " + snapshot.sourceURL.lastPathComponent
     }
+    private func createArchiveDirectory() {
+        guard canWriteArchive(), let browser = active.archivePanel, !browser.snapshot.isReadOnly else { return }
+        let snapshot = browser.snapshot, base = browser.currentDirectory
+        prompt("Новая папка в архиве", detail: "Путь относительно текущей папки. Начальный / означает корень архива. Архив будет переписан целиком; отмена до публикации сохраняет оригинал.", value: "Новая папка", button: "Создать") { [weak self] value in
+            guard let self, self.canWriteArchive() else { return }
+            do {
+                let path = try ArchiveMutationInput.resolve(value, relativeTo: base)
+                self.archiveOperations.createDirectory(snapshot, path: path) { [weak self] result in
+                    switch result {
+                    case .success(let updated): self?.archiveUpdated(updated)
+                    case .failure(let error): self?.archiveFailure(error)
+                    }
+                }
+            } catch { self.archiveFailure(error) }
+        }
+    }
+    private func moveArchiveSelection(cursorOnly: Bool = false) {
+        guard canWriteArchive(), let browser = active.archivePanel, !browser.snapshot.isReadOnly else { return }
+        let paths = cursorOnly ? browser.cursorPath.map { [$0] } ?? [] : browser.selectedArchivePaths
+        guard !paths.isEmpty else { return }
+        let snapshot = browser.snapshot, base = browser.currentDirectory
+        let initial = paths.count == 1 ? (paths[0] as NSString).lastPathComponent : "/"
+        prompt("Переместить / переименовать внутри архива", detail: "Объектов: \(paths.count). Для одного объекта укажите новое полное имя, для нескольких — папку назначения. Относительно текущей папки, / — корень архива. Конфликты останавливают операцию без замены. Перемещение между архивом и обычной папкой здесь не выполняется.", value: initial, button: "Переместить") { [weak self] value in
+            guard let self, self.canWriteArchive() else { return }
+            do {
+                let mapping = try ArchiveMutationInput.mapping(paths: paths, destination: value, relativeTo: base)
+                self.archiveOperations.move(snapshot, entries: mapping) { [weak self] result in
+                    switch result {
+                    case .success(let updated): self?.archiveUpdated(updated)
+                    case .failure(let error): self?.archiveFailure(error)
+                    }
+                }
+            } catch { self.archiveFailure(error) }
+        }
+    }
     private func openArchiveMember(_ panel: PanelView, path: String, editable: Bool) {
         guard !busy, !toolMutationPending, let browser = panel.archivePanel else { return }
-        let snapshot = browser.snapshot
         if browser.cursorPath == path && browser.cursorIsDirectory { return }
-        if editable && snapshot.isEncrypted { inform("Архив доступен только для чтения", "Извлечение с паролем поддерживается. Сохранение шифрования при изменении архива пока не поддерживается."); return }
+        openArchiveMember(snapshot: browser.snapshot, path: path, editable: editable)
+    }
+    private func openArchiveMember(snapshot: ArchiveSnapshot, path: String, editable: Bool, byteOffset: Int64? = nil) {
+        guard !busy, !toolMutationPending, snapshot.entries.contains(where: { $0.path == path && !$0.isDirectory }) else { return }
+        if editable && snapshot.isReadOnly { inform("Архив доступен только для чтения", "Для редактирования извлеките файл в обычную папку. Изменение вложенных и зашифрованных архивов не поддерживается."); return }
         archiveOperations.extract(snapshot, paths: [path]) { [weak self] result in
             guard let self else { return }
             switch result {
             case .failure(let error): self.archiveFailure(error)
             case .success(let workspace):
-                if editable { _ = self.openArchiveEditor(snapshot: snapshot, path: path, workspace: workspace) }
+                do { try snapshot.verifyCurrent() } catch { self.archiveFailure(error); return }
+                if editable { _ = self.openArchiveEditor(snapshot: snapshot, path: path, workspace: workspace, byteOffset: byteOffset) }
                 else {
                     do {
                         let memberURL = try workspace.url(for: path)
-                        let viewer = try ViewerWindow(url: memberURL, onEdit: { [weak self, weak workspace] url, offset, encoding in
+                        let viewer = try ViewerWindow(url: memberURL, initialByteOffset: byteOffset, initialDisplayMode: byteOffset == nil ? nil : .hex, onEdit: { [weak self, weak workspace] url, offset, encoding in
                             guard let self else { return false }
                             guard url.standardizedFileURL == memberURL.standardizedFileURL else {
                                 return self.openDocument(url, editable: true, byteOffset: offset, encoding: encoding)
@@ -317,6 +414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                             return self.openArchiveEditor(snapshot: snapshot, path: path, workspace: workspace, byteOffset: offset, encoding: encoding)
                         })
                         viewer.retainedArchiveWorkspace = workspace
+                        viewer.showWorkingCopyLocation(ArchiveNavigationFrame(snapshot: snapshot).displayPath + " !/" + path)
                         self.viewers.removeAll { $0.window?.isVisible == false }; self.viewers.append(viewer)
                         viewer.showWindow(nil); viewer.window?.makeKeyAndOrderFront(nil)
                     } catch { self.archiveFailure(error) }
@@ -325,14 +423,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
     @discardableResult private func openArchiveEditor(snapshot: ArchiveSnapshot, path: String, workspace: ArchiveWorkspace, byteOffset: Int64? = nil, encoding: ViewerEncoding = .automatic) -> Bool {
-        guard !snapshot.isEncrypted else { inform("Зашифрованный архив", "Редактирование зашифрованных архивов пока недоступно."); return false }
+        guard !snapshot.isReadOnly else { inform("Архив доступен только для чтения", "Для редактирования извлеките файл в обычную папку. Изменение вложенных и зашифрованных архивов не поддерживается."); return false }
         do {
             let editor = try TextFileWindow(url: workspace.url(for: path), initialByteOffset: byteOffset, encoding: encoding)
             editor.retainedArchiveWorkspace = workspace
             let commit = try ArchiveEditCommitWindow(snapshot: snapshot, path: path, workspace: workspace, editor: editor,
                 canCommit: { [weak self] in self?.canWriteArchive() ?? false },
                 onCommitted: { [weak self] snapshot in self?.archiveUpdated(snapshot) })
-            editors.removeAll { $0.window?.isVisible == false }; editors.append(editor)
+            editors.removeAll { $0.window?.isVisible == false && $0.retainedArchiveWorkspace == nil && $0.retainedRemoteWorkspace == nil }; editors.append(editor)
             archiveEdits.removeAll { $0.window?.isVisible == false }; archiveEdits.append(commit)
             commit.showWindow(nil); editor.showWindow(nil); editor.window?.makeKeyAndOrderFront(nil)
             editor.window?.subtitle = "Рабочая копия · применить через окно «Сохранить в архив»"
@@ -341,7 +439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     private func extractArchiveSelection(cursorOnly: Bool = false) {
         guard !busy, !toolMutationPending, let browser = active.archivePanel else { return }
-        guard !passive.isArchive else { inform("Выберите обычную папку назначения", "Копирование между архивами пока не поддерживается."); return }
+        guard !passive.isVirtual, !passive.isArchive, !passive.isRemote else { inform("Выберите обычную папку назначения", "Прямое извлечение в другой архив или сетевую панель пока не поддерживается."); return }
         let selected = cursorOnly ? browser.cursorPath.map { [$0] } ?? [] : browser.selectedArchivePaths
         let paths = selected.filter { path in !selected.contains(where: { path.hasPrefix($0 + "/") }) }
         guard !paths.isEmpty else { inform("Выберите объекты архива", "Отметьте файлы или установите курсор на объект."); return }
@@ -358,7 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 case .success(let workspace):
                     do {
                         let urls = try paths.map { try workspace.url(for: $0) }
-                        if self.operationQueue.enqueue(TransferRequest(sources: urls, destination: destination, move: false), retaining: workspace) {
+                        if self.operationQueue.enqueue(TransferRequest(sources: urls, destination: destination, move: false, propagateDescriptions: false), retaining: workspace) {
                             self.status.stringValue = "Извлечение передано в очередь."
                         }
                     } catch { self.archiveFailure(error) }
@@ -367,7 +465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
     private func addToArchive(cursorOnly: Bool = false) {
-        guard canWriteArchive(), !active.isArchive, let browser = passive.archivePanel else { return }
+        guard canWriteArchive(), !active.isVirtual, !active.isArchive, !active.isRemote, let browser = passive.archivePanel, !browser.snapshot.isReadOnly else { return }
         let selected = cursorOnly ? active.cursorEntry.map { [$0] } ?? [] : active.selectedEntries
         guard !selected.isEmpty else { inform("Выберите файлы", "Установите курсор или отметьте объекты для добавления."); return }
         let snapshot = browser.snapshot, prefix = browser.currentDirectory
@@ -383,7 +481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
     private func deleteArchiveSelection() {
-        guard canWriteArchive(), let browser = active.archivePanel else { return }
+        guard canWriteArchive(), let browser = active.archivePanel, !browser.snapshot.isReadOnly else { return }
         let selected = browser.selectedArchivePaths, snapshot = browser.snapshot
         let paths = selected.filter { path in !selected.contains(where: { path.hasPrefix($0 + "/") }) }
         guard !paths.isEmpty else { return }
@@ -396,38 +494,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
     private func createArchive() {
-        guard canWriteArchive(), !active.isArchive, let selected = requireSelection() else { return }
+        guard canWriteArchive(), !active.isVirtual, !active.isArchive, !active.isRemote, let selected = requireSelection() else { return }
         let captured = active.capturedSearchResults(for: selected)
         let alert = NSAlert(); alert.messageText = "Формат нового архива"
-        alert.informativeText = "ZIP или несжатый TAR. Шифрование при создании пока не поддерживается."
-        alert.addButton(withTitle: "ZIP"); alert.addButton(withTitle: "TAR"); alert.addButton(withTitle: "Отмена")
-        let answer = alert.runModal(); guard answer != .alertThirdButtonReturn else { return }
-        let format: ArchiveFormat = answer == .alertFirstButtonReturn ? .zip : .tar
+        alert.informativeText = L10n.text("Выберите формат и сжатие. Шифрование при создании пока не поддерживается.")
+        let formats = ArchiveFormat.allCases
+        let picker = archiveFormatPicker()
+        alert.accessoryView = picker
+        alert.addButton(withTitle: L10n.text("Продолжить")); alert.addButton(withTitle: L10n.text("Отмена"))
+        guard alert.runModal() == .alertFirstButtonReturn, formats.indices.contains(picker.indexOfSelectedItem) else { return }
+        let format = formats[picker.indexOfSelectedItem]
         let save = NSSavePanel(); save.title = "Создать архив"; save.directoryURL = active.directory
-        save.nameFieldStringValue = "Archive." + format.rawValue
-        if let type = UTType(filenameExtension: format.rawValue) { save.allowedContentTypes = [type] }
+        save.nameFieldStringValue = "Archive." + format.defaultExtension
+        if let type = UTType(filenameExtension: (format.defaultExtension as NSString).pathExtension.isEmpty ? format.defaultExtension : (format.defaultExtension as NSString).pathExtension) { save.allowedContentTypes = [type] }
         guard save.runModal() == .OK, let destination = save.url else { return }
         do { try captured.forEach { try $0.verifyCurrent() } } catch { archiveFailure(error); return }
         archiveOperations.create(sources: selected.map(\.url), destination: destination, format: format) { [weak self] result in
             switch result { case .success(let snapshot): self?.archiveUpdated(snapshot); case .failure(let error): self?.archiveFailure(error) }
         }
     }
+    private func archiveFormatPicker() -> NSPopUpButton {
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 320, height: 28), pullsDown: false)
+        picker.addItems(withTitles: ArchiveFormat.allCases.map(\.displayName))
+        picker.setAccessibilityLabel(L10n.text("Формат нового архива"))
+        return picker
+    }
 
     private func updateFunctionLabels() {
         let remote = active?.isRemote == true
         let archive = active?.isArchive == true
-        let readOnly = active?.archivePanel?.snapshot.isEncrypted == true
+        let readOnly = active?.archivePanel?.snapshot.isReadOnly == true
         let temporary = !archive && !remote && active?.isTemporary == true
         archiveFunctionButtons[4]?.isEnabled = !readOnly
+        archiveFunctionButtons[5]?.isEnabled = !(archive && (passive.isArchive || passive.isRemote)) && !(passive.isArchive && (remote || passive.archivePanel?.snapshot.isReadOnly == true))
         archiveFunctionButtons[5]?.title = archive ? "F5  Извлечь" : (passive.isArchive == true ? "F5  В архив" : "F5  Копия")
         archiveFunctionButtons[5]?.toolTip = archive ? "Извлечь выбранные элементы в обычную папку через очередь." : (passive.isArchive ? "Добавить выбранные файлы в соседний архив." : "Копировать выбранные файлы.")
-        archiveFunctionButtons[6]?.isEnabled = !archive && passive.isArchive != true
+        archiveFunctionButtons[6]?.isEnabled = archive ? !readOnly : !passive.isArchive
         archiveFunctionButtons[8]?.title = (archive || remote) ? "F8  Удалить" : "F8  Корзина"
         archiveFunctionButtons[8]?.toolTip = remote ? "Удаление с сервера без Корзины после подтверждения." : archive ? "Удалить выбранные элементы из архива после подтверждения. Корзина не используется." : "Переместить выбранные файлы в Корзину macOS."
         archiveFunctionButtons[8]?.isEnabled = !readOnly
-        folderFunctionButton?.isEnabled = !archive
+        folderFunctionButton?.isEnabled = !readOnly
         folderFunctionButton?.title = temporary ? "F7  Убрать" : "F7  Папка"
         folderFunctionButton?.toolTip = temporary ? "F7 — убрать ссылку из временной панели, сохранив файл." : "F7 — создать папку."
+        if passive.isVirtual { archiveFunctionButtons[5]?.isEnabled = !remote && !archive; archiveFunctionButtons[6]?.isEnabled = false }
+        if active?.isVirtual == true {
+            archiveFunctionButtons[4]?.isEnabled = active.cursorVirtualResult?.canEdit == true
+            archiveFunctionButtons[5]?.isEnabled = !passive.isArchive && !passive.isRemote && !passive.isVirtual && !passive.isTemporary
+            archiveFunctionButtons[5]?.title = "F5  Копия"
+            archiveFunctionButtons[6]?.isEnabled = false
+            archiveFunctionButtons[8]?.isEnabled = true
+            archiveFunctionButtons[8]?.title = "F8  Убрать"
+            archiveFunctionButtons[8]?.toolTip = "Убрать ссылки из панели. Исходные файлы сохраняются."
+            folderFunctionButton?.isEnabled = true; folderFunctionButton?.title = "F7  Убрать"
+        }
         for button in archiveFunctionButtons.values { button.title = L10n.text(button.title) }
         if let button = folderFunctionButton { button.title = L10n.text(button.title) }
     }
@@ -458,14 +577,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         toolWindows.append(controller); controller.showWindow(nil)
     }
     private func compareDirectories() {
-        guard !left.isTemporary, !right.isTemporary, !left.isArchive, !right.isArchive, !left.isRemote, !right.isRemote else {
+        guard !left.isVirtual, !right.isVirtual, !left.isTemporary, !right.isTemporary, !left.isArchive, !right.isArchive, !left.isRemote, !right.isRemote else {
             inform("Сравнение каталогов", "Вернитесь из временной панели к папкам."); return
         }
         let leftURL = left.directory, rightURL = right.directory
         comparisonWindow = DirectoryComparisonWindow(left: leftURL, right: rightURL) { [weak self] leftURLs, rightURLs in
             guard let self else { return }
             guard self.left.directory == leftURL, self.right.directory == rightURL,
-                  !self.left.isTemporary, !self.right.isTemporary, !self.left.loading, !self.right.loading else {
+                  !self.left.isVirtual, !self.right.isVirtual, !self.left.isTemporary, !self.right.isTemporary, !self.left.loading, !self.right.loading else {
                 self.inform("Пути панелей изменились", "Повторите сравнение текущих каталогов."); return
             }
             self.left.setContentMode(.files); self.right.setContentMode(.files)
@@ -477,6 +596,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     private func addToTemporaryPanel() {
         guard !busy else { return }
+        if active.isVirtual {
+            do { try passive.appendVirtualResults(active.selectedVirtualResults) } catch { showError(error) }
+            return
+        }
         let items = active.selectedEntries
         guard !items.isEmpty else { return }
         let snapshots = active.capturedSearchResults(for: items)
@@ -490,12 +613,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     return try items.map { try SearchResult.capture($0.url) }
                 }.value
                 guard target.directory == path else { throw PanelSessionError("Путь соседней панели изменился. Повторите добавление.") }
-                try target.addTemporaryItems(results)
+                if target.isVirtual { try target.appendVirtualResults(results.map(SearchMatch.local)) }
+                else { try target.addTemporaryItems(results) }
                 status.stringValue = "Добавлено ссылок: \(results.count). Исходные файлы не перемещались."
             } catch { showError(error) }
         }
     }
+    private func commonTemporaryPanels() -> TemporaryPanelsWindow {
+        if let temporaryPanelsWindow { return temporaryPanelsWindow }
+        let store = AppRuntime.smokeStateDirectory.map { TemporaryPanelLibraryStore(url: $0.appendingPathComponent("common-panels/panels.json")) } ?? TemporaryPanelLibraryStore()
+        let controller = TemporaryPanelsWindow(store: store, captureCurrent: { [weak self] in
+            guard let self, self.active.isTemporary else { return nil }
+            return (self.active.temporaryLibrarySlot, self.active.temporaryResults)
+        }, onOpen: { [weak self] slot, items in
+            guard let self else { return }
+            self.synchronizingTemporaryPanels = true
+            self.active.showTemporaryLibrarySlot(slot, items: items)
+            self.synchronizingTemporaryPanels = false
+            self.window.makeKeyAndOrderFront(nil); self.active.focus()
+        }, onError: { [weak self] error in self?.showError(error) }, onStored: { [weak self] slot, items in
+            guard let self, !self.synchronizingTemporaryPanels else { return }
+            self.synchronizingTemporaryPanels = true
+            for panel in [self.left!, self.right!] where panel.temporaryLibrarySlot == slot {
+                panel.showTemporaryLibrarySlot(slot, items: items, focus: false)
+            }
+            self.synchronizingTemporaryPanels = false
+        })
+        temporaryPanelsWindow = controller
+        return controller
+    }
+    private func persistentTemporaryPanels() -> PersistentTemporaryPanelsWindow {
+        if let persistentPanelsWindow { return persistentPanelsWindow }
+        let store = AppRuntime.smokeStateDirectory.map {
+            PersistentTemporaryPanelsStore(url: $0.appendingPathComponent("mixed-common/mixed-panels.json"),
+                legacyURL: $0.appendingPathComponent("common-panels/panels.json"))
+        } ?? PersistentTemporaryPanelsStore()
+        let controller = PersistentTemporaryPanelsWindow(store: store, captureCurrent: { [weak self] in
+            guard let self, let active = self.active else { return nil }
+            if active.isVirtual { return (active.virtualLibrarySlot, active.virtualResults) }
+            if active.isTemporary { return (nil, active.temporaryResults.map(SearchMatch.local)) }
+            return nil
+        }, onOpen: { [weak self] slot, references in
+            guard let self else { return }
+            do {
+                try self.active.showVirtualLibrarySlot(slot, matches: references.map(SearchMatch.saved))
+                self.window.makeKeyAndOrderFront(nil); self.active.focus()
+            } catch { self.showError(error) }
+        }, onError: { [weak self] error in self?.searchActionError(error) }, onStored: { [weak self] slot, references in
+            guard let self, !self.synchronizingTemporaryPanels else { return }
+            self.synchronizingTemporaryPanels = true
+            defer { self.synchronizingTemporaryPanels = false }
+            do {
+                for panel in [self.left!, self.right!] where panel.virtualLibrarySlot == slot {
+                    try panel.refreshVirtualLibrarySlot(slot, references: references)
+                }
+            } catch { self.showError(error) }
+        })
+        persistentPanelsWindow = controller
+        return controller
+    }
+
+    private func importTemporaryList() {
+        guard !busy, !active.isVirtual, !active.isArchive, !active.isRemote else { return }
+        let chooser = NSOpenPanel(); chooser.canChooseDirectories = false; chooser.allowsMultipleSelection = false
+        chooser.title = L10n.text("Импорт списка во временную панель…")
+        guard chooser.runModal() == .OK, let url = chooser.url else { return }
+        let target = active!, directory = target.directory
+        let format: TemporaryPanelList.Format = url.pathExtension.lowercased() == "json" ? .json : url.pathExtension.lowercased() == "lst0" ? .nul : .lines
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    let urls = try TemporaryPanelList.read(url, format: format)
+                    var items: [SearchResult] = [], skipped = 0
+                    for path in urls {
+                        do { items.append(try SearchResult.capture(path)) } catch { skipped += 1 }
+                    }
+                    return (items, skipped)
+                }.value
+                guard target.directory == directory, !target.isArchive, !target.isRemote else { throw PanelSessionError("Панель изменилась во время импорта.") }
+                try target.addTemporaryItems(result.0)
+                status.stringValue = L10n.text("Импортировано ссылок") + ": \(result.0.count); " + L10n.text("Недоступных путей") + ": \(result.1)"
+            } catch { showError(error) }
+        }
+    }
+    private func exportTemporaryList() {
+        guard !busy, !active.isVirtual, !active.isArchive, !active.isRemote else { return }
+        let urls = active.isTemporary ? active.temporaryResults.map(\.url) : active.selectedEntries.map(\.url)
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        let chooser = NSSavePanel(); chooser.allowedContentTypes = [.json]; chooser.nameFieldStringValue = "panel-list.json"
+        chooser.title = L10n.text("Экспорт списка путей…")
+        guard chooser.runModal() == .OK, let url = chooser.url else { return }
+        do {
+            try TemporaryPanelList.encode(urls).write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            status.stringValue = L10n.text("Список путей сохранён") + ": " + url.path
+        } catch { showError(error) }
+    }
     private func locateTemporaryItem() {
+        if active.isVirtual, let match = active.cursorVirtualResult { revealSearchMatch(match); return }
         guard active.isTemporary, let item = active.cursorEntry else { return }
         active.setContentMode(.files)
         active.load(item.url.deletingLastPathComponent(), preserveSelection: false, selectName: item.name)
@@ -518,7 +735,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func panelKey(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
         if modifiers == [.control], event.keyCode == 121, !active.isArchive, let entry = active.cursorEntry, !entry.isDirectory { openArchive(entry.url, in: active); return true }
-        if active.isArchive || active.isRemote { return false }
+        if active.isVirtual || active.isArchive || active.isRemote { return false }
         if modifiers == [.control], event.keyCode == 116, active.isTemporary { locateTemporaryItem(); return true }
         if modifiers == [.control] || modifiers == [.control, .shift] {
             let digitCodes: [UInt16: Int] = [29: 0, 18: 1, 19: 2, 20: 3, 21: 4, 23: 5, 22: 6, 26: 7, 28: 8, 25: 9]
@@ -558,53 +775,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func functionButton(_ sender: NSButton) { performFunction(sender.tag) }
     @objc func functionMenu(_ sender: NSMenuItem) { if sender.tag == 1 { help() } else { performFunction(sender.tag) } }
     private let filePanelCommands: Set<String> = ["mark", "markAll", "clearMarks", "invertMarks", "invertAll", "markMask", "unmarkMask", "restoreMarks", "sameExtension", "unmarkExtension", "sameName", "unmarkName", "invertFiles", "quickFind", "findNext", "findPrevious", "filter", "fileDescription", "rename", "copyCursor", "batchRename", "properties", "symbolicLink", "hardLink", "deletePermanently"]
+    private let virtualPanelCommands: Set<String> = ["temporarySlots", "temporaryRemove", "temporaryLocate", "temporaryLastMixed", "temporaryAdd", "copyCursor", "search", "mark", "markAll", "clearMarks", "invertMarks", "invertAll", "markMask", "unmarkMask", "restoreMarks", "sameExtension", "unmarkExtension", "sameName", "unmarkName", "invertFiles", "filter", "reverseSort", "refresh", "home", "parent", "back", "forward", "networkConnect", "networkCancel", "archiveCancel", "operationQueue", "help", "commandLine", "toggleTerminal"]
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.representedObject as? String == "descriptionPropagation" {
+            menuItem.state = DescriptionPreferences.enabled ? .on : .off
+        }
         if menuItem.action == #selector(showInterfacePreferences(_:)) { return NSApp.modalWindow == nil }
         if menuItem.action == #selector(functionMenu(_:)), menuItem.tag == 8 {
-            menuItem.title = active?.isRemote == true ? "Удалить с сервера…" : active?.isArchive == true ? "Удалить из архива…" : "В Корзину…"
+            menuItem.title = active?.isVirtual == true ? "Убрать ссылки из панели" : active?.isRemote == true ? "Удалить с сервера…" : active?.isArchive == true ? "Удалить из архива…" : "В Корзину…"
         }
         if menuItem.action == #selector(functionMenu(_:)), menuItem.tag == 5 {
             menuItem.title = active?.isArchive == true ? "Извлечь из архива…" : (passive.isArchive == true ? "Добавить в архив…" : "Копировать…")
         }
         if menuItem.action == #selector(functionMenu(_:)), menuItem.tag == 7 {
-            menuItem.title = active?.isTemporary == true ? "Убрать из временной панели" : "Создать папку…"
+            menuItem.title = (active?.isVirtual == true || active?.isTemporary == true) ? "Убрать из временной панели" : "Создать папку…"
         }
         if menuItem.action == #selector(functionMenu(_:)) && menuItem.tag == 1 { return true }
         if menuItem.action == #selector(newEditor(_:)) || menuItem.action == #selector(recoverEditors(_:)) {
             return NSApp.keyWindow?.attachedSheet == nil
         }
         guard window != nil && window.isKeyWindow && window.attachedSheet == nil && !busy else { return false }
+        if active.isVirtual {
+            if menuItem.action == #selector(functionMenu(_:)) {
+                if [2, 6].contains(menuItem.tag) { return false }
+                if menuItem.tag == 4 { return active.cursorVirtualResult?.canEdit == true && !toolMutationPending }
+                if menuItem.tag == 5 { return !passive.isVirtual && !passive.isRemote && !passive.isArchive && !passive.isTemporary && !toolMutationPending }
+            }
+            if let id = menuItem.representedObject as? String, !virtualPanelCommands.contains(id) { return false }
+        }
+        if menuItem.representedObject as? String == "temporaryLastMixed" { return !lastVirtualResults.isEmpty }
         if let id = menuItem.representedObject as? String, (active.isArchive || active.isRemote),
-           (filePanelCommands.contains(id) && id != "copyCursor") || ["search", "temporaryAdd", "temporaryRemove", "temporaryLocate", "saveSession", "panelSettings", "brief", "full", "custom", "reverseSort", "symbolicLink", "hardLink"].contains(id) { return false }
+           (filePanelCommands.contains(id) && id != "copyCursor") || ["temporaryAdd", "temporaryRemove", "temporaryLocate", "temporaryImport", "temporaryExport", "alternateExecute", "alternateView", "alternateEdit", "saveSession", "panelSettings", "brief", "full", "custom", "reverseSort", "symbolicLink", "hardLink"].contains(id) { return false }
         if let id = menuItem.representedObject as? String, filePanelCommands.contains(id), active.contentMode != .files { return false }
         if menuItem.action == #selector(functionMenu(_:)), (3...8).contains(menuItem.tag), active.contentMode != .files { return false }
         if let id = menuItem.representedObject as? String {
             switch id {
             case "networkConnect": return !toolMutationPending
-            case "networkDisconnect", "networkPath", "networkRefresh": return active.isRemote && !toolMutationPending
-            case "networkCancel": return network.isWorking
+            case "networkDisconnect", "networkPath", "networkRefresh", "networkRename": return active.isRemote && !toolMutationPending
+            case "networkCancel": return network.isWorking || virtualOperations.isWorking || savedPanelRestore.isWorking
+            case "networkReconnect": return active.remotePanel?.provider is SFTPProvider && !toolMutationPending
             case "networkRetry", "networkDiscard": return network.hasPendingDownload
-            case "archiveOpen": return !active.isArchive && active.cursorEntry?.isDirectory == false && !toolMutationPending
+            case "archiveOpen": return !toolMutationPending && (active.isArchive ? active.archivePanel?.cursorPath != nil && active.archivePanel?.cursorIsDirectory == false : !active.isRemote && active.cursorEntry?.isDirectory == false)
             case "archiveClose": return active.isArchive
-            case "archiveCreate": return !active.isArchive && !active.selectedEntries.isEmpty && !toolMutationPending
-            case "archiveExtract": return active.isArchive && !passive.isArchive && !toolMutationPending
-            case "archiveAdd": return !active.isArchive && passive.isArchive && passive.archivePanel?.snapshot.isEncrypted == false && !toolMutationPending
-            case "archiveDelete": return active.archivePanel?.snapshot.isEncrypted == false && !toolMutationPending
+            case "archiveCreate": return !active.isArchive && !active.isRemote && !active.selectedEntries.isEmpty && !toolMutationPending
+            case "archiveExtract": return active.isArchive && !passive.isArchive && !passive.isRemote && !toolMutationPending
+            case "archiveAdd": return !active.isArchive && !active.isRemote && passive.isArchive && passive.archivePanel?.snapshot.isReadOnly == false && !toolMutationPending
+            case "archiveDelete", "archiveMove", "archiveMkdir": return active.archivePanel?.snapshot.isReadOnly == false && !toolMutationPending
             case "archiveCancel": return archiveOperations.isWorking
             default: break
             }
         }
-        if active.isArchive, menuItem.action == #selector(functionMenu(_:)), [4, 8].contains(menuItem.tag), active.archivePanel?.snapshot.isEncrypted == true { return false }
-        if active.isArchive, menuItem.action == #selector(functionMenu(_:)), [6, 7].contains(menuItem.tag) { return false }
+        if active.isArchive, menuItem.action == #selector(functionMenu(_:)), [4, 6, 7, 8].contains(menuItem.tag), active.archivePanel?.snapshot.isReadOnly == true { return false }
         if menuItem.representedObject as? String == "back" { return active.canGoBack }
         if menuItem.representedObject as? String == "forward" { return active.canGoForward }
-        if let id = menuItem.representedObject as? String, ["leaveResults", "temporaryRemove", "temporaryLocate"].contains(id) { return active.isTemporary && active.contentMode == .files }
+        if let id = menuItem.representedObject as? String, ["leaveResults", "temporaryRemove", "temporaryLocate"].contains(id) { return (active.isVirtual || active.isTemporary) && active.contentMode == .files }
+        if let id = menuItem.representedObject as? String, ["alternateExecute", "alternateView", "alternateEdit"].contains(id) {
+            return active.contentMode == .files && !active.loading && active.cursorEntry?.isDirectory == false
+        }
+        if let id = menuItem.representedObject as? String, ["temporaryImport", "temporaryExport", "temporarySlots"].contains(id) {
+            return active.contentMode == .files && !active.loading
+        }
         if menuItem.representedObject as? String == "temporaryAdd" { return active.contentMode == .files && !active.loading }
         return true
     }
 
     private func configureAutomation() {
         let workspace = CommandWorkspace.shared
+        workspace.panelState = { [weak self] in
+            guard let self, !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote, self.active.contentMode == .files,
+                  !self.active.loading, !self.terminalVisible else { return nil }
+            return MacroEnvironment(context: .panel, fileName: self.active.cursorEntry?.name,
+                isDirectory: self.active.cursorEntry?.isDirectory, hasSelection: !self.active.markedEntries.isEmpty)
+        }
         workspace.configure(window: window) { [weak self] text in self?.status.stringValue = text }
         let recorded: Set<String> = ["mark", "markAll", "clearMarks", "invertMarks", "invertAll", "invertFiles", "restoreMarks", "sameExtension", "unmarkExtension", "sameName", "unmarkName", "reverseSort", "brief", "full", "custom"]
         func registerMenu(_ menu: NSMenu) {
@@ -636,14 +878,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         for (id, title, delta) in [("panel.down", "Курсор вниз", 1), ("panel.up", "Курсор вверх", -1)] {
             workspace.register(id, title: title, contexts: [.panel], recordable: true) { [weak self] in
-                guard let self, !self.busy, !self.active.loading, !self.active.isArchive, !self.active.isRemote,
+                guard let self, !self.busy, !self.active.loading, !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote,
                       self.active.contentMode == .files, !self.terminalVisible else { throw CommandRegistryError.contextMismatch }
                 self.active.automationMoveCursor(delta)
             }
         }
         workspace.panelKey = { [weak self] event in
             guard let self, !self.terminalVisible, self.window.firstResponder === self.active.table,
-                  !self.active.isArchive, !self.active.isRemote, self.active.contentMode == .files else { return nil }
+                  !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote, self.active.contentMode == .files else { return nil }
             let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
             if flags == [.command], event.keyCode == 0 { return "panel.markAll" }
             if flags == [.control], event.keyCode == 46 { return "panel.restoreMarks" }
@@ -660,7 +902,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         ViewerWindow.registerAutomation(in: workspace)
         workspace.register("dialog.help", title: "Справка диалога", contexts: [.dialog]) { [weak self] in self?.help() }
         ExtensionWorkspace.shared.panelEntries = { [weak self] in
-            guard let self, !self.active.loading, !self.active.isArchive, !self.active.isRemote else { throw CommandRegistryError.contextMismatch }
+            guard let self, !self.active.loading, !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote else { throw CommandRegistryError.contextMismatch }
             return self.active.selectedEntries.map { ExtensionEntry(name: $0.name, isDirectory: $0.isDirectory, size: Int64($0.size)) }
         }
     }
@@ -675,7 +917,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if active.contentMode != .files && [3, 4, 5, 6, 7, 8].contains(function) {
             status.stringValue = "Для файловой операции переключитесь в режим «Файлы»."; NSSound.beep(); return
         }
+        if active.isVirtual {
+            switch function {
+            case 3, 4: if let match = active.cursorVirtualResult { openSearchMatch(match, editable: function == 4) }; return
+            case 5: copyVirtualResults(); return
+            case 2, 6: NSSound.beep(); return
+            case 7, 8: active.removeVirtualSelection(); return
+            default: break
+            }
+        }
         if active.isRemote {
+            if passive.isVirtual && [5, 6].contains(function) { NSSound.beep(); return }
             switch function {
             case 3, 4: network.open(active, editable: function == 4); return
             case 5, 6: network.transfer(from: active, to: passive, move: function == 6); return
@@ -689,7 +941,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             case 3, 4: if let path = active.archivePanel?.cursorPath { openArchiveMember(active, path: path, editable: function == 4) }; return
             case 5: extractArchiveSelection(); return
             case 8: deleteArchiveSelection(); return
-            case 6, 7: inform("Команда недоступна в архиве", "Используйте F5 для извлечения или добавления. Перемещение и создание папок внутри архива пока не поддерживаются."); return
+            case 6: moveArchiveSelection(); return
+            case 7: createArchiveDirectory(); return
             default: break
             }
         }
@@ -715,24 +968,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         performPanelCommand(id)
     }
     private func performPanelCommand(_ id: String) {
-        if active.isArchive || active.isRemote, (filePanelCommands.contains(id) && id != "copyCursor") || ["search", "temporaryAdd", "temporaryRemove", "temporaryLocate", "saveSession", "panelSettings", "brief", "full", "custom", "reverseSort"].contains(id) { NSSound.beep(); return }
+        if active.isVirtual, !virtualPanelCommands.contains(id) { NSSound.beep(); return }
+        if active.isArchive || active.isRemote, (filePanelCommands.contains(id) && id != "copyCursor") || ["temporaryAdd", "temporaryRemove", "temporaryLocate", "temporaryImport", "temporaryExport", "alternateExecute", "alternateView", "alternateEdit", "saveSession", "panelSettings", "brief", "full", "custom", "reverseSort"].contains(id) { NSSound.beep(); return }
         if filePanelCommands.contains(id), active.contentMode != .files { NSSound.beep(); return }
         switch id {
         case "networkConnect": network.connect(in: active)
-        case "networkDisconnect": active.leaveRemote()
+        case "networkDisconnect": if let provider = active.remotePanel?.provider { network.disconnected(provider) }; active.leaveRemote()
         case "networkPath": network.goTo(active)
         case "networkRefresh": network.refresh(active)
-        case "networkCancel": network.cancel()
+        case "networkReconnect": network.reconnect(active)
+        case "networkRename": network.rename(active)
+        case "networkCancel": network.cancel(); virtualOperations.cancel(); savedPanelRestore.cancel()
         case "networkRetry": network.retryDownload()
         case "networkDiscard": network.discardDownload()
-        case "archiveOpen": if let entry = active.cursorEntry, !entry.isDirectory { openArchive(entry.url, in: active) }
-        case "archiveClose": active.leaveArchive()
+        case "archiveOpen":
+            if active.isArchive, let path = active.archivePanel?.cursorPath { openNestedArchive(active, path: path) }
+            else if !active.isRemote, let entry = active.cursorEntry, !entry.isDirectory { openArchive(entry.url, in: active) }
+        case "archiveClose": active.closeArchiveLevel()
         case "archiveCreate": createArchive()
         case "archiveExtract": extractArchiveSelection()
         case "archiveAdd": addToArchive()
         case "archiveDelete": deleteArchiveSelection()
+        case "archiveMove": moveArchiveSelection()
+        case "archiveMkdir": createArchiveDirectory()
         case "archiveCancel": archiveOperations.cancel()
         case "fileDescription": editFileDescription()
+        case "descriptionPropagation":
+            DescriptionPreferences.enabled.toggle()
+            status.stringValue = DescriptionPreferences.enabled ? "Описания будут переноситься с файлами в новых локальных заданиях." : "Автоматический перенос описаний отключён для новых заданий."
         case "sortGroups": editSortGroups()
         case "panelFiles": active.setContentMode(.files); active.focus()
         case "panelTree": active.setContentMode(.tree); active.focus()
@@ -740,8 +1003,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case "panelQuickView": active.setContentMode(.quickView); active.focus()
         case "compareDirectories": compareDirectories()
         case "temporaryAdd": addToTemporaryPanel()
-        case "temporaryRemove": active.removeTemporarySelection()
+        case "temporaryRemove": if active.isVirtual { active.removeVirtualSelection() } else { active.removeTemporarySelection() }
+        case "temporaryLastMixed": do { try active.showVirtualResults(lastVirtualResults) } catch { showError(error) }
         case "temporaryLocate": locateTemporaryItem()
+        case "temporarySlots": persistentTemporaryPanels().showWindow(nil)
+        case "temporaryImport": importTemporaryList()
+        case "temporaryExport": exportTemporaryList()
+        case "alternateExecute": shellWorkspace.alternativeAssociation(action: .alternateExecute)
+        case "alternateView": shellWorkspace.alternativeAssociation(action: .alternateView)
+        case "alternateEdit": shellWorkspace.alternativeAssociation(action: .alternateEdit)
         case "saveSession": left.persistSession(); right.persistSession(); status.stringValue = "Сессия панелей сохранена."
         case "commandLine": shellWorkspace.focusCommand()
         case "shell": shellWorkspace.interactiveShell()
@@ -876,11 +1146,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             return
         }
         if !shellWorkspace.association(for: entry.url, action: editable ? .edit : .view) {
-            _ = openDocument(entry.url, editable: editable)
+            if editable { _ = openDocument(entry.url, editable: true) }
+            else {
+                let urls = active.visible.filter { !$0.isDirectory && !$0.isSymbolicLink }.map(\.url)
+                status.stringValue = "Подготовка просмотра…"
+                Task { [weak self] in
+                    let navigation = await Task.detached(priority: .userInitiated) { try? ViewerNavigation(urls: urls, currentURL: entry.url) }.value
+                    guard let self else { return }
+                    _ = self.openDocument(entry.url, editable: false, navigation: navigation)
+                    self.status.stringValue = navigation == nil ? "Просмотр без списка соседних файлов." : "Список файлов для просмотра взят из текущего порядка панели."
+                }
+            }
         }
     }
     @discardableResult
-    private func openDocument(_ url: URL, editable: Bool, byteOffset: Int64? = nil, encoding: ViewerEncoding = .automatic) -> Bool {
+    private func openDocument(_ url: URL, editable: Bool, byteOffset: Int64? = nil, encoding: ViewerEncoding = .automatic, initialDisplayMode: ViewerDisplayMode? = nil, navigation: ViewerNavigation? = nil) -> Bool {
         do {
             if editable {
                 if let existing = editors.first(where: {
@@ -888,11 +1168,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 }) { existing.showWindow(nil); return true }
                 let editor = try TextFileWindow(url: url, editable: true, initialByteOffset: byteOffset, encoding: encoding,
                     onView: { [weak self] url, offset, encoding in self?.openDocument(url, editable: false, byteOffset: offset, encoding: encoding) ?? false })
-                editors.removeAll { $0.window?.isVisible == false }
+                editors.removeAll { $0.window?.isVisible == false && $0.retainedArchiveWorkspace == nil && $0.retainedRemoteWorkspace == nil }
                 editors.append(editor)
                 editor.showWindow(nil)
             } else {
-                let viewer = try ViewerWindow(url: url, initialByteOffset: byteOffset, initialEncoding: encoding,
+                let viewer = try ViewerWindow(url: url, initialByteOffset: byteOffset, initialEncoding: encoding, initialDisplayMode: initialDisplayMode, navigation: navigation,
                     onEdit: { [weak self] url, offset, encoding in self?.openDocument(url, editable: true, byteOffset: offset, encoding: encoding) ?? false })
                 viewers.removeAll { $0.window?.isVisible == false }
                 viewers.append(viewer)
@@ -909,22 +1189,176 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             return false
         }
     }
+    private func searchLocations(in panel: PanelView) -> [SearchLocation] {
+        if let archive = panel.archivePanel { return [.archive(archive.snapshot, prefix: archive.currentDirectory)] }
+        if let remote = panel.remotePanel { return [.remote(remote.provider, root: remote.currentPath)] }
+        if panel.isVirtual { return [] }
+        return [.local(panel.directory)]
+    }
     func openSearch() {
-        guard !active.isArchive, !active.isRemote else { inform("Поиск внутри провайдера пока недоступен", "Откройте обычную папку для рекурсивного поиска."); return }
-        if let searchWindow, searchWindow.window?.isVisible == true || searchWindow.isSearching {
-            searchWindow.showWindow(nil)
-            return
+        if let searchWindow, searchWindow.window?.isVisible == true || searchWindow.isWorkerRunning {
+            searchWindow.showWindow(nil); return
         }
-        searchWindow = SearchWindow(directory: active.directory, maskGroups: maskGroups,
-            onReveal: { [weak self] result in self?.revealSearchResult(result) },
-            onOpen: { [weak self] result, editable in self?.openSearchResult(result, editable: editable) },
-            onSendToPanel: { [weak self] results in
-                guard let self else { return }
-                self.active.showSearchResults(results)
-                self.window.makeKeyAndOrderFront(nil)
-                self.active.focus()
-            })
+        guard !busy, !toolMutationPending, !operationQueue.hasPendingOperations else { return }
+        let sources = searchLocations(in: active)
+        searchWindow = SearchWindow(sources: sources.isEmpty ? searchLocations(in: passive) : sources,
+            availableSources: { [weak self] in
+                guard let self else { return [] }
+                return self.searchLocations(in: self.active) + self.searchLocations(in: self.passive)
+            }, maskGroups: maskGroups,
+            onReveal: { [weak self] match in self?.revealSearchMatch(match) },
+            onOpen: { [weak self] match, editable in self?.openSearchMatch(match, editable: editable) },
+            onSendToPanel: { [weak self] matches in self?.showSearchMatches(matches) })
+        searchWindow?.canStart = { [weak self] in
+            guard let self else { return false }
+            return !self.busy && !self.toolMutationPending && !self.operationQueue.hasPendingOperations
+        }
         searchWindow?.showWindow(nil)
+    }
+    private func showSearchMatches(_ matches: [SearchMatch]) {
+        do {
+            if matches.allSatisfy({ if case .local = $0 { return true }; return false }) {
+                active.showSearchResults(matches.compactMap { if case .local(let value) = $0 { return value }; return nil })
+            } else { try active.showVirtualResults(matches) }
+            window.makeKeyAndOrderFront(nil); active.focus()
+        } catch { searchActionError(error) }
+    }
+    private func revealSearchMatch(_ match: SearchMatch) {
+        guard !toolMutationPending, !busy else { return }
+        switch match {
+        case .saved:
+            restoreSavedMatches([match]) { [weak self] matches in
+                if let match = matches.first { self?.revealSearchMatch(match) }
+            }
+        case .local(let result): revealSearchResult(result)
+        case .archive(let result): revealArchiveSearchResult(result)
+        case .remote(let result, let provider):
+            let target = active!
+            network.revealSearchResult(result, provider: provider, in: target) { [weak self, weak target] in
+                guard let self, let target else { return }
+                self.activate(target); self.window.makeKeyAndOrderFront(nil); target.focus()
+            }
+        }
+    }
+    private func openSearchMatch(_ match: SearchMatch, editable: Bool) {
+        guard !toolMutationPending, !busy, !editable || match.canEdit else { return }
+        switch match {
+        case .saved:
+            restoreSavedMatches([match]) { [weak self] matches in
+                if let match = matches.first { self?.openSearchMatch(match, editable: editable) }
+            }
+        case .local(let result): openSearchResult(result, editable: editable)
+        case .archive(let result): openArchiveSearchResult(result, editable: editable)
+        case .remote(let result, let provider):
+            guard result.remoteEntry != nil else { return }
+            network.openSearchResult(result, provider: provider, editable: editable)
+        }
+    }
+    /// Resolve only on an explicit action. Partial failures remain visible as offline rows.
+    private func restoreSavedMatches(_ matches: [SearchMatch], completion: @escaping ([SearchMatch]) -> Void) {
+        guard !busy, !toolMutationPending, !operationQueue.hasPendingOperations else { return }
+        let pending = matches.enumerated().compactMap { index, match -> (Int, SavedSearchReference)? in
+            if case .saved(let reference) = match { return (index, reference) }; return nil
+        }
+        guard !pending.isEmpty else { completion(matches); return }
+        let target = active!, generation = target.locationGeneration, originalVirtualPanel = target.virtualPanel
+        var providers: [any RemoteProvider] = []
+        for match in lastVirtualResults + left.virtualResults + right.virtualResults {
+            if case .remote(_, let provider) = match, !providers.contains(where: { $0 === provider }) { providers.append(provider) }
+        }
+        for panel in [left!, right!] {
+            if let provider = panel.remotePanel?.provider, !providers.contains(where: { $0 === provider }) { providers.append(provider) }
+        }
+        savedPanelRestore.restore(pending.map { $0.1 }, availableProviders: providers) { [weak self, weak target] outcome in
+            guard let self, let target else { return }
+            guard target.locationGeneration == generation else {
+                self.status.stringValue = "Панель изменилась. Повторите действие с нужным результатом."
+                return
+            }
+            if let originalVirtualPanel {
+                guard target.virtualPanel === originalVirtualPanel,
+                      pending.allSatisfy({ item in target.virtualResults.contains { $0.id == item.1.id && (try? SavedSearchReference(capturing: $0)) == item.1 } }) else {
+                    self.status.stringValue = "Список результатов изменился. Повторите действие."; return
+                }
+            }
+            do { try target.applyRestoredVirtualMatches(outcome.matches) }
+            catch { self.searchActionError(error); return }
+            guard !outcome.cancelled else {
+                self.status.stringValue = "Восстановление отменено. Ссылки сохранены в панели."; return
+            }
+            guard outcome.failures.isEmpty else {
+                let detail = outcome.failures.prefix(3).map { $0.reference.displayPath + "\n" + $0.message }.joined(separator: "\n\n")
+                self.searchActionError(PanelSessionError("Недоступных результатов: \(outcome.failures.count). Ссылки сохранены.\n\n" + detail))
+                return
+            }
+            var resolved = matches
+            for (item, restored) in zip(pending, outcome.matches) { resolved[item.0] = restored }
+            self.activate(target)
+            completion(resolved)
+        }
+    }
+
+    private func copyVirtualResults(cursorOnly: Bool = false) {
+        guard !busy, !toolMutationPending, !operationQueue.hasPendingOperations,
+              !passive.isVirtual, !passive.isArchive, !passive.isRemote, !passive.isTemporary else { return }
+        let matches = cursorOnly ? active.cursorVirtualResult.map { [$0] } ?? [] : active.selectedVirtualResults
+        guard !matches.isEmpty, matches.count <= 100 else {
+            inform("Копирование результатов", "Выберите от 1 до 100 объектов."); return
+        }
+        let destination = passive.directory
+        let alert = NSAlert(); alert.messageText = "Копировать выбранные результаты?"
+        alert.informativeText = "Объектов: \(matches.count)\nНазначение: \(destination.path)\nАрхивные и сетевые копии: до 256 МиБ суммарно. Конфликты обрабатывает очередь; исходники сохраняются."
+        alert.addButton(withTitle: "Копировать"); alert.addButton(withTitle: "Отмена")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        restoreSavedMatches(matches) { [weak self] resolved in
+            self?.prepareVirtualCopies(resolved, destination: destination)
+        }
+    }
+    private func prepareVirtualCopies(_ matches: [SearchMatch], destination: URL) {
+        var passwords: [URL: String] = [:]
+        for match in matches {
+            guard case .archive(let result) = match, let snapshot = result.capturedArchiveSnapshot,
+                  snapshot.isEncrypted, passwords[snapshot.sourceURL] == nil else { continue }
+            let prompt = NSAlert(); prompt.messageText = "Пароль архива"
+            prompt.informativeText = result.archiveDisplayPath ?? snapshot.sourceURL.lastPathComponent
+            let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 26)); prompt.accessoryView = field
+            prompt.addButton(withTitle: "Продолжить"); prompt.addButton(withTitle: "Отмена")
+            guard prompt.runModal() == .alertFirstButtonReturn else { return }; passwords[snapshot.sourceURL] = field.stringValue
+        }
+        virtualOperations.run(title: "Подготовка результатов к копированию", work: { token, progress in
+            try SearchResultCopies.prepare(matches, archivePasswords: passwords, cancellation: token, progress: progress)
+        }) { [weak self] outcome in
+            guard let self else { return }
+            do {
+                let copies = try outcome.get()
+                // Freeze requests before launching any queue job; same-name items remain distinct jobs.
+                let requests = try copies.map { copy -> TransferRequest in
+                    if case .local(let result) = copy.original { try result.verifyCurrent() }
+                    return TransferRequest(sources: [copy.source], destination: destination, move: false, propagateDescriptions: false)
+                }
+                var added = 0
+                for (request, copy) in zip(requests, copies) {
+                    guard self.operationQueue.enqueue(request, retaining: copy) else { break }; added += 1
+                }
+                self.status.stringValue = "Передано в очередь: \(added) из \(copies.count)."
+            } catch { self.showError(error) }
+        }
+    }
+    private func revealArchiveSearchResult(_ result: ProviderSearchResult) {
+        do {
+            guard let snapshot = result.capturedArchiveSnapshot else { throw PanelSessionError("Архив результата недоступен") }
+            try result.verifyArchiveCurrent(snapshot: snapshot)
+            active.showArchive(frame: ArchiveNavigationFrame(snapshot: snapshot))
+            active.archivePanel?.reveal(path: result.path)
+            window.makeKeyAndOrderFront(nil); active.focus()
+        } catch { searchActionError(error) }
+    }
+    private func openArchiveSearchResult(_ result: ProviderSearchResult, editable: Bool) {
+        do {
+            guard let snapshot = result.capturedArchiveSnapshot else { throw PanelSessionError("Архив результата недоступен") }
+            try result.verifyArchiveCurrent(snapshot: snapshot)
+            openArchiveMember(snapshot: snapshot, path: result.path, editable: editable, byteOffset: result.byteOffset)
+        } catch { searchActionError(error) }
     }
     private func revealSearchResult(_ result: SearchResult) {
         do {
@@ -944,7 +1378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     retainTool(FilePropertiesWindow(url: result.url, canMutate: { [weak self] in self?.canUseFileTools() ?? false }, onComplete: { [weak self] in self?.refresh() }))
                 } else { retainTool(DirectorySizeWindow(url: result.url)) }
             } else {
-                _ = openDocument(result.url, editable: editable)
+                _ = openDocument(result.url, editable: editable, byteOffset: result.byteOffset, initialDisplayMode: result.byteOffset == nil ? nil : .hex)
             }
         } catch { searchActionError(error) }
     }
@@ -1009,15 +1443,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         } catch { showError(error) }
     }
     func makeDirectory() {
-        guard !active.loading else { return }
+        guard !active.isVirtual, !active.loading else { return }
         let directory = active.directory
         prompt("Новая папка", detail: directory.path, value: "Новая папка", button: "Создать") { [weak self] name in
             self?.runOperation("Создание папки…") { try FileService.createDirectory(named: name, in: directory) }
         }
     }
     func transfer(move: Bool, cursorOnly: Bool = false) {
+        if active.isVirtual { if !move { copyVirtualResults(cursorOnly: cursorOnly) }; return }
+        if passive.isVirtual { if !move { addToTemporaryPanel() }; return }
         if active.isRemote || passive.isRemote { network.transfer(from: active, to: passive, move: move, cursorOnly: cursorOnly); return }
         if active.isArchive || passive.isArchive {
+            if move && active.isArchive { moveArchiveSelection(cursorOnly: cursorOnly); return }
             if move { inform("Перемещение между архивом и папкой", "Пока доступно только копирование F5; исходники остаются на месте."); return }
             if active.isArchive { extractArchiveSelection(cursorOnly: cursorOnly) } else { addToArchive(cursorOnly: cursorOnly) }
             return
@@ -1049,7 +1486,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             guard let self, !self.toolMutationPending, !self.busy else { return }
             do { try searchSnapshots.forEach { try $0.verifyCurrent() } }
             catch { self.showError(error); return }
-            self.operationQueue.enqueue(TransferRequest(sources: sources, destination: destination, move: move))
+            self.operationQueue.enqueue(TransferRequest(sources: sources, destination: destination, move: move, propagateDescriptions: DescriptionPreferences.enabled, descriptionEncodings: DescriptionPreferences.encodings(forSources: sources, destination: destination)))
             self.status.stringValue = "Добавлено в очередь: \(sources.count) объектов"
         }
     }
@@ -1134,7 +1571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             text = FileOperationQueue.helpText
         } else if let controller = toolWindows.first(where: { $0.window === key }) {
             title = controller.window?.title ?? "Файловые инструменты"
-            text = "F3 для папки считает логический размер без обхода символических ссылок; подсчёт можно остановить. F4 открывает свойства и позволяет менять POSIX-права выбранного объекта без рекурсии.\n\nГрупповое переименование использует шаблон {name}, {ext}, {n}. Сначала создайте и проверьте предпросмотр. Изменение шаблона сбрасывает предпросмотр. Существующие имена не перезаписываются; после частичной ошибки завершённые переименования остаются.\n\nЗакройте окно через Cmd+W. Во время записи дождитесь завершения."
+            text = "F3 для папки считает логический размер без обхода символических ссылок; подсчёт можно остановить. F4 открывает свойства: даты доступа/изменения и POSIX-права. Рекурсивные права требуют предпросмотра и отдельного подтверждения; даты меняются только у выбранного объекта. Отмена сохраняет выполненные изменения.\n\nГрупповое переименование использует шаблон {name}, {ext}, {n}. Сначала создайте и проверьте предпросмотр. Изменение шаблона сбрасывает предпросмотр. Существующие имена не перезаписываются; после частичной ошибки завершённые переименования остаются.\n\nЗакройте окно через Cmd+W. Во время записи дождитесь завершения."
         } else if key === settingsWindow?.window {
             title = "Настройки панели"
             text = "Сортировка и вид сохраняются отдельно для левой и правой панели.\n\nКраткий режим показывает имя. Полный добавляет сведения о размере, дате, правах и владельце. В своём режиме выберите колонки; имя всегда остаётся. Большое число колонок включает горизонтальную прокрутку.\n\nПапки первыми — отдельная группировка, независимая от направления. Естественный порядок ставит file2 перед file10. Учитывать регистр — сравнивать большие и малые буквы отдельно. Сортировка по пометкам обновляется при изменении пометок.\n\n«Применить» сохраняет настройки. «Отмена» закрывает без изменения."
@@ -1149,10 +1586,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             text = dialogHelp.isEmpty ? "Enter — подтвердить действие; Escape — отменить. Проверяйте пути и число объектов перед подтверждением. Корзина macOS позволяет восстановить удалённые объекты." : dialogHelp
         } else if active.isRemote {
             title = "Сетевая панель"
-            text = "SFTP, FTP/FTPS и WebDAV: Enter — папка/просмотр, Tab — соседняя панель, Esc — отключиться. Пробел/Insert — пометки, Cmd+A — отметить всё.\n\nF3 — просмотр, F4 — локальная рабочая копия. Сохранение в редакторе не отправляет файл: нажмите «Сохранить на сервер» в отдельном окне. Удалённая версия проверяется повторно.\n\nF5 — копирование между обычной и сетевой панелями; F6 — перенос обычного файла после проверки копии. F7 — новая папка, F8 — удаление с сервера без Корзины. Непустые папки и перенос папок требуют отдельных действий.\n\nПосле разрыва используйте «Сеть → Продолжить скачивание». WebDAV со строгим ETag продолжает подтверждённую частичную копию; другие серверы начинают загрузку заново. При изменённой версии сбросьте задание. Незавершённое скачивание хранится до сброса или выхода из приложения. Между удалёнными панелями прямой перенос пока не поддерживается."
+            text = "SFTP, FTP/FTPS и WebDAV: Enter — папка/просмотр, Tab — соседняя панель, Esc — отключиться. Пробел/Insert — пометки, Cmd+A — отметить всё.\n\nF3 — просмотр, F4 — локальная рабочая копия. Сохранение в редакторе не отправляет файл: нажмите «Сохранить на сервер» в отдельном окне. Удалённая версия проверяется повторно.\n\nF5 — копирование между обычной и сетевой панелями; F6 — перенос обычного файла после проверки копии. F7 — новая папка, F8 — удаление с сервера без Корзины. F8 показывает план рекурсивного удаления для SFTP/FTP; WebDAV-папки этой командой не удаляются. Alt+F7 ищет внутри текущей сетевой папки.\n\nПосле разрыва используйте «Сеть → Продолжить скачивание». WebDAV со строгим ETag продолжает подтверждённую частичную копию; другие серверы начинают загрузку заново. При изменённой версии сбросьте задание. Незавершённое скачивание хранится до сброса или выхода из приложения. F6 между двумя панелями одного SFTP/WebDAV-профиля перемещает выбранные файлы и папки на сервере без замены. Команда «Сеть → Переименовать / переместить на сервере» работает с объектом под курсором. Слияние папок и межсерверная передача пока недоступны."
         } else if active.isArchive {
             title = "Архивная панель"
-            text = "ZIP и несжатый TAR. Enter — войти в папку или просмотреть файл, Backspace — выше, Esc — закрыть архив, Tab — соседняя панель. Пробел/Insert — пометка, Cmd+A — отметить всё.\n\nF3 — просмотр, F4 — рабочая копия редактора. Сохранение в редакторе меняет только копию: примените её отдельной кнопкой «Сохранить в архив». F5 извлекает в обычную папку через очередь; F5 с противоположной файловой панели добавляет выбранное в текущую папку архива. F8 удаляет элементы из архива после подтверждения.\n\nСоздание ZIP/TAR доступно в меню «Архив» на обычной панели. Шифрованные ZIP доступны только для чтения с паролем. Вложенные, многотомные, ZIP64, 7z/RAR и сжатые TAR пока не поддерживаются."
+            text = "ZIP и несжатый TAR. Enter — войти в папку или просмотреть файл, Backspace — выше, Esc — закрыть архив, Tab — соседняя панель. Пробел/Insert — пометка, Cmd+A — отметить всё.\n\nF3 — просмотр, F4 — рабочая копия редактора. Сохранение в редакторе меняет только копию: примените её отдельной кнопкой «Сохранить в архив». F5 извлекает в обычную папку через очередь; F5 с противоположной файловой панели добавляет выбранное в текущую папку архива. F6 перемещает/переименовывает внутри архива без перезаписи конфликтов; F7 создаёт папку. F8 удаляет элементы из архива после подтверждения. Alt+F7 ищет внутри текущей папки архива.\n\nСоздание ZIP/TAR доступно в меню «Архив» на обычной панели. Шифрованные ZIP доступны только для чтения с паролем. Вложенные, многотомные, ZIP64, 7z/RAR и сжатые TAR пока не поддерживаются."
         } else {
             title = "Файловая панель"
             text = "Курсор и пометки независимы. F5/F6/F8 обрабатывают пометки, без пометок — курсор. F3/F4 и Shift+F5/F6 используют только курсор. Для папки F3 считает размер, F4 открывает свойства.\n\nНАВИГАЦИЯ\nTab — другая панель; Enter — открыть; Backspace — выше.\nHome/End/PageUp/PageDown — перемещение; Shift — с пометкой.\nCmd+L — путь, Cmd+[ / Cmd+] — назад/вперёд.\nOption+буквы — быстрый поиск без фильтрации, Ctrl+Enter — следующее совпадение, Ctrl+Shift+Enter — предыдущее, Escape — закрыть поиск.\nCmd+F — фильтр текущей панели; скрываемые файлы теряют пометки.\nOption+F7 или Cmd+Shift+F — рекурсивный поиск файлов. Результаты можно открыть через F3/F4 или отправить во временную панель. Кнопка возврата восстанавливает обычную папку.\nOption+F1/F2 — тома и папки соответствующей панели.\nCtrl+Shift+0…9 — сохранить быструю папку; Ctrl+0…9 — перейти.\n\nПОМЕТКИ\nInsert/Space — переключить пометку и шагнуть вниз.\nShift+стрелки/Home/End/Page — пометить диапазон покидаемых строк.\nCtrl+M — восстановить прошлый набор, повтор — поменять наборы местами.\nNumpad +/− — маска; * — инверсия; Ctrl+* — с папками.\nCtrl+Numpad +/− — то же расширение; Ctrl+Shift+Numpad +/− — то же имя без расширения.\nCmd+A — все объекты, Cmd-щелчок — одна пометка.\n\nМЕНЮ\nCmd+J — очередь и журнал; отмена не откатывает завершённые файлы.\nF9 — все меню команд; меню «Вид» — сортировка, режим и колонки.\nCtrl+T — дерево, Ctrl+L — информация, Ctrl+Q — быстрый просмотр соседнего файла; Esc возвращает файлы. «Панели» — сравнение каталогов, описания и группы сортировки. Во временной панели F7 убирает только ссылку, Ctrl+PageUp открывает исходную папку.\nМеню «История», «Избранное» и «Тома» — переходы; «Панели» — синхронизация путей. Настройки сохраняются между запусками.\n\nF2 — пользовательское меню; «Команды» — настройка меню, ассоциации и истории. Cmd+Enter — строка команд, Tab/Ctrl+Space в строке — дополнить путь, Ctrl+E/X — история. Ctrl+O — панели/PTY; Ctrl+C в терминале — прервать. Shell открывает интерактивную сессию. Простой cd меняет панель, cd внутри shell меняет только сессию. На Mac для F-клавиш может потребоваться Fn."
@@ -1160,6 +1597,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         contextHelp.present(title: title, text: text)
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        do { try temporaryPanelsWindow?.persistLinkedPanel(); try persistentPanelsWindow?.persistLinkedPanel() }
+        catch { showError(error); return .terminateCancel }
+        if searchWindow?.isProviderSearching == true {
+            searchWindow?.cancel(); searchWindow?.showWindow(nil)
+            status.stringValue = "Поиск отменяется. Дождитесь очистки временных копий и повторите выход."
+            return .terminateCancel
+        }
+        if savedPanelRestore.isWorking {
+            savedPanelRestore.cancel()
+            status.stringValue = "Восстановление отменяется. Дождитесь очистки и повторите выход."
+            return .terminateCancel
+        }
         if toolMutationPending {
             status.stringValue = "Дождитесь завершения или отмены файловой операции."
             toolWindows.first { ($0 as? FileToolsWindowController)?.hasPendingMutation == true }?.showWindow(nil)
@@ -1175,7 +1624,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         for controller in toolWindows.compactMap({ $0 as? MetadataEditingWindow }) where controller.window?.isVisible == true {
             if !controller.confirmClose() { return .terminateCancel }
         }
-        for editor in editors where editor.window?.isVisible == true {
+        for editor in editors where editor.window?.isVisible == true || editor.retainedArchiveWorkspace != nil || editor.retainedRemoteWorkspace != nil {
             if let window = editor.window, editor.windowShouldClose(window) == false { return .terminateCancel }
         }
         for session in archiveEdits where session.window?.isVisible == true {
@@ -1227,6 +1676,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         window?.subtitle = L10n.text("Файловый менеджер")
         left?.applyInterfacePreferences(); right?.applyInterfacePreferences()
+        shellWorkspace?.applyInterfacePreferences()
     }
     private func installWorkspaceObservers() {
         let center = NSWorkspace.shared.notificationCenter
@@ -1257,7 +1707,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func refreshLocalPanelsIfIdle() {
         guard refreshAfterWake, !busy, !toolMutationPending, !operationQueue.hasPendingOperations else { return }
         refreshAfterWake = false
-        for panel in [left!, right!] where !panel.isArchive && !panel.isRemote {
+        for panel in [left!, right!] where !panel.isVirtual && !panel.isArchive && !panel.isRemote {
             if FileManager.default.isReadableFile(atPath: panel.directory.path) { panel.refresh() }
             else { panel.invalidateUnavailableVolume(panel.directory) }
         }
@@ -1320,9 +1770,267 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             try require(left.entries.count == 2, "Panel recovers after resource returns")
             left.persistSession()
             try require(AppPreferences.defaults.data(forKey: "panel.left.session") != nil, "Session persists in isolated defaults")
+            let listData = try TemporaryPanelList.encode(left.entries.map(\.url))
+            let listURLs = try TemporaryPanelList.decode(listData, format: .json, relativeTo: left.directory)
+            let snapshots = try listURLs.map { try SearchResult.capture($0) }
+            try left.addTemporaryItems(snapshots)
+            try require(left.isTemporary && left.temporaryResults.count == 2 && left.table.numberOfRows == 2, "Imported path list creates real temporary panel rows")
+            try left.addTemporaryItems(snapshots)
+            let exportedPaths = try TemporaryPanelList.decode(TemporaryPanelList.encode(left.temporaryResults.map(\.url)), format: .json, relativeTo: left.directory)
+            try require(left.temporaryResults.count == 2 && exportedPaths.count == 2, "Temporary export preserves paths and duplicate import keeps original snapshots")
+            checks += try await FilePropertiesWindow.runUISmokeChecks()
+            checks += try await BatchRenameWindow.verifyFARRenameUI()
+            checks += try await PanelView.runColumnLayoutUISmokeChecks()
+            checks += try await FileOperationQueue.runDescriptionQueueUISmokeChecks()
+            checks += try await FileDescriptionWindow.runUISmokeChecks()
+            let commonPanels = commonTemporaryPanels()
+            commonPanels.updateLinkedSlot(0, items: snapshots)
+            activate(left); commonPanels.openSlot(0)
+            activate(right); commonPanels.openSlot(0)
+            let sharedLoadDeadline = Date().addingTimeInterval(5)
+            while (left.loading || right.loading) && Date() < sharedLoadDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
+            try require(!left.loading && !right.loading && left.temporaryResults.count == 2 && right.temporaryResults.count == 2,
+                        "Both shared common panels finish validating the original snapshots")
+            activate(left); left.focus(); left.markAll()
+            try require(left.markedEntries.count == 2, "Common panel marks are applied after snapshot validation")
+            left.removeTemporarySelection()
+            let sharedSyncDeadline = Date().addingTimeInterval(5)
+            while (left.loading || right.loading) && Date() < sharedSyncDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
+            try require(!left.loading && !right.loading && left.temporaryResults.isEmpty && right.temporaryResults.isEmpty,
+                        "Two panels sharing a common slot synchronize removals without restoring stale links")
+            try require(active === left, "Synchronizing the passive common panel preserves the active panel and focus")
+            commonPanels.openSlot(9)
+            activate(right); commonPanels.openSlot(8)
+            activate(left); commonPanels.openSlot(0)
+            let sharedReopenDeadline = Date().addingTimeInterval(5)
+            while (left.loading || right.loading) && Date() < sharedReopenDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
+            try require(!left.loading && !right.loading && left.temporaryResults.isEmpty,
+                        "Switching both former shared views and reopening the slot does not resurrect removed references")
+            activate(left)
+            checks += try TemporaryPanelsWindow.runUISmokeChecks()
+            checks += try PersistentTemporaryPanelsWindow.runUISmokeChecks()
+            checks += try await SavedPanelRestoreController.runUISmokeChecks()
+            checks += try await runPersistentPanelsHostUISmokeChecks()
+            checks += try SearchWindow.runSearchOptionsUISmokeChecks()
+            checks += try await SearchWindow.runProviderSearchUISmokeChecks()
+            checks += try await SearchWindow.runHexSearchUISmokeChecks()
+            checks += try await SearchWindow.runArchiveTraversalUISmokeChecks()
+            checks += try await SearchWindow.runMultiSourceUISmokeChecks()
+            checks += try PanelView.runVirtualResultsUISmokeChecks()
+            checks += try await runMixedResultsHostUISmokeChecks()
+            checks += try await ArchiveOperationController.runArchiveMutationUISmokeChecks()
+            checks += try await runArchiveNavigationUISmokeChecks()
+            checks += try NetworkCoordinator.runProviderOperationUISmokeChecks()
+            checks += try NetworkCoordinator.runDirectoryTransferUISmokeChecks()
+            checks += try NetworkConflictEditor.runUISmokeChecks()
+            checks += try await NetworkCoordinator.runDirectoryMoveUISmokeChecks()
+            checks += try PanelView.runNetworkLifecycleUISmokeChecks()
+            checks += try UserCommandsWindow.runUserCommandUISmokeChecks()
+            checks += try CommandWorkspace.runUISmokeChecks()
+            checks += try TextFileWindow.runEditingUISmokeChecks()
+            checks += try await ViewerWindow.runViewerUISmokeChecks()
+            checks += try await ViewerWindow.runViewerFuzzyUISmokeChecks()
+            checks += try await WorkingCopyViewerSession.runWorkingCopyUISmokeChecks()
+            checks += try NetworkConnectionWindow.runUISmokeChecks()
+            checks += try TerminalRenderer.runUISmokeChecks()
+            checks += try MacroShortcutAdapter.runUISmokeChecks()
+            checks += try ExtensionWorkspace.runUISmokeChecks()
+            checks += try await ShellWorkspace.runUISmokeChecks()
             shellWorkspace.stopForExit()
             AppRuntime.finishSmoke(checks: checks)
         } catch { shellWorkspace?.stopForExit(); AppRuntime.finishSmoke(checks: checks, error: error.localizedDescription) }
+    }
+
+    private func runPersistentPanelsHostUISmokeChecks() async throws -> [String] {
+        guard AppRuntime.isSmoke, let base = AppRuntime.smokeStateDirectory else { throw PanelSessionError("Missing smoke scope") }
+        let folder = base.appendingPathComponent("saved-host-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent("local.txt"); try Data("saved original".utf8).write(to: file)
+        let original = active!, previous = lastVirtualResults
+        let provider = ProviderUISmokeFixture()
+        savedPanelRestore.showsProgressWindow = false
+        defer {
+            savedPanelRestore.showsProgressWindow = true
+            left.leaveVirtualResults(focus: false); right.leaveVirtualResults(focus: false)
+            activate(original); lastVirtualResults = previous
+            persistentTemporaryPanels().persistLastMixed(previous)
+            try? FileManager.default.removeItem(at: folder)
+        }
+        var matches: [SearchMatch] = [.local(try SearchResult.capture(file))]
+        var options = SearchOptions(roots: [folder]); options.namePattern = "alpha.txt"
+        _ = ProviderSearchEngine.runRemote(provider: provider, root: "/docs", request: SearchRequest(options: options), cancellation: ProviderSearchCancellation()) {
+            if case .result(let result) = $0 { matches.append(.remote(result, provider)) }
+        }
+        guard matches.count == 2 else { throw PanelSessionError("Saved host fixture missing") }
+        let library = persistentTemporaryPanels()
+        library.updateLinkedSlot(7, items: matches)
+        activate(left); library.openSlot(7)
+        activate(right); library.openSlot(7)
+        guard [left!, right!].allSatisfy({ $0.virtualLibrarySlot == 7 && $0.virtualResults.count == 2 && $0.virtualResults.allSatisfy({ if case .saved = $0 { return true }; return false }) }), provider.downloads == 0 else {
+            throw PanelSessionError("Host shared slots did not open offline")
+        }
+        activate(left); window.makeKeyAndOrderFront(nil); left.focus()
+        let menu = menuCommand("Общие временные панели · 0–9", "temporarySlots")
+        guard validateMenuItem(menu) else { throw PanelSessionError("Common slot menu unavailable on a virtual panel") }
+        // Supply a real session provider; restore must match it exactly and avoid credentials.
+        lastVirtualResults = matches
+        var restored: [SearchMatch]?
+        restoreSavedMatches(left.virtualResults) { restored = $0 }
+        let deadline = Date().addingTimeInterval(5)
+        while savedPanelRestore.isWorking && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        guard let restored, restored.count == 2, restored.allSatisfy({ if case .saved = $0 { return false }; return true }),
+              left.virtualResults.allSatisfy({ if case .saved = $0 { return false }; return true }),
+              left.virtualLibrarySlot == 7 else { throw PanelSessionError("Host explicit restore failed or lost shared slot") }
+        let copies = try SearchResultCopies.prepare(restored)
+        guard copies.count == 2, provider.downloads == 1 else { throw PanelSessionError("Restored results did not enter normal copy staging") }
+        left.markAll(); left.removeVirtualSelection()
+        guard left.virtualResults.isEmpty, right.virtualResults.isEmpty else { throw PanelSessionError("Host mixed common slot removal did not synchronize") }
+        let disk = try PersistentTemporaryPanelsStore(url: base.appendingPathComponent("mixed-common/mixed-panels.json")).load()
+        guard disk.slots[7].isEmpty, disk.lastMixed.isEmpty, FileManager.default.fileExists(atPath: file.path) else {
+            throw PanelSessionError("Host removal did not persist or removed source")
+        }
+        // Startup uses exactly this offline decode; reopening retains type and original stamps.
+        library.persistLastMixed(matches)
+        let restart = try PersistentTemporaryPanelsStore(url: base.appendingPathComponent("mixed-common/mixed-panels.json")).load()
+        lastVirtualResults = restart.lastMixed.map(SearchMatch.saved)
+        try left.showVirtualResults(lastVirtualResults)
+        guard left.virtualResults.count == 2, left.virtualLibrarySlot == nil, provider.downloads == 1 else {
+            throw PanelSessionError("Last mixed list failed offline restart recreation")
+        }
+        guard let localReference = restart.lastMixed.first(where: { if case .local = $0 { return true }; return false }) else {
+            throw PanelSessionError("Missing saved local fixture")
+        }
+        var removedActionRan = false
+        restoreSavedMatches([.saved(localReference)]) { _ in removedActionRan = true }
+        left.markAll(); left.removeVirtualSelection()
+        let removalDeadline = Date().addingTimeInterval(5)
+        while savedPanelRestore.isWorking && Date() < removalDeadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        guard !savedPanelRestore.isWorking, !removedActionRan, left.virtualResults.isEmpty,
+              FileManager.default.fileExists(atPath: file.path) else {
+            throw PanelSessionError("Pending saved action acted after its reference was removed")
+        }
+        return ["Host common-slot menu works on virtual panels; both panes open persisted mixed references offline",
+                "Host explicit restore reuses exact live provider, upgrades rows and stages F5 copies",
+                "Host shared removals persist without touching originals; last mixed panel recreates offline after store reload",
+                "Removing a saved reference during restoration prevents the deferred action"]
+    }
+
+    private func runMixedResultsHostUISmokeChecks() async throws -> [String] {
+        guard AppRuntime.isSmoke, let base = AppRuntime.smokeStateDirectory else { throw PanelSessionError("Missing smoke scope") }
+        let original = active!, previous = lastVirtualResults
+        let folder = base.appendingPathComponent("mixed-host-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { left.leaveVirtualResults(focus: false); left.leaveRemote(focus: false); lastVirtualResults = previous; activate(original); try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appendingPathComponent("local.txt"); try Data("local".utf8).write(to: file)
+        let provider = ProviderUISmokeFixture()
+        var options = SearchOptions(roots: [folder]); options.namePattern = "*.txt"; options.kinds = [.file]
+        var matches: [SearchMatch] = []
+        _ = MultiSourceSearchEngine.run(locations: [.local(folder), .remote(provider, root: "/docs")],
+            request: SearchRequest(options: options), cancellation: ProviderSearchCancellation()) {
+                if case .match(let match) = $0 { matches.append(match) }
+            }
+        guard matches.count == 3, let remote = matches.first(where: { if case .remote = $0 { return true }; return false }) else { throw PanelSessionError("Host mixed fixtures missing") }
+        activate(left); showSearchMatches(matches); window.makeKeyAndOrderFront(nil); left.focus()
+        let moveMenu = NSMenuItem(title: "Move", action: #selector(functionMenu(_:)), keyEquivalent: ""); moveMenu.tag = 6
+        guard left.isVirtual, left.cursorEntry == nil, left.selectedEntries.isEmpty,
+              !validateMenuItem(moveMenu), lastVirtualResults.count == 3 else { throw PanelSessionError("Host mixed panel exposed local operations or lost session history") }
+        revealSearchMatch(remote)
+        let deadline = Date().addingTimeInterval(5)
+        while network.isWorking && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        guard left.remotePanel?.provider === provider, left.remotePanel?.cursor?.path == "/docs/alpha.txt" else {
+            throw PanelSessionError("Host Enter did not restore captured remote provider")
+        }
+        try left.showVirtualResults(lastVirtualResults)
+        openSearchMatch(remote, editable: false)
+        let viewDeadline = Date().addingTimeInterval(5)
+        while network.isWorking && Date() < viewDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        guard provider.downloads > 0 else { throw PanelSessionError("Host F3 did not read captured remote result") }
+        window.makeKeyAndOrderFront(nil); left.focus(); left.markAll(); performFunctionDirect(8)
+        guard left.virtualResults.isEmpty, lastVirtualResults.isEmpty, FileManager.default.fileExists(atPath: file.path),
+              try provider.stat(path: "/docs/alpha.txt", cancellation: TransferCancellation()) != nil else {
+            throw PanelSessionError("Host F8 changed source files or resurrected removed references")
+        }
+        return ["Mixed host panel hides underlying local paths and disables move; session history retains typed references",
+                "Mixed host Enter and F3 restore and read the captured network provider",
+                "Mixed host F8 removes references and session history while preserving local and remote originals"]
+    }
+
+    private func runArchiveNavigationUISmokeChecks() async throws -> [String] {
+        guard AppRuntime.isSmoke, let base = AppRuntime.smokeStateDirectory else { throw ArchiveError.io("Missing isolated smoke directory") }
+        let folder = base.appendingPathComponent("nested-panel-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let originalActive = active!
+        defer { left.leaveArchive(); activate(originalActive); try? FileManager.default.removeItem(at: folder) }
+        func require(_ condition: Bool, _ message: String) throws { if !condition { throw ArchiveError.io(message) } }
+        let payload = Data([0, 255, 1, 128, 42])
+        let file = folder.appendingPathComponent("payload.bin"); try payload.write(to: file)
+        let nestedFolder = folder.appendingPathComponent("archives")
+        try FileManager.default.createDirectory(at: nestedFolder, withIntermediateDirectories: false)
+        try Data("marked sibling".utf8).write(to: nestedFolder.appendingPathComponent("sibling.txt"))
+        let inner = try ArchiveWriter.create(sources: [file, nestedFolder], destination: folder.appendingPathComponent("inner.tar.gz"), format: .tarGzip)
+        try FileManager.default.copyItem(at: inner.sourceURL, to: nestedFolder.appendingPathComponent("inner.tar.gz"))
+        let outer = try ArchiveWriter.create(sources: [nestedFolder], destination: folder.appendingPathComponent("outer.zip"), format: .zip)
+        let root = ArchiveNavigationFrame(snapshot: outer)
+        activate(left); left.showArchive(frame: root); left.archivePanel?.reveal(path: "archives/inner.tar.gz")
+        left.archivePanel?.restoreNavigationState(.init(directory: "archives", cursor: "archives/inner.tar.gz", marks: ["archives/sibling.txt"], cursors: ["archives": "archives/inner.tar.gz"]))
+        window.makeKeyAndOrderFront(nil); left.focus()
+        try require(archiveFunctionButtons[6]?.isEnabled == true && folderFunctionButton?.isEnabled == true, "Writable archive enables F6/F7 function buttons")
+        left.archivePanel?.openSelection()
+        let deadline = Date().addingTimeInterval(5)
+        while archiveOperations.isWorking && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        guard let child = left.archiveFrame, child.parent === root else { throw ArchiveError.io("Enter did not open nested archive through host controller") }
+        window.makeKeyAndOrderFront(nil); left.focus()
+        try require(left.archivePanel?.currentDirectory == "" && left.archivePanel?.captureNavigationState().marks.isEmpty == true, "Nested child starts at root without inheriting parent marks")
+        try require(child.snapshot.isReadOnly && left.pathField.stringValue.contains("outer.zip !/archives/inner.tar.gz"), "Nested frame shows parent chain and is read-only")
+        let searchSource = ProviderSearchSource.archive(child.snapshot, prefix: "")
+        try require(!searchSource.canEdit && searchSource.caption.contains("outer.zip !/archives/inner.tar.gz"), "Nested search retains provenance and disables editing")
+        try require(archiveFunctionButtons[4]?.isEnabled == false && archiveFunctionButtons[6]?.isEnabled == false && archiveFunctionButtons[8]?.isEnabled == false && folderFunctionButton?.isEnabled == false, "Nested archive disables F4/F6/F7/F8")
+        for id in ["archiveDelete", "archiveMove", "archiveMkdir"] {
+            let item = menuCommand(id, id)
+            try require(!validateMenuItem(item), "Nested archive mutation menu is disabled")
+        }
+        left.closeArchiveLevel()
+        try require(left.archiveFrame === root && left.archivePanel?.cursorPath == "archives/inner.tar.gz" && left.archivePanel?.currentDirectory == "archives" && left.archivePanel?.selectedArchivePaths == ["archives/sibling.txt"], "Closing nested archive restores parent directory, cursor and marks")
+        left.leaveArchive()
+        let extracted = try ArchiveReader.extract(child.snapshot)
+        defer { extracted.cleanup() }
+        try require(try Data(contentsOf: extracted.url(for: "payload.bin")) == payload, "Retained nested result stays readable after panel exit")
+        let viewer = try ViewerWindow(url: extracted.url(for: "payload.bin"), onEdit: { _, _, _ in false })
+        viewer.retainedArchiveWorkspace = extracted
+        viewer.showWorkingCopyLocation(child.displayPath + " !/payload.bin")
+        try require(viewer.window?.subtitle == child.displayPath + " !/payload.bin", "Nested viewer identifies its archive location")
+        viewer.close()
+        var searchOptions = SearchOptions(roots: [folder])
+        searchOptions.namePattern = "payload.bin"
+        searchOptions.searchNestedArchives = true
+        var archiveMatches: [ProviderSearchResult] = []
+        _ = ProviderSearchEngine.runArchive(outer, request: SearchRequest(options: searchOptions), cancellation: ProviderSearchCancellation()) { event in
+            if case .result(let result) = event { archiveMatches.append(result) }
+        }
+        guard let found = archiveMatches.first(where: { $0.capturedArchiveSnapshot?.isReadOnly == true }) else {
+            throw ArchiveError.io("Nested search result missing in host smoke")
+        }
+        revealArchiveSearchResult(found)
+        try require(left.archivePanel?.cursorPath == "payload.bin" && left.archiveFrame?.parent != nil,
+                    "Search Enter restores actual nested frame and selects member")
+        let previousViewerCount = viewers.filter { $0.window?.isVisible != false }.count
+        openArchiveSearchResult(found, editable: false)
+        let searchOpenDeadline = Date().addingTimeInterval(5)
+        while archiveOperations.isWorking && Date() < searchOpenDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        try require(viewers.count == previousViewerCount + 1 && viewers.last?.window?.subtitle.contains("outer.zip !/archives/inner.tar.gz !/payload.bin") == true,
+                    "Search F3 opens actual retained nested working copy with full location")
+        viewers.last?.close(); viewers.removeLast()
+        left.leaveArchive()
+        try Data("changed parent".utf8).write(to: outer.sourceURL)
+        do { try child.verifyCurrent(); throw ArchiveError.io("Changed outer archive was accepted") }
+        catch ArchiveError.changedArchive { }
+        let picker = archiveFormatPicker()
+        try require(picker.itemTitles == ArchiveFormat.allCases.map(\.displayName), "Creation picker exposes every verified compression format")
+        return ["Enter opens nested compressed archive through controller and displays its parent chain",
+                "Nested archives disable write commands; writable roots expose F6/F7 buttons",
+                "Closing nested frame restores parent directory, cursor and marks; retained snapshot survives panel exit and rejects changed ancestor",
+                "Archive creation picker offers ZIP, TAR, TAR.GZ, TAR.BZ2 and TAR.XZ",
+                "Search Enter restores nested panel; F3 opens actual nested member through host controller"]
     }
 
     func setupMenu() {
@@ -1364,6 +2072,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         for (title, id) in [("Массовое переименование…", "batchRename"), ("Свойства и права…", "properties"), ("Создать символическую ссылку…", "symbolicLink"), ("Создать жёсткую ссылку…", "hardLink"), ("Удалить безвозвратно…", "deletePermanently")] {
             files.addItem(menuCommand(title, id))
         }
+        files.addItem(menuCommand("Переносить описания вместе с файлами", "descriptionPropagation"))
         let operations = submenu("Операции")
         operations.addItem(menuCommand("Очередь и журнал…", "operations", key: "j"))
         operations.addItem(menuCommand("Отменить все ожидающие и текущую", "cancelOperations"))
@@ -1384,7 +2093,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let item = NSMenuItem(title: title, action: #selector(command(_:)), keyEquivalent: "")
             item.target = self; item.representedObject = id; commands.addItem(item)
         }
+        for (title, id) in [("Альтернативное открытие…", "alternateExecute"), ("Альтернативный просмотр…", "alternateView"), ("Альтернативное редактирование…", "alternateEdit")] {
+            commands.addItem(menuCommand(title, id))
+        }
         let navigation = submenu("Панели")
+        navigation.addItem(menuCommand("Общие временные панели · 0–9", "temporarySlots"))
+        navigation.addItem(menuCommand("Последняя смешанная панель", "temporaryLastMixed"))
+        navigation.addItem(menuCommand("Импорт списка во временную панель…", "temporaryImport"))
+        navigation.addItem(menuCommand("Экспорт списка путей…", "temporaryExport"))
         for (name, id, key) in [("Описание файла…", "fileDescription", ""), ("Группы сортировки…", "sortGroups", ""), ("Файловая панель", "panelFiles", ""), ("Дерево каталогов · Ctrl+T", "panelTree", ""), ("Информационная панель · Ctrl+L", "panelInfo", ""), ("Быстрый просмотр · Ctrl+Q", "panelQuickView", ""), ("Сравнить каталоги…", "compareDirectories", ""), ("Добавить выбранное во временную соседнюю панель", "temporaryAdd", ""), ("Убрать из временной панели (без удаления файлов)", "temporaryRemove", ""), ("Перейти к исходной папке", "temporaryLocate", ""), ("Сохранить сессию панелей", "saveSession", ""), ("Перейти к пути…", "path", "l"), ("Выбрать папку…", "choose", "o"), ("Назад", "back", "["), ("Вперёд", "forward", "]"), ("Быстрый поиск по имени", "quickFind", ""), ("Следующее совпадение", "findNext", ""), ("Предыдущее совпадение", "findPrevious", ""), ("Фильтр текущей папки", "filter", "f"), ("Обновить", "refresh", "r"), ("Показать / скрыть скрытые файлы", "hidden", "."), ("Открыть этот путь в соседней панели", "syncToOther", ""), ("Взять путь соседней панели", "syncFromOther", ""), ("Настройки активной панели…", "panelSettings", ""), ("Открыть Терминал здесь", "terminal", "t"), ("Показать в Finder", "reveal", "")] {
             let item = NSMenuItem(title: name, action: #selector(command(_:)), keyEquivalent: key)
             item.target = self; item.representedObject = id; navigation.addItem(item)
@@ -1399,9 +2115,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         windows.addItem(withTitle: "Закрыть окно", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         windows.addItem(withTitle: "Свернуть", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         let networks = submenu("Сеть")
-        for (title, id) in [("Подключиться…", "networkConnect"), ("Отключиться", "networkDisconnect"), ("Удалённая папка…", "networkPath"), ("Обновить / подключиться повторно", "networkRefresh"), ("Отменить сетевую операцию", "networkCancel"), ("Продолжить скачивание", "networkRetry"), ("Сбросить незавершённое скачивание", "networkDiscard")] { networks.addItem(menuCommand(title, id)) }
+        for (title, id) in [("Подключиться…", "networkConnect"), ("Отключиться", "networkDisconnect"), ("Удалённая папка…", "networkPath"), ("Обновить", "networkRefresh"), ("Установить новое SSH-соединение", "networkReconnect"), ("Переименовать / переместить на сервере…", "networkRename"), ("Отменить сетевую операцию", "networkCancel"), ("Продолжить скачивание", "networkRetry"), ("Сбросить незавершённое скачивание", "networkDiscard")] { networks.addItem(menuCommand(title, id)) }
         let archives = submenu("Архив")
-        for (title, id) in [("Открыть как архив · Ctrl+PageDown", "archiveOpen"), ("Закрыть архив", "archiveClose"), ("Создать ZIP / TAR…", "archiveCreate"), ("Извлечь выбранное…", "archiveExtract"), ("Добавить выбранное в соседний архив…", "archiveAdd"), ("Удалить выбранное из архива…", "archiveDelete"), ("Отменить архивную операцию", "archiveCancel")] { archives.addItem(menuCommand(title, id)) }
+        for (title, id) in [("Открыть как архив · Ctrl+PageDown", "archiveOpen"), ("Закрыть архив", "archiveClose"), ("Создать ZIP / TAR со сжатием…", "archiveCreate"), ("Извлечь выбранное…", "archiveExtract"), ("Добавить выбранное в соседний архив…", "archiveAdd"), ("Удалить выбранное из архива…", "archiveDelete"), ("Переместить / переименовать внутри архива · F6", "archiveMove"), ("Новая папка внутри архива · F7", "archiveMkdir"), ("Отменить архивную операцию", "archiveCancel")] { archives.addItem(menuCommand(title, id)) }
         NSApp.windowsMenu = windows
         CommandWorkspace.shared.installMenu(in: bar)
         ExtensionWorkspace.shared.installMenu(in: bar)

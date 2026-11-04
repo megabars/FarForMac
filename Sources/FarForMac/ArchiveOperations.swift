@@ -95,6 +95,33 @@ final class ArchiveOperationController {
         }
     }
 
+    func openNested(_ frame: ArchiveNavigationFrame, path: String,
+                    completion: @escaping (Result<ArchiveNavigationFrame, Error>) -> Void) {
+        openNested(frame, path: path, password: nil, nestedPassword: nil, completion: completion)
+    }
+    private func openNested(_ frame: ArchiveNavigationFrame, path: String, password: String?, nestedPassword: String?,
+                            completion: @escaping (Result<ArchiveNavigationFrame, Error>) -> Void) {
+        run(title: "Открытие вложенного архива", detail: frame.displayPath + " !/" + path, work: { token, progress in
+            try frame.openNested(path: path, password: password, nestedPassword: nestedPassword,
+                                 cancellation: token, onProgress: progress)
+        }) { [weak self] result in
+            guard case .failure(let error) = result, let passwordError = error as? ArchiveNestedPasswordError,
+                  let self else { completion(result); return }
+            let sourceError: ArchiveError
+            let parent: Bool
+            switch passwordError {
+            case .parent(let error): sourceError = error; parent = true
+            case .child(let error): sourceError = error; parent = false
+            }
+            let source = parent ? frame.snapshot.sourceURL : URL(fileURLWithPath: path)
+            guard let value = Self.requestPassword(source, incorrect: Self.incorrectPassword(sourceError)) else {
+                completion(.failure(ArchiveError.cancelled)); return
+            }
+            self.openNested(frame, path: path, password: parent ? value : password,
+                            nestedPassword: parent ? nestedPassword : value, completion: completion)
+        }
+    }
+
     func extract(_ snapshot: ArchiveSnapshot, paths: [String]? = nil,
                  completion: @escaping (Result<ArchiveWorkspace, Error>) -> Void) {
         guard !isWorking else { completion(.failure(ArchiveOperationUIError.busy)); return }
@@ -145,6 +172,20 @@ final class ArchiveOperationController {
                 completion: @escaping (Result<ArchiveSnapshot, Error>) -> Void) {
         update(snapshot, additions: additions, deletions: deletions, replacements: replacements, prefix: prefix,
                policy: .error, completion: completion)
+    }
+
+    func createDirectory(_ snapshot: ArchiveSnapshot, path: String,
+                         completion: @escaping (Result<ArchiveSnapshot, Error>) -> Void) {
+        run(title: "Создание папки в архиве", detail: path, work: { token, progress in
+            try ArchiveWriter.createDirectory(snapshot, path: path, cancellation: token, onProgress: progress)
+        }, completion: completion)
+    }
+
+    func move(_ snapshot: ArchiveSnapshot, entries: [String: String],
+              completion: @escaping (Result<ArchiveSnapshot, Error>) -> Void) {
+        run(title: "Перемещение внутри архива", detail: snapshot.sourceURL.path, work: { token, progress in
+            try ArchiveWriter.move(snapshot, entries: entries, cancellation: token, onProgress: progress)
+        }, completion: completion)
     }
     private func update(_ snapshot: ArchiveSnapshot, additions: [URL], deletions: [String],
                         replacements: [String: URL], prefix: String, policy: ArchiveOverwritePolicy,
@@ -209,5 +250,36 @@ final class ArchiveOperationController {
         case .alertSecondButtonReturn: return .skip
         default: return nil
         }
+    }
+
+    static func runArchiveMutationUISmokeChecks() async throws -> [String] {
+        let root = (AppRuntime.smokeDirectory ?? FileManager.default.temporaryDirectory)
+            .appendingPathComponent("archive-mutations-" + UUID().uuidString)
+        let fm = FileManager.default
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        let source = root.appendingPathComponent("payload.bin")
+        let payload = Data([0, 1, 127, 128, 255, 0])
+        try payload.write(to: source)
+        let snapshot = try ArchiveWriter.create(sources: [source], destination: root.appendingPathComponent("smoke.zip"), format: .zip)
+        let controller = ArchiveOperationController()
+        let created: ArchiveSnapshot = try await withCheckedThrowingContinuation { continuation in
+            controller.createDirectory(snapshot, path: "empty") { continuation.resume(with: $0) }
+        }
+        let moved: ArchiveSnapshot = try await withCheckedThrowingContinuation { continuation in
+            controller.move(created, entries: ["payload.bin": "parent/renamed.bin", "empty": "parent/empty"]) {
+                continuation.resume(with: $0)
+            }
+        }
+        let workspace = try ArchiveReader.extract(moved)
+        defer { workspace.cleanup() }
+        guard !controller.isWorking,
+              moved.entries.contains(where: { $0.path == "parent/empty" && $0.isDirectory }),
+              !moved.entries.contains(where: { $0.path == "payload.bin" || $0.path == "empty" }),
+              try Data(contentsOf: workspace.url(for: "parent/renamed.bin")) == payload else {
+            throw NSError(domain: "ArchiveMutationSmoke", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Archive F6/F7 wrappers preserve data and empty directories"])
+        }
+        return ["Archive operation controller creates empty directories and moves trees with preserved binary data"]
     }
 }

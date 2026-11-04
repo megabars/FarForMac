@@ -50,6 +50,8 @@ jobs:
           mkdir -p dist/validation
           set -o pipefail
           python3 -m unittest discover -s Tests/NetworkFixtures -v 2>&1 | tee dist/validation/fixture-startup.log
+      - name: Install test-only SSH server
+        run: python3 -m pip install -r Tests/NetworkFixtures/requirements-ssh-password.txt
       - name: Core tests
         run: |
           mkdir -p dist/validation

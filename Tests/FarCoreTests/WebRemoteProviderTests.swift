@@ -134,6 +134,61 @@ final class WebRemoteProviderTests {
         }
     }
 
+    @Test func searchDownloadEnforcesDAVAndFTPByteCeilingsBeforeWriting() throws {
+        let fixture = try WebRemoteFixture(); defer { fixture.stop() }
+        let providers: [RemoteSearchDownloadProvider] = [
+            WebRemoteProvider(connection: fixture.connection(.webdav), password: "memory-only-secret"),
+            FTPRemoteProvider(connection: fixture.connection(.ftp), password: "memory-only-secret")
+        ]
+        let unknown = fixture.root.appendingPathComponent("unknown-length-bounded")
+        webExpectThrows(try providers[0].searchDownload(path: "/unknown-length-search", to: unknown, maximumBytes: 3,
+            cancellation: TransferCancellation(), progress: { _ in }))
+        #expect(((try? Data(contentsOf: unknown).count) ?? 0) <= 3)
+        for (index, provider) in providers.enumerated() {
+            let output = fixture.root.appendingPathComponent("bounded-\(index)")
+            webExpectThrows(try provider.searchDownload(path: "/hello space.txt", to: output, maximumBytes: 3,
+                cancellation: TransferCancellation(), progress: { _ in }))
+            let size = (try? Data(contentsOf: output).count) ?? 0
+            #expect(size <= 3)
+            try provider.searchDownload(path: "/hello space.txt", to: output, maximumBytes: 18,
+                cancellation: TransferCancellation(), progress: { _ in })
+            #expect(try Data(contentsOf: output) == Data("hello remote world".utf8))
+            var options = SearchOptions(roots: []); options.contentMode = .literal; options.contentQuery = "remote"
+            var found: [ProviderSearchResult] = []
+            let summary = ProviderSearchEngine.runRemote(provider: provider, root: "/hello space.txt", request: SearchRequest(options: options), cancellation: ProviderSearchCancellation()) {
+                if case .result(let result) = $0 { found.append(result) }
+            }
+            #expect(summary.errors == 0); #expect(found.count == 1)
+        }
+    }
+
+    @Test func directoryUploadMoveVerifiesDAVBytesBeforeLocalDeletionAndDownloadMoveRefusesCollections() throws {
+        let fixture = try WebRemoteFixture(); defer { fixture.stop() }
+        let provider = WebRemoteProvider(connection: fixture.connection(.webdav), password: "memory-only-secret")
+        let source = fixture.root.appendingPathComponent("move-tree")
+        try FileManager.default.createDirectory(at: source.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source.appendingPathComponent("empty"), withIntermediateDirectories: false)
+        try Data("first file".utf8).write(to: source.appendingPathComponent("a"))
+        try Data("nested bytes".utf8).write(to: source.appendingPathComponent("sub/b"))
+        let upload = try RemoteDirectoryTransfer.prepareUpload(provider: provider, sources: [source], into: "/", policy: .requireNew)
+        let report = try RemoteDirectoryTransfer.move(provider: provider, plan: upload)
+        #expect(report.moving && report.retainedSources.isEmpty && report.failedSourceRemovals.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: source.path))
+        #expect(try provider.stat(path: "/move-tree/empty", cancellation: TransferCancellation())?.isDirectory == true)
+        let check = fixture.root.appendingPathComponent("move-readback")
+        try provider.download(path: "/move-tree/sub/b", to: check, resumeOffset: 0, cancellation: TransferCancellation(), progress: { _ in })
+        #expect(try Data(contentsOf: check) == Data("nested bytes".utf8))
+        let destination = fixture.root.appendingPathComponent("refused-move")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        let remoteEntry = try provider.stat(path: "/move-tree", cancellation: TransferCancellation())
+        let entry = try #require(remoteEntry)
+        let download = try RemoteDirectoryTransfer.prepareDownload(provider: provider, entries: [entry], into: destination, policy: .requireNew)
+        webExpectThrows(try RemoteDirectoryTransfer.move(provider: provider, plan: download))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
+        #expect(try provider.stat(path: "/move-tree/a", cancellation: TransferCancellation())?.size == 10)
+        #expect(try provider.stat(path: "/move-tree/sub/b", cancellation: TransferCancellation())?.size == 12)
+    }
+
     private func exercise(_ provider: RemoteProvider, fixture: WebRemoteFixture, prefix: String) throws {
         let cancellation = TransferCancellation()
         let entries = try provider.list(path: "/", cancellation: cancellation)
@@ -224,4 +279,124 @@ private func webExpectThrows<T>(_ expression: @autoclosure () throws -> T, inspe
         _ = try expression()
         Issue.record("Expected the remote operation to fail")
     } catch { inspect?(error) }
+}
+
+extension WebRemoteProviderTests {
+    @Test func testLoopbackDAVDirectoryFileAboveSearchCeilingTransfersBothWays() throws {
+        let fixture = try WebRemoteFixture(); defer { fixture.stop() }
+        var connection = fixture.connection(.webdav); connection.timeoutSeconds = 20
+        let provider = WebRemoteProvider(connection: connection, password: "memory-only-secret")
+        let source = fixture.root.appendingPathComponent("large-tree")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        let bytes = Data(repeating: 0x5a, count: 65 * 1024 * 1024)
+        try bytes.write(to: source.appendingPathComponent("large.bin"))
+        let upload = try RemoteDirectoryTransfer.prepareUpload(provider: provider, sources: [source], into: "/", policy: .requireNew)
+        #expect(upload.transferBytes == Int64(bytes.count))
+        _ = try RemoteDirectoryTransfer.copy(provider: provider, plan: upload)
+        let destination = fixture.root.appendingPathComponent("large-download")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        let entry = try #require(try provider.stat(path: "/large-tree", cancellation: TransferCancellation()))
+        let download = try RemoteDirectoryTransfer.prepareDownload(provider: provider, entries: [entry], into: destination, policy: .requireNew)
+        _ = try RemoteDirectoryTransfer.copy(provider: provider, plan: download)
+        #expect(try Data(contentsOf: destination.appendingPathComponent("large-tree/large.bin")) == bytes)
+        #expect(try Data(contentsOf: source.appendingPathComponent("large.bin")) == bytes)
+    }
+
+    @Test func testLoopbackDAVDirectoryTransferNewTreeAndExplicitMergeSkip() throws {
+        let fixture = try WebRemoteFixture(); defer { fixture.stop() }
+        let p = WebRemoteProvider(connection: fixture.connection(.webdav), password: "memory-only-secret")
+        let token = TransferCancellation()
+        let local = fixture.root.appendingPathComponent("directory-transfer-source")
+        let tree = local.appendingPathComponent("tree")
+        try FileManager.default.createDirectory(at: tree.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: tree.appendingPathComponent("empty"), withIntermediateDirectories: false)
+        try Data("original".utf8).write(to: tree.appendingPathComponent("a"))
+        try Data("nested".utf8).write(to: tree.appendingPathComponent("sub/b"))
+        let fresh = try RemoteDirectoryTransfer.prepareUpload(provider: p, sources: [tree], into: "/", policy: .requireNew)
+        #expect(fresh.copies.count == 1 && fresh.directoryCount == 3 && fresh.fileCount == 2)
+        #expect(try p.stat(path: "/tree", cancellation: token) == nil)
+        _ = try RemoteDirectoryTransfer.copy(provider: p, plan: fresh)
+        #expect(try p.stat(path: "/tree/sub/b", cancellation: token)?.size == 6)
+        #expect(try p.stat(path: "/tree/empty", cancellation: token)?.isDirectory == true)
+        try Data("changed local".utf8).write(to: tree.appendingPathComponent("a"))
+        try Data("new child".utf8).write(to: tree.appendingPathComponent("sub/c"))
+        let merge = try RemoteDirectoryTransfer.prepareUpload(provider: p, sources: [tree], into: "/", policy: .mergeSkippingExisting)
+        #expect(merge.copies.map(\.destination) == ["/tree/sub/c"] && merge.skipped.count == 2 && merge.transferBytes == 9)
+        let uploaded = try RemoteDirectoryTransfer.copy(provider: p, plan: merge)
+        #expect(uploaded.completed.count == 1 && uploaded.skipped.count == 2)
+        let check = local.appendingPathComponent("server-a")
+        try p.download(path: "/tree/a", to: check, resumeOffset: 0, cancellation: token, progress: { _ in })
+        #expect(try Data(contentsOf: check) == Data("original".utf8))
+        let destination = fixture.root.appendingPathComponent("directory-transfer-download")
+        try FileManager.default.createDirectory(at: destination.appendingPathComponent("tree/sub"), withIntermediateDirectories: true)
+        try Data("local kept".utf8).write(to: destination.appendingPathComponent("tree/a"))
+        try Data("local only".utf8).write(to: destination.appendingPathComponent("tree/sub/local-only"))
+        let root = try #require(try p.stat(path: "/tree", cancellation: token))
+        let downPlan = try RemoteDirectoryTransfer.prepareDownload(provider: p, entries: [root], into: destination, policy: .mergeSkippingExisting)
+        #expect(downPlan.skipped.map(\.source) == ["/tree/a"] && downPlan.copies.count == 3)
+        _ = try RemoteDirectoryTransfer.copy(provider: p, plan: downPlan)
+        #expect(try Data(contentsOf: destination.appendingPathComponent("tree/a")) == Data("local kept".utf8))
+        #expect(try Data(contentsOf: destination.appendingPathComponent("tree/sub/b")) == Data("nested".utf8))
+        #expect(try Data(contentsOf: destination.appendingPathComponent("tree/sub/c")) == Data("new child".utf8))
+        #expect(try Data(contentsOf: destination.appendingPathComponent("tree/sub/local-only")) == Data("local only".utf8))
+        #expect(try Data(contentsOf: tree.appendingPathComponent("a")) == Data("changed local".utf8))
+        // The general bounded transfer method accepts ceilings above the search
+        // limit while still refusing bytes beyond the reviewed file length.
+        try p.boundedDownload(path: "/tree/a", to: check, maximumBytes: 65 * 1024 * 1024, cancellation: token, progress: { _ in })
+        #expect(try Data(contentsOf: check) == Data("original".utf8))
+        #expect(throws: (any Error).self) { try p.boundedDownload(path: "/tree/a", to: check, maximumBytes: 1, cancellation: token, progress: { _ in }) }
+    }
+
+    @Test func testLoopbackFTPPreviewRecursiveDeleteAndRefusedUnsafeRename() throws {
+        let fixture = try WebRemoteFixture(); defer { fixture.stop() }
+        let p = FTPRemoteProvider(connection: fixture.connection(.ftp), password: "memory-only-secret")
+        let token = TransferCancellation()
+        try p.makeDirectory(path: "/tree", cancellation: token)
+        try p.makeDirectory(path: "/tree/sub", cancellation: token)
+        let local = fixture.root.appendingPathComponent("tree-source")
+        try Data("retained bytes".utf8).write(to: local)
+        try p.upload(from: local, to: "/tree/sub/file", cancellation: token, progress: { _ in })
+        let root = try #require(try p.stat(path: "/tree", cancellation: token))
+        #expect(throws: (any Error).self) { try RemoteTreeOperations.prepareMove(provider: p, entries: [root], to: "/renamed", intoDirectory: false) }
+        #expect(try p.stat(path: "/tree/sub/file", cancellation: token) != nil)
+        let preview = try RemoteTreeOperations.prepareDelete(provider: p, entries: [root])
+        #expect(preview.directoryCount == 2 && preview.fileCount == 1)
+        // Fresh child after preview must stop the whole job before the first deletion.
+        try p.upload(from: local, to: "/tree/new", cancellation: token, progress: { _ in })
+        #expect(throws: RemoteTreeOperationError.self) { try RemoteTreeOperations.delete(provider: p, plan: preview) }
+        #expect(try p.stat(path: "/tree/sub/file", cancellation: token) != nil)
+        // RMD itself refuses a nonempty folder, closing the final-list/new-child race.
+        #expect(throws: (any Error).self) { try p.remove(path: "/tree", isDirectory: true, cancellation: token) }
+        #expect(try p.stat(path: "/tree/new", cancellation: token) != nil)
+        let fresh = try RemoteTreeOperations.prepareDelete(provider: p, entries: [try #require(try p.stat(path: "/tree", cancellation: token))])
+        let report = try RemoteTreeOperations.delete(provider: p, plan: fresh)
+        #expect(report.completed.count == 4)
+        #expect(try p.stat(path: "/tree", cancellation: token) == nil)
+    }
+
+    @Test func testLoopbackDAVMoveUsesNoOverwriteAndRefusesRecursiveDelete() throws {
+        let fixture = try WebRemoteFixture(); defer { fixture.stop() }
+        let p = WebRemoteProvider(connection: fixture.connection(.webdav), password: "memory-only-secret")
+        let token = TransferCancellation()
+        let source = try #require(try p.stat(path: "/hello space.txt", cancellation: token))
+        let plan = try RemoteTreeOperations.prepareMove(provider: p, entries: [source], to: "/new name.txt", intoDirectory: false)
+        _ = try RemoteTreeOperations.move(provider: p, plan: plan)
+        #expect(try p.stat(path: "/new name.txt", cancellation: token)?.size == source.size)
+        try p.makeDirectory(path: "/dav-folder", cancellation: token)
+        let folder = try #require(try p.stat(path: "/dav-folder", cancellation: token))
+        #expect(throws: (any Error).self) { try RemoteTreeOperations.prepareDelete(provider: p, entries: [folder]) }
+        #expect(try p.stat(path: "/dav-folder", cancellation: token) != nil)
+        try p.makeDirectory(path: "/dav-folder/sub", cancellation: token)
+        let local = fixture.root.appendingPathComponent("dav-tree-upload")
+        try Data("tree bytes".utf8).write(to: local)
+        try p.upload(from: local, to: "/dav-folder/sub/file", cancellation: token, progress: { _ in })
+        let directoryMove = try RemoteTreeOperations.prepareMove(provider: p, entries: [try #require(try p.stat(path: "/dav-folder", cancellation: token))], to: "/dav-renamed", intoDirectory: false)
+        _ = try RemoteTreeOperations.move(provider: p, plan: directoryMove)
+        #expect(try p.stat(path: "/dav-folder", cancellation: token) == nil)
+        #expect(try p.stat(path: "/dav-renamed/sub/file", cancellation: token)?.size == 10)
+        // Server-side Overwrite:F rejects even a direct conflicting request.
+        #expect(throws: (any Error).self) { try p.rename(from: "/dav-renamed", to: "/new name.txt", replace: false, cancellation: token) }
+        #expect(try p.stat(path: "/dav-renamed/sub/file", cancellation: token) != nil)
+        #expect(try p.stat(path: "/new name.txt", cancellation: token)?.size == source.size)
+    }
 }

@@ -46,6 +46,10 @@ import FarCore
         let index = previous.flatMap { name in self.entries.firstIndex { $0.path == name } }.map { $0 + 1 } ?? (entries.isEmpty ? 0 : 1)
         select(index); onChange?()
     }
+    func selectPath(_ path: String) {
+        guard let index = entries.firstIndex(where: { $0.path == path }) else { return }
+        select(index + 1)
+    }
     private func reload() { table.reloadData(); summary.stringValue = "Объектов: \(entries.count) · Отмечено: \(marks.count) · F5 копировать · F6 перенести · F8 удалить" }
     private func select(_ row: Int) { let value = max(0, min(row, entries.count)); table.selectRowIndexes(IndexSet(integer: value), byExtendingSelection: false); table.scrollRowToVisible(value) }
     @objc private func openSelection() {

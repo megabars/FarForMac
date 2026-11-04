@@ -27,6 +27,24 @@ struct FileMaskTests {
         #expect(!(try FileMask("?")).matches(""))
     }
 
+    @Test func farLegacyOptionalExtensionAndDotlessTrailingDot() throws {
+        #expect(try FileMask("report.*").matches("report"))
+        #expect(try FileMask("report.*").matches("REPORT.txt"))
+        #expect(try FileMask("report.part.*").matches("report.part"))
+        #expect(try FileMask("report.").matches("REPORT"))
+        #expect(try FileMask("*.").matches("README"))
+        #expect(try FileMask("*.").matches("README."))
+        #expect(!(try FileMask("*.")).matches("file.txt"))
+        #expect(!(try FileMask("report.part.")).matches("report.part"))
+        #expect(!(try FileMask("?.")).matches(""))
+        #expect(!(try FileMask("*.")).matches(""))
+        #expect(!(try FileMask(".*")).matches(""))
+        #expect(!(try FileMask("report.*x")).matches("report"))
+        #expect(!(try FileMask("*report.")).matches("x.report"))
+        #expect(!(try FileMask("*|report.*")).matches("report"))
+        #expect(try FileMask("report.*", groups: [:]).matchingNames(["report", "report.txt", "other"]) == ["report", "report.txt"])
+    }
+
     @Test
     func includeListsAndExclusionsCombineWithoutCursorOrFilesystemState() throws {
         let mask = try FileMask(" *.txt ; *.md, README | secret*;*.bak ")

@@ -5,10 +5,14 @@ public struct EditorSearchQuery: Equatable, Sendable {
     public var regex: Bool
     public var caseSensitive: Bool
     public var wholeWords: Bool
+    public var fuzzy: Bool
+    public var preserveStyle: Bool
 
-    public init(pattern: String, regex: Bool = false, caseSensitive: Bool = false, wholeWords: Bool = false) {
+    public init(pattern: String, regex: Bool = false, caseSensitive: Bool = false, wholeWords: Bool = false,
+                fuzzy: Bool = false, preserveStyle: Bool = false) {
         self.pattern = pattern; self.regex = regex
         self.caseSensitive = caseSensitive; self.wholeWords = wholeWords
+        self.fuzzy = fuzzy; self.preserveStyle = preserveStyle
     }
 }
 
@@ -16,20 +20,25 @@ public struct EditorEdit: Equatable, Sendable {
     public let text: String
     public let selection: NSRange
     public let count: Int
+    public let changes: [EditorTextChange]?
 
-    public init(text: String, selection: NSRange, count: Int) {
-        self.text = text; self.selection = selection; self.count = count
+    public init(text: String, selection: NSRange, count: Int, changes: [EditorTextChange]? = nil) {
+        self.text = text; self.selection = selection; self.count = count; self.changes = changes
     }
 }
 
 public enum EditorEditingError: Error, LocalizedError, Equatable {
     case emptyQuery, queryTooLong, unsupportedMultilineRegex
+    case incompatibleSearchOptions, foldedQueryIsEmpty, styleSearchLimit
     case invalidRegularExpression(String)
     case regexLineTooLong(offset: Int), regexDeadlineExceeded, regexExecutionFailed
     case invalidRange, invalidPosition, rangeDoesNotMatch, operationTooLarge, invalidRectangleCoordinate
 
     public var errorDescription: String? {
         switch self {
+        case .incompatibleSearchOptions: return "Regex, нестрогий поиск и сохранение стиля используются по отдельности."
+        case .foldedQueryIsEmpty: return "После нормализации строка поиска пуста."
+        case .styleSearchLimit: return "Поиск неполон: превышен бюджет сопоставления стиля (250 мс или 16 Ми единиц работы)."
         case .emptyQuery: return "Введите строку поиска."
         case .queryTooLong: return "Предел строки поиска — 4096 символов."
         case .unsupportedMultilineRegex: return "Регулярные выражения проверяются в пределах одной строки."
@@ -83,9 +92,10 @@ public enum EditorEditing {
                             direction: ViewerSearchDirection = .forward) throws -> NSRange? {
         let plan = try EditorSearchPlan(query)
         let source = text as NSString
+        if query.fuzzy || query.preserveStyle, source.length > maximumOutputUTF16 { throw EditorEditingError.operationTooLarge }
         let origin = min(max(0, from), source.length)
         if direction == .backward, origin == 0 { return nil }
-        if !query.regex { return literalFind(text, plan: plan, from: origin, direction: direction) }
+        if !query.regex { return try literalFind(text, plan: plan, from: origin, direction: direction) }
         var latest: NSRange?
         for line in EditorLine.table(text) {
             if direction == .forward, line.end < origin { continue }
@@ -112,8 +122,10 @@ public enum EditorEditing {
     public static func replace(in text: String, range: NSRange, query: EditorSearchQuery,
                                replacement: String) throws -> String {
         let plan = try EditorSearchPlan(query)
+        guard replacement.utf16.count <= maximumOutputUTF16 else { throw EditorEditingError.operationTooLarge }
         guard validRange(range, in: text) else { throw EditorEditingError.invalidRange }
         let source = text as NSString
+        if query.fuzzy || query.preserveStyle, source.length > maximumOutputUTF16 { throw EditorEditingError.operationTooLarge }
         let inserted: String
         if query.regex {
             guard let line = EditorLine.table(text).first(where: { range.location >= $0.start && NSMaxRange(range) <= $0.end })
@@ -127,9 +139,9 @@ public enum EditorEditing {
             let remaining = maximumOutputUTF16 - (source.length - range.length)
             inserted = try expandedReplacement(replacement, match: match, value: value, plan: plan, remaining: remaining)
         } else {
-            guard literalFind(text, plan: plan, from: range.location, direction: .forward) == range
+            guard try literalFind(text, plan: plan, from: range.location, direction: .forward) == range
             else { throw EditorEditingError.rangeDoesNotMatch }
-            inserted = replacement
+            inserted = query.preserveStyle ? try plan.style!.replacement(replacement, in: text, range: range) : replacement
         }
         try checkOutput(base: source.length - range.length, inserted: inserted.utf16.count)
         return source.replacingCharacters(in: range, with: inserted)
@@ -140,6 +152,7 @@ public enum EditorEditing {
         let plan = try EditorSearchPlan(query)
         let source = text as NSString
         guard source.length <= maximumOutputUTF16 else { throw EditorEditingError.operationTooLarge }
+        guard replacement.utf16.count <= maximumOutputUTF16 else { throw EditorEditingError.operationTooLarge }
         var projectedLength = source.length
         var changes = [(NSRange, String)]()
         func append(_ range: NSRange, _ inserted: String) throws {
@@ -168,9 +181,11 @@ public enum EditorEditing {
                 }
             }
         } else {
+            let folding = query.fuzzy ? try SearchTextFolding(text, caseSensitive: query.caseSensitive) : nil
             var cursor = 0
-            while let match = literalFind(text, plan: plan, from: cursor, direction: .forward) {
-                try append(match, replacement); cursor = NSMaxRange(match)
+            while let match = try literalFind(text, plan: plan, from: cursor, direction: .forward, folding: folding) {
+                let inserted = query.preserveStyle ? try plan.style!.replacement(replacement, in: text, range: match) : replacement
+                try append(match, inserted); cursor = NSMaxRange(match)
             }
         }
         guard let finalChange = changes.last else {
@@ -181,7 +196,7 @@ public enum EditorEditing {
         let shift = changes.dropLast().reduce(0) { $0 + $1.1.utf16.count - $1.0.length }
         return EditorEdit(text: result as String,
                           selection: NSRange(location: finalChange.0.location + shift, length: finalChange.1.utf16.count),
-                          count: changes.count)
+                          count: changes.count, changes: changes.map { EditorTextChange(range: $0.0, replacementUTF16Length: $0.1.utf16.count) })
     }
 
     /// Columns count Unicode scalars, not UTF-16 code units or visual tab cells. A UTF-16
@@ -203,6 +218,84 @@ public enum EditorEditing {
         guard column <= value.unicodeScalars.count + 1 else { throw EditorEditingError.invalidPosition }
         let prefix = value.unicodeScalars.prefix(column - 1)
         return lines[line - 1].start + prefix.reduce(0) { $0 + ($1.value > 0xFFFF ? 2 : 1) }
+    }
+
+    /// Enumerate non-overlapping matches in one pass. A bounded partial result is
+    /// explicit; regex line/time failures still throw and never masquerade as truncation.
+    public static func allMatches(in text: String, query: EditorSearchQuery,
+                                  limit: Int = 10_000) throws -> EditorSearchMatches {
+        let plan = try EditorSearchPlan(query)
+        guard limit > 0, limit <= maximumMatches else { throw EditorEditingError.operationTooLarge }
+        let source = text as NSString
+        guard source.length <= maximumOutputUTF16 else { throw EditorEditingError.operationTooLarge }
+        var matches = [EditorSearchMatch]()
+        let lines = EditorLine.table(text)
+        func item(_ range: NSRange, lineIndex: Int, column: Int) -> EditorSearchMatch {
+            let line = lines[lineIndex]
+            let start = scalarBoundary(text, at: max(line.start, range.location - 60), forward: false)
+            let end = scalarBoundary(text, at: min(line.end, range.location + min(range.length, 120) + 60), forward: true)
+            let excerpt = source.substring(with: NSRange(location: start, length: max(0, end - start)))
+            return EditorSearchMatch(range: range, line: lineIndex + 1, column: column, excerpt: excerpt)
+        }
+        if !query.regex {
+            let folding = query.fuzzy ? try SearchTextFolding(text, caseSensitive: query.caseSensitive) : nil
+            var cursor = 0, lineIndex = 0, columnOffset = 0, column = 1
+            while let range = try literalFind(text, plan: plan, from: cursor, direction: .forward, folding: folding) {
+                if matches.count == limit { return EditorSearchMatches(matches: matches, truncated: true) }
+                while lineIndex + 1 < lines.count, lines[lineIndex + 1].start <= range.location {
+                    lineIndex += 1; columnOffset = lines[lineIndex].start; column = 1
+                }
+                column += source.substring(with: NSRange(location: columnOffset, length: range.location - columnOffset)).unicodeScalars.count
+                columnOffset = range.location
+                matches.append(item(range, lineIndex: lineIndex, column: column))
+                cursor = NSMaxRange(range)
+            }
+        } else {
+            for (lineIndex, line) in lines.enumerated() {
+                let value = source.substring(with: line.range)
+                try checkLine(value, offset: line.start)
+                let deadline = ProcessInfo.processInfo.systemUptime + 0.05
+                var cursor = 0, columnOffset = 0, column = 1
+                while cursor <= value.utf16.count {
+                    guard let range = try regexFirst(value, plan: plan, from: cursor, deadline: deadline)?.range else { break }
+                    if matches.count == limit { return EditorSearchMatches(matches: matches, truncated: true) }
+                    column += (value as NSString).substring(with: NSRange(location: columnOffset, length: range.location - columnOffset)).unicodeScalars.count
+                    columnOffset = range.location
+                    matches.append(item(NSRange(location: line.start + range.location, length: range.length), lineIndex: lineIndex, column: column))
+                    cursor = NSMaxRange(range)
+                    if range.length == 0 {
+                        if cursor == value.utf16.count { break }
+                        cursor = scalarBoundary(value, at: cursor + 1, forward: true)
+                    }
+                }
+            }
+        }
+        return EditorSearchMatches(matches: matches, truncated: false)
+    }
+
+    /// FAR coordinate syntax, adapted to scalar columns and clamped to real text
+    /// (AppKit has no virtual cursor beyond EOL). Empty components preserve position.
+    public static func gotoOffset(in text: String, expression: String, from: Int,
+                                  hexadecimal: Bool = false) throws -> Int {
+        guard expression.utf16.count <= 4096 else { throw EditorEditingError.invalidPosition }
+        let parts = expression.components(separatedBy: CharacterSet(charactersIn: ",.;:"))
+        let values: [String]
+        if parts.count > 1 {
+            guard parts.count == 2 else { throw EditorEditingError.invalidPosition }
+            values = parts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        } else {
+            values = expression.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard values.count <= 2 else { throw EditorEditingError.invalidPosition }
+        }
+        let current = lineColumn(in: text, offset: from)
+        let lines = EditorLine.table(text)
+        let row = try EditorGotoCoordinate(values.first ?? "", hexadecimal: hexadecimal)
+        let col = try EditorGotoCoordinate(values.count > 1 ? values[1] : "", hexadecimal: hexadecimal)
+        let lineIndex = try row.resolve(current: current.line - 1, extent: lines.count, maximum: lines.count - 1)
+        let value = (text as NSString).substring(with: lines[lineIndex].range)
+        let column = try col.resolve(current: current.column - 1, extent: value.unicodeScalars.count,
+                                     maximum: value.unicodeScalars.count)
+        return try offset(in: text, line: lineIndex + 1, column: column + 1)
     }
 
     /// A selection ending exactly at the next line's start excludes that next line.
@@ -250,7 +343,8 @@ public enum EditorEditing {
         }
         let start = transform(selection.location)
         let end = transform(NSMaxRange(selection))
-        return EditorEdit(text: result as String, selection: NSRange(location: start, length: max(0, end - start)), count: changes.count)
+        return EditorEdit(text: result as String, selection: NSRange(location: start, length: max(0, end - start)), count: changes.count,
+                          changes: changes.map { EditorTextChange(range: $0.0, replacementUTF16Length: $0.1.utf16.count) })
     }
 
     public static func extractRectangle(in text: String, rectangle: EditorRectangle, tabSize: Int) throws -> String {
@@ -297,6 +391,8 @@ public enum EditorEditing {
         var selectionEnd = 0
         var length = 0
         var changed = 0
+        var anchorChanges = [EditorTextChange]()
+        var appended = ""
         for number in 1...max(lines.count, finalLine) {
             let line = number <= lines.count ? lines[number - 1] : nil
             var value = line.map { source.substring(with: $0.range) } ?? ""
@@ -319,10 +415,16 @@ public enum EditorEditing {
             if let line, line.next > line.end { ending = source.substring(with: NSRange(location: line.end, length: line.next - line.end)) }
             else { ending = number < max(lines.count, finalLine) ? eol : "" }
             try checkOutput(base: length, inserted: value.utf16.count + ending.utf16.count)
+            if let line {
+                let original = source.substring(with: NSRange(location: line.start, length: line.next - line.start))
+                if let change = EditorTextChange.difference(from: original, to: value + ending, offset: line.start) { anchorChanges.append(change) }
+            } else { appended += value + ending }
             output.append(value + ending); length += value.utf16.count + ending.utf16.count
         }
         let start = selectionStart ?? min(source.length, length)
-        return EditorEdit(text: output.joined(), selection: NSRange(location: start, length: max(0, selectionEnd - start)), count: changed)
+        if !appended.isEmpty { anchorChanges.append(EditorTextChange(range: NSRange(location: source.length, length: 0), replacementUTF16Length: appended.utf16.count)) }
+        return EditorEdit(text: output.joined(), selection: NSRange(location: start, length: max(0, selectionEnd - start)), count: changed,
+                          changes: anchorChanges)
     }
 
     private static func normalized(_ rectangle: EditorRectangle) -> EditorRectangle {
@@ -439,34 +541,53 @@ public enum EditorEditing {
     }
 
     private static func literalFind(_ text: String, plan: EditorSearchPlan, from: Int,
-                                    direction: ViewerSearchDirection) -> NSRange? {
+                                    direction: ViewerSearchDirection, folding prepared: SearchTextFolding? = nil) throws -> NSRange? {
         let source = text as NSString
-        var cursor = direction == .forward ? scalarBoundary(text, at: from, forward: true) : 0
-        var latest: NSRange?
+        let folding = try prepared ?? (plan.query.fuzzy ? SearchTextFolding(text, caseSensitive: plan.query.caseSensitive) : nil)
+        var cursor = direction == .forward ? scalarBoundary(text, at: from, forward: true) : from
         var options: NSString.CompareOptions = [.literal]
         if !plan.query.caseSensitive { options.insert(.caseInsensitive) }
-        while cursor <= source.length {
-            let found = source.range(of: plan.query.pattern, options: options, range: NSRange(location: cursor, length: source.length - cursor))
-            guard found.location != NSNotFound else { break }
-            if direction == .backward, found.location >= from { break }
-            if !plan.query.wholeWords || isWholeWord(text, range: found) {
-                if direction == .forward { return found }
-                latest = found
+        if direction == .backward { options.insert(.backwards) }
+        while cursor >= 0, cursor <= source.length {
+            let found: NSRange?
+            if let style = plan.style {
+                found = try style.firstRange(in: text, from: cursor, backwards: direction == .backward, wholeWords: plan.query.wholeWords)
+            } else if let folding {
+                // Backward matches may extend past the cursor; only their start is strict.
+                if direction == .backward {
+                    var next = 0, latest: NSRange?
+                    while let range = folding.firstRange(ofFolded: plan.foldedPattern!, in: NSRange(location: next, length: source.length - next)) {
+                        if range.location >= cursor { break }
+                        if !plan.query.wholeWords || isWholeWord(text, range: range) { latest = range }
+                        next = scalarBoundary(text, at: range.location + 1, forward: true)
+                    }
+                    return latest
+                }
+                found = folding.firstRange(ofFolded: plan.foldedPattern!, in: NSRange(location: cursor, length: source.length - cursor))
+            } else if direction == .backward {
+                // NSString backwards restricts the end too; retain overlapping starts.
+                var next = 0, latest: NSRange?
+                while next < cursor {
+                    let range = source.range(of: plan.query.pattern, options: options.subtracting(.backwards), range: NSRange(location: next, length: source.length - next))
+                    if range.location == NSNotFound || range.location >= cursor { break }
+                    if !plan.query.wholeWords || isWholeWord(text, range: range) { latest = range }
+                    next = scalarBoundary(text, at: range.location + 1, forward: true)
+                }
+                return latest
+            } else {
+                let range = source.range(of: plan.query.pattern, options: options, range: NSRange(location: cursor, length: source.length - cursor))
+                found = range.location == NSNotFound ? nil : range
             }
-            cursor = scalarBoundary(text, at: found.location + 1, forward: true)
+            guard let found else { return nil }
+            if !plan.query.wholeWords || isWholeWord(text, range: found) { return found }
+            if direction == .backward { cursor = found.location }
+            else { cursor = scalarBoundary(text, at: found.location + 1, forward: true) }
         }
-        return latest
+        return nil
     }
 
     private static func isWholeWord(_ text: String, range: NSRange) -> Bool {
-        let source = text as NSString
-        let before = source.substring(to: range.location).unicodeScalars.last
-        let after = source.substring(from: NSMaxRange(range)).unicodeScalars.first
-        func word(_ scalar: Unicode.Scalar?) -> Bool {
-            guard let scalar else { return false }
-            return scalar == "_" || CharacterSet.alphanumerics.contains(scalar) || CharacterSet.nonBaseCharacters.contains(scalar)
-        }
-        return !word(before) && !word(after)
+        SearchWordBoundary.isWholeWord(text, range: range)
     }
 
     private static func validRange(_ range: NSRange, in text: String) -> Bool {
@@ -519,11 +640,17 @@ private struct EditorLine {
 private struct EditorSearchPlan {
     let query: EditorSearchQuery
     let expression: NSRegularExpression?
+    let style: EditorSearchStyle?
+    let foldedPattern: String?
 
     init(_ query: EditorSearchQuery) throws {
         guard !query.pattern.isEmpty else { throw EditorEditingError.emptyQuery }
         guard query.pattern.utf16.count <= 4096 else { throw EditorEditingError.queryTooLong }
+        guard [query.regex, query.fuzzy, query.preserveStyle].filter({ $0 }).count <= 1 else { throw EditorEditingError.incompatibleSearchOptions }
         self.query = query
+        style = query.preserveStyle ? EditorSearchStyle(pattern: query.pattern, caseSensitive: query.caseSensitive) : nil
+        foldedPattern = query.fuzzy ? SearchTextFolding.fold(query.pattern, caseSensitive: query.caseSensitive) : nil
+        if foldedPattern?.isEmpty == true { throw EditorEditingError.foldedQueryIsEmpty }
         guard query.regex else { expression = nil; return }
         guard !Self.multiline(query.pattern) else { throw EditorEditingError.unsupportedMultilineRegex }
         let pattern = query.wholeWords ? #"(?<![\p{L}\p{M}\p{N}_])(?:"# + query.pattern + #")(?![\p{L}\p{M}\p{N}_])"# : query.pattern

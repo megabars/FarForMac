@@ -9,7 +9,7 @@ struct WebRemoteError: LocalizedError {
 
 /// RFC 3659 machine-readable listings. Credentials stay in this process; FTPS
 /// requires TLS on both connections and normal certificate verification.
-public final class FTPRemoteProvider: RemoteProvider {
+public final class FTPRemoteProvider: RemoteSearchDownloadProvider, RemoteBoundedDownloadProvider {
     public let connection: NetworkConnection
     private let password: String?
     public init(connection: NetworkConnection, password: String?) {
@@ -33,6 +33,20 @@ public final class FTPRemoteProvider: RemoteProvider {
 
     public func download(path: String, to: URL, resumeOffset: Int64, cancellation: TransferCancellation,
                          progress: @escaping (NetworkProgress) -> Void) throws {
+        try download(path: path, to: to, resumeOffset: resumeOffset, maximumBytes: nil, cancellation: cancellation, progress: progress)
+    }
+    public func boundedDownload(path: String, to: URL, maximumBytes: Int64, cancellation: TransferCancellation,
+                                progress: @escaping (NetworkProgress) -> Void) throws {
+        guard (0...RemoteTransferLimits.maximumBytes).contains(maximumBytes) else { throw NetworkError.limitExceeded("Transfer download exceeds 1 TiB.") }
+        try download(path: path, to: to, resumeOffset: 0, maximumBytes: maximumBytes, cancellation: cancellation, progress: progress)
+    }
+    public func searchDownload(path: String, to: URL, maximumBytes: Int64, cancellation: TransferCancellation,
+                               progress: @escaping (NetworkProgress) -> Void) throws {
+        guard (0...Int64(64 * 1024 * 1024)).contains(maximumBytes) else { throw NetworkError.limitExceeded("Search download exceeds 64 MiB.") }
+        try download(path: path, to: to, resumeOffset: 0, maximumBytes: maximumBytes, cancellation: cancellation, progress: progress)
+    }
+    private func download(path: String, to: URL, resumeOffset: Int64, maximumBytes: Int64?, cancellation: TransferCancellation,
+                          progress: @escaping (NetworkProgress) -> Void) throws {
         try webRemoteCheck(cancellation)
         try connection.validate()
         guard resumeOffset >= 0 else { throw WebRemoteError("Invalid download offset.") }
@@ -49,7 +63,7 @@ public final class FTPRemoteProvider: RemoteProvider {
         if resumeOffset == 0 { try file.truncate(atOffset: 0) }
         try file.seek(toOffset: UInt64(resumeOffset))
         _ = try perform(path: path, operation: 1, offset: resumeOffset, cancellation: cancellation,
-                        progress: progress, file: file)
+                        progress: progress, file: file, maximumBytes: maximumBytes)
     }
 
     public func upload(from: URL, to: String, cancellation: TransferCancellation,
@@ -81,7 +95,7 @@ public final class FTPRemoteProvider: RemoteProvider {
 
     private func perform(path: String, directory: Bool = false, operation: Int32, localPath: String? = nil,
                          offset: Int64 = 0, commands: [String] = [], cancellation: TransferCancellation,
-                         progress: @escaping (NetworkProgress) -> Void = { _ in }, file: FileHandle? = nil) throws -> Data {
+                         progress: @escaping (NetworkProgress) -> Void = { _ in }, file: FileHandle? = nil, maximumBytes: Int64? = nil) throws -> Data {
         try webRemoteCheck(cancellation)
         try connection.validate()
         guard connection.kind == .ftp || connection.kind == .ftps else { throw WebRemoteError("This connection is not FTP or FTPS.") }
@@ -95,7 +109,7 @@ public final class FTPRemoteProvider: RemoteProvider {
         let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "%?#"))
         components.percentEncodedPath = "/%2F" + String(clean.dropFirst()).addingPercentEncoding(withAllowedCharacters: allowed)! + (directory ? "/" : "")
         guard let url = components.url else { throw WebRemoteError("Invalid FTP server address.") }
-        let state = FTPRequestState(path: clean, cancellation: cancellation, progress: progress, file: file, offset: offset)
+        let state = FTPRequestState(path: clean, cancellation: cancellation, progress: progress, file: file, offset: offset, maximumBytes: maximumBytes)
         let context = Unmanaged.passUnretained(state).toOpaque()
         var response: Int = 0
         var error = [CChar](repeating: 0, count: 1024)
@@ -108,7 +122,13 @@ public final class FTPRemoteProvider: RemoteProvider {
                                          if state.cancellation.isCancelled { return 0 }
                                          let chunk = Data(bytes: bytes, count: count)
                                          do {
-                                             if let file = state.file { try file.write(contentsOf: chunk) }
+                                             if let file = state.file {
+                                                 if let maximum = state.maximumBytes, Int64(count) > maximum - state.received {
+                                                     throw NetworkError.limitExceeded("Search download exceeds the expected file size.")
+                                                 }
+                                                 try file.write(contentsOf: chunk)
+                                                 state.received += Int64(count)
+                                             }
                                              else {
                                                  guard state.data.count + count <= 32 * 1024 * 1024 else { throw WebRemoteError("FTP listing exceeds the 32 MB limit.") }
                                                  state.data.append(chunk)
@@ -176,10 +196,12 @@ private final class FTPRequestState {
     let progress: (NetworkProgress) -> Void
     let file: FileHandle?
     let offset: Int64
+    let maximumBytes: Int64?
+    var received: Int64 = 0
     var data = Data()
     var error: Error?
-    init(path: String, cancellation: TransferCancellation, progress: @escaping (NetworkProgress) -> Void, file: FileHandle?, offset: Int64) {
-        self.path = path; self.cancellation = cancellation; self.progress = progress; self.file = file; self.offset = offset
+    init(path: String, cancellation: TransferCancellation, progress: @escaping (NetworkProgress) -> Void, file: FileHandle?, offset: Int64, maximumBytes: Int64?) {
+        self.path = path; self.cancellation = cancellation; self.progress = progress; self.file = file; self.offset = offset; self.maximumBytes = maximumBytes
     }
 }
 

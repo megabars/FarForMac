@@ -165,3 +165,60 @@ private final class DescriptionTree {
     }
     deinit { try? FileManager.default.removeItem(at: root) }
 }
+
+@Suite
+struct FileDescriptionPropagationTests {
+    @Test func explicitLegacyEncodingPreservesUntouchedBytesAndRefusesLoss() throws {
+        for encoding in [FileDescriptionEncoding.windows1251, .dos866] {
+            let tree = try DescriptionTree()
+            let data = try #require("old Старое\r\nuntouched\t  Байты  \n".data(using: encoding.stringEncoding))
+            try data.write(to: tree.file)
+            #expect(throws: FileDescriptionError.invalidEncoding) { try FileDescriptions.load(directory: tree.root) }
+            var snapshot = try FileDescriptions.load(directory: tree.root, encoding: encoding)
+            #expect(snapshot.description(for: "old") == "Старое")
+            try snapshot.setDescription("Новое", for: "old")
+            snapshot = try snapshot.save()
+            #expect(try Data(contentsOf: tree.file) == "old Новое\r\nuntouched\t  Байты  \n".data(using: encoding.stringEncoding))
+            let saved = try Data(contentsOf: tree.file)
+            try snapshot.setDescription("🙂", for: "old")
+            #expect(throws: FileDescriptionError.unrepresentableEncoding) { try snapshot.save() }
+            #expect(try Data(contentsOf: tree.file) == saved)
+        }
+    }
+
+    @Test func copyThenMoveSameDirectoryPreservesUnrelatedRecords() throws {
+        let tree = try DescriptionTree()
+        try Data("old first\nkeep\t  exact bytes  \r\n".utf8).write(to: tree.file)
+        var transfer = try #require(try FileDescriptionTransfer.prepare(source: tree.root.appendingPathComponent("old"), destination: tree.root.appendingPathComponent("new")))
+        try transfer.publishDescription()
+        #expect(try FileDescriptions.load(directory: tree.root).descriptions == ["old": "first", "new": "first", "keep": "exact bytes"])
+        try transfer.removeSourceDescription()
+        #expect(try FileDescriptions.load(directory: tree.root).descriptions == ["new": "first", "keep": "exact bytes"])
+        #expect(try String(contentsOf: tree.file, encoding: .utf8).contains("keep\t  exact bytes  \r\n"))
+    }
+
+    @Test func renameUsesOriginalMapAndCompletedSubsetOnly() throws {
+        let tree = try DescriptionTree()
+        try Data("one first\ntwo second\nkeep untouched\n".utf8).write(to: tree.file)
+        let plan = try FileDescriptionRenamePlan.prepare(directory: tree.root)
+        try plan.apply(completedRenames: [(source: "one", destination: "new")])
+        #expect(try FileDescriptions.load(directory: tree.root).descriptions == ["new": "first", "two": "second", "keep": "untouched"])
+        let swapped = try FileDescriptionRenamePlan.prepare(directory: tree.root)
+        try swapped.apply(completedRenames: [(source: "new", destination: "two"), (source: "two", destination: "new")])
+        #expect(try FileDescriptions.load(directory: tree.root).descriptions == ["new": "second", "two": "first", "keep": "untouched"])
+    }
+
+    @Test func stalePropagationAndRenameNeverClobberConcurrentEdits() throws {
+        let source = try DescriptionTree(), target = try DescriptionTree()
+        try Data("one first\n".utf8).write(to: source.file)
+        var transfer = try #require(try FileDescriptionTransfer.prepare(source: source.root.appendingPathComponent("one"), destination: target.root.appendingPathComponent("one")))
+        try Data("concurrent keep\n".utf8).write(to: target.file)
+        #expect(throws: FileDescriptionError.changed) { try transfer.publishDescription() }
+        #expect(try FileDescriptions.load(directory: source.root).description(for: "one") == "first")
+        #expect(try String(contentsOf: target.file, encoding: .utf8) == "concurrent keep\n")
+        let rename = try FileDescriptionRenamePlan.prepare(directory: source.root)
+        try Data("one external\n".utf8).write(to: source.file)
+        #expect(throws: FileDescriptionError.changed) { try rename.apply(completedRenames: [(source: "one", destination: "new")]) }
+        #expect(try String(contentsOf: source.file, encoding: .utf8) == "one external\n")
+    }
+}

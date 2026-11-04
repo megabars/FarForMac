@@ -18,12 +18,16 @@ final class ArchiveEditCommitWindow: FileToolsWindowController {
     private var saveRevision = 0
     private var editorWasClosed = false
     private var editorCloseObserver: NSObjectProtocol?
+    private var viewingSession: WorkingCopyViewerSession?
     private lazy var commitButton = button("Сохранить в архив", #selector(commitWorkingCopy))
     private lazy var editButton = button("Вернуться в редактор", #selector(showEditor))
     private lazy var closeButton = button("Закрыть", #selector(closeSession))
 
     init(snapshot: ArchiveSnapshot, path: String, workspace: ArchiveWorkspace, editor: TextFileWindow,
          canCommit: @escaping () -> Bool = { true }, onCommitted: @escaping (ArchiveSnapshot) -> Void) throws {
+        guard !snapshot.isReadOnly else {
+            throw snapshot.isEncrypted ? ArchiveWriteError.encryptedReadOnly : ArchiveWriteError.nestedReadOnly
+        }
         self.snapshot = snapshot; self.path = path; self.workspace = workspace; self.editor = editor
         self.workingURL = try workspace.url(for: path).standardizedFileURL
         self.canCommit = canCommit; self.onCommitted = onCommitted
@@ -33,6 +37,8 @@ final class ArchiveEditCommitWindow: FileToolsWindowController {
         let help = NSTextField(wrappingLabelWithString: "Редактор сохраняет файл во временную рабочую копию. Для замены файла в архиве нажмите «Сохранить в архив». При ошибке или отмене исходный архив сохраняется.")
         status.stringValue = "Архив ещё не изменён. Рабочая копия открыта в редакторе."
         content([source, help, status, NSView(), row([editButton, NSView(), closeButton, commitButton])])
+        viewingSession = WorkingCopyViewerSession(editor: editor, url: workingURL, title: (path as NSString).lastPathComponent,
+                                                   archiveWorkspace: workspace)
         let previous = editor.onArchiveWorkingCopySaved
         editor.onArchiveWorkingCopySaved = { [weak self] url in
             previous?(url)
@@ -51,6 +57,7 @@ final class ArchiveEditCommitWindow: FileToolsWindowController {
                 guard let self else { return }
                 self.editorWasClosed = true
                 self.editButton.isEnabled = false
+                self.viewingSession?.close(); self.viewingSession = nil
             }
         }
     }
@@ -125,6 +132,7 @@ final class ArchiveEditCommitWindow: FileToolsWindowController {
     /// NSApplication may terminate without releasing window controllers. Call
     /// only after every application close guard has approved termination.
     func cleanupForTermination() {
+        viewingSession?.close(); viewingSession = nil
         workspace?.cleanup(); workspace = nil
     }
     override func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -139,10 +147,36 @@ final class ArchiveEditCommitWindow: FileToolsWindowController {
         return true
     }
     override func windowWillClose(_ notification: Notification) {
+        viewingSession?.close(); viewingSession = nil
         if let editorCloseObserver { NotificationCenter.default.removeObserver(editorCloseObserver); self.editorCloseObserver = nil }
         // Editor and viewer leases keep their working files alive independently.
         // Releasing this lease lets ARC remove the workspace after its final user.
         workspace = nil
         super.windowWillClose(notification)
+    }
+}
+
+extension ArchiveEditCommitWindow {
+    static func runWorkingCopyUISmokeChecks() async throws -> [String] {
+        let root = (AppRuntime.smokeDirectory ?? FileManager.default.temporaryDirectory).appendingPathComponent("archive-f6-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("member.txt"), archive = root.appendingPathComponent("fixture.zip")
+        try Data("one\n🙂two\n".utf8).write(to: source)
+        let snapshot = try ArchiveWriter.create(sources: [source], destination: archive, format: .zip)
+        let original = try Data(contentsOf: archive)
+        let workspace = try ArchiveReader.extract(snapshot, paths: ["member.txt"])
+        let editor = try TextFileWindow(url: workspace.url(for: "member.txt"))
+        editor.retainedArchiveWorkspace = workspace
+        let controller = try ArchiveEditCommitWindow(snapshot: snapshot, path: "member.txt", workspace: workspace, editor: editor,
+            onCommitted: { _ in })
+        controller.showWindow(nil)
+        defer { controller.window?.performClose(nil) }
+        guard let session = controller.viewingSession else { throw ViewerError.unsupportedURL }
+        let checks = try await WorkingCopyViewerSession.exerciseUISmoke(editor: editor, session: session, kind: "Archive")
+        guard try Data(contentsOf: archive) == original, !controller.pendingChanges else {
+            throw NSError(domain: "WorkingCopySmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: "F6 never commits archive bytes"])
+        }
+        return checks + ["Archive F6 leaves archive unchanged"]
     }
 }

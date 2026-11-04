@@ -5,9 +5,13 @@ public struct TransferRequest: Sendable {
     public let sources: [URL]
     public let destination: URL
     public let move: Bool
+    public let propagateDescriptions: Bool
+    public let descriptionEncodings: [String: FileDescriptionEncoding]
     fileprivate let sourceSnapshots: [TransferStamp?]
-    public init(sources: [URL], destination: URL, move: Bool) {
+    public init(sources: [URL], destination: URL, move: Bool, propagateDescriptions: Bool = true,
+                descriptionEncodings: [String: FileDescriptionEncoding] = [:]) {
         self.sources = sources; self.destination = destination; self.move = move
+        self.propagateDescriptions = propagateDescriptions; self.descriptionEncodings = descriptionEncodings
         self.sourceSnapshots = sources.map { try? TransferStamp($0) }
     }
 }
@@ -65,7 +69,7 @@ public struct TransferResult: Sendable {
     public let cancelled: Bool
     public let issues: [String]
     public var summary: String {
-        let status = cancelled ? "Операция отменена" : (failed > 0 || skipped > 0 ? "Операция завершена частично" : "Операция завершена")
+        let status = cancelled ? "Операция отменена" : (failed > 0 || skipped > 0 || !issues.isEmpty ? "Операция завершена частично" : "Операция завершена")
         return "\(status). Обработано: \(completed), пропущено: \(skipped), ошибок: \(failed)."
     }
     public init(completed: Int, skipped: Int, failed: Int, cancelled: Bool, issues: [String]) {
@@ -145,6 +149,7 @@ private final class Worker {
     var acceptRefreshedSources = false
     var sourceLeaves: [TransferNode] = []
     var cleanupStamps: [URL: TransferStamp] = [:]
+    var explicitDescriptionDirectories = Set<String>()
 
     init(_ request: TransferRequest, _ cancellation: TransferCancellation,
          _ progress: @escaping (TransferProgress) -> Void,
@@ -176,6 +181,10 @@ private final class Worker {
         }
         totalBytes = plan.reduce(0) { $0 + $1.0.bytes }; totalItems = plan.reduce(0) { $0 + $1.0.items }
         sourceLeaves = plan.flatMap { leaves($0.0) }
+        for (node, target) in plan where node.source.lastPathComponent == "descript.ion" || target.lastPathComponent == "descript.ion" {
+            explicitDescriptionDirectories.insert(FileDescriptionEncoding.directoryKey(node.source.deletingLastPathComponent()))
+            explicitDescriptionDirectories.insert(FileDescriptionEncoding.directoryKey(target.deletingLastPathComponent()))
+        }
         for (node, destination) in plan {
             do { try check(); try transfer(node, to: destination) }
             catch is TransferStopped { stopped = true; break }
@@ -330,7 +339,13 @@ private final class Worker {
                         guard node.stamp.directory && existing.directory else { throw TransferProblem("Слияние доступно только для двух папок.") }
                         guard try TransferStamp(target) == existing else { continue }
                         try verify(node)
-                        try merge(node, target: target, expected: existing)
+                        var metadata = prepareDescriptions(node.source, target)
+                        try merge(node, target: target, expected: existing) {
+                            if let error = metadata.error { self.descriptionWarning(error, source: node.source, target: target); return false }
+                            do { try metadata.plan?.publishDescription(); if request.move { try metadata.plan?.verifySourceDescription() }; return true }
+                            catch { self.descriptionWarning(error, source: node.source, target: target); return false }
+                        }
+                        finishSourceDescription(&metadata.plan, source: node.source, target: target)
                         return
                     case .replace:
                         guard !node.stamp.directory && !existing.directory else {
@@ -338,9 +353,22 @@ private final class Worker {
                         }
                     }
                 }
+                var metadata = prepareDescriptions(node.source, target)
                 let receipt = try publish(node, to: target, replacing: existing)
                 completed += node.items; completedBytes += node.bytes
-                if request.move { try removePublishedSource(node, target: target, receipt: receipt) }
+                var metadataReady = metadata.error == nil
+                do { try metadata.plan?.publishDescription(); if request.move { try metadata.plan?.verifySourceDescription() } }
+                catch { metadataReady = false; descriptionWarning(error, source: node.source, target: target) }
+                if let error = metadata.error { descriptionWarning(error, source: node.source, target: target) }
+                // A metadata failure must never trigger a file-operation retry or remove
+                // the source whose description could not be retained at the destination.
+                if request.move && metadataReady {
+                    do { try removePublishedSource(node, target: target, receipt: receipt) }
+                    catch { finishSourceDescription(&metadata.plan, source: node.source, target: target); throw error }
+                    finishSourceDescription(&metadata.plan, source: node.source, target: target)
+                } else if request.move && !metadataReady {
+                    issues.append("Копия сохранена; источник оставлен из-за ошибки описаний: «\(node.source.path)».")
+                }
                 return
             } catch is TransferStopped { throw TransferStopped() }
             catch {
@@ -357,11 +385,38 @@ private final class Worker {
             }
         }
     }
-    func merge(_ node: TransferNode, target: URL, expected: TransferStamp) throws {
+    func prepareDescriptions(_ source: URL, _ target: URL) -> (plan: FileDescriptionTransfer?, error: Error?) {
+        guard request.propagateDescriptions,
+              !explicitDescriptionDirectories.contains(FileDescriptionEncoding.directoryKey(source.deletingLastPathComponent())),
+              !explicitDescriptionDirectories.contains(FileDescriptionEncoding.directoryKey(target.deletingLastPathComponent())) else { return (nil, nil) }
+        do { return (try FileDescriptionTransfer.prepare(source: source, destination: target, encodings: request.descriptionEncodings), nil) }
+        catch { return (nil, error) }
+    }
+    func descriptionWarning(_ error: Error, source: URL, target: URL) {
+        issues.append("Файловая операция выполнена, но описания «\(source.path)» → «\(target.path)» обновлены не полностью: \(error.localizedDescription)")
+    }
+    func finishSourceDescription(_ plan: inout FileDescriptionTransfer?, source: URL, target: URL) {
+        guard request.move else { return }
+        do {
+            guard try stampIfPresent(source) == nil else { return }
+            try plan?.removeSourceDescription()
+        } catch { descriptionWarning(error, source: source, target: target) }
+    }
+    func merge(_ node: TransferNode, target: URL, expected: TransferStamp, publishDescription: () -> Bool) throws {
         // The existing directory is a container only. Its own metadata is retained.
         // Each child gets its own conflict and atomic publication boundary.
         let beforeSkipped = skipped, beforeFailed = failed
-        for child in node.children {
+        let control = request.propagateDescriptions ? node.children.first(where: { $0.source.lastPathComponent == "descript.ion" && $0.stamp.mode & S_IFMT == S_IFREG }) : nil
+        let payload = node.children.filter { $0.source != control?.source }
+        if let control {
+            // The control file is managed as records, not copied as a selected
+            // payload. Keep the same single-container budget as an empty folder
+            // when there are no payload children, otherwise remove its item count.
+            totalBytes -= control.bytes
+            if !payload.isEmpty { totalItems -= control.items }
+            else { totalItems += 1 - control.items }
+        }
+        for child in payload {
             try check()
             guard let current = try stampIfPresent(target), current.directory, current.sameObject(expected) else {
                 throw TransferProblem("Папка назначения изменилась во время слияния: «\(target.path)».")
@@ -369,8 +424,11 @@ private final class Worker {
             try transfer(child, to: target.appendingPathComponent(child.source.lastPathComponent))
         }
         if !request.move { try verify(node) }
-        if node.children.isEmpty { completed += 1 }
-        if request.move && skipped == beforeSkipped && failed == beforeFailed {
+        if payload.isEmpty { completed += 1 }
+        // Metadata follows completed work, before any container removal. A warning
+        // retains the original directory instead of discarding its parent record.
+        let metadataReady = publishDescription()
+        if request.move && metadataReady && skipped == beforeSkipped && failed == beforeFailed {
             // Remove only an empty original directory; never recursively delete a merged tree.
             while true {
                 try check()
@@ -379,6 +437,18 @@ private final class Worker {
                     throw TransferProblem("Исходная папка была заменена после слияния; она сохранена: «\(node.source.path)».")
                 }
                 if rmdir(node.source.path) == 0 { break }
+                if request.propagateDescriptions,
+                   let remaining = try? fm.contentsOfDirectory(atPath: node.source.path), remaining == ["descript.ion"] {
+                    do {
+                        let key = FileDescriptionEncoding.directoryKey(node.source)
+                        let descriptions = try FileDescriptions.load(directory: node.source, encoding: request.descriptionEncodings[key] ?? .utf8)
+                        if try descriptions.removeEmptyFileIfUnchanged(), rmdir(node.source.path) == 0 {
+                            break
+                        }
+                    } catch { descriptionWarning(error, source: node.source, target: target) }
+                    issues.append("Данные перенесены; исходная папка с оставшимися строками descript.ion сохранена: «\(node.source.path)».")
+                    return
+                }
                 let message = "Данные перенесены, но исходную папку удалить не удалось: «\(node.source.path)»."
                 switch failure(TransferFailure(source: node.source, destination: target, message: message)) {
                 case .retry: continue
@@ -535,7 +605,11 @@ private final class Worker {
             guard current.directory, current.sameObject(node.stamp) else {
                 throw TransferProblem("Исходная папка была заменена; её содержимое сохранено: «\(node.source.path)».")
             }
-            for child in node.children {
+            // Keep the original records available until every payload child has
+            // been removed. Cancellation must not leave a remaining file without
+            // the source control file that still describes it.
+            let cleanupChildren = request.propagateDescriptions ? node.children.filter { $0.source.lastPathComponent != "descript.ion" } + node.children.filter { $0.source.lastPathComponent == "descript.ion" } : node.children
+            for child in cleanupChildren {
                 try removePlannedSource(child, target: target.appendingPathComponent(child.source.lastPathComponent),
                                         receipt: receipt, ancestors: ancestors + [target])
             }

@@ -449,3 +449,205 @@ final class TransferEngineTests {
     }
 
 }
+
+extension TransferEngineTests {
+    @Test func descriptionsFollowCopyMoveAndConflictRename() throws {
+        let source = try file("original", "content"), target = try directory("destination")
+        _ = try file("descript.ion", "original Описание\nkeep\t  exact bytes  \r\n")
+        let copy = run([source], target)
+        #expect(copy.failed == 0 && copy.issues.isEmpty)
+        #expect(try FileDescriptions.load(directory: target).description(for: "original") == "Описание")
+        #expect(try FileDescriptions.load(directory: root).description(for: "original") == "Описание")
+        let moved = run([source], target, move: true, conflict: { _ in .rename("renamed") })
+        #expect(moved.failed == 0 && moved.issues.isEmpty)
+        #expect(!fm.fileExists(atPath: source.path))
+        #expect(try FileDescriptions.load(directory: root).description(for: "original").isEmpty)
+        #expect(try FileDescriptions.load(directory: target).description(for: "renamed") == "Описание")
+        #expect(try text(root.appendingPathComponent("descript.ion")) == "keep\t  exact bytes  \r\n")
+    }
+
+    @Test func skippedAndCancelledCopiesLeaveDescriptionBytesUntouched() throws {
+        let source = try file("source"), target = try file("target")
+        let metadata = try file("descript.ion", "source first\ntarget second\n")
+        let original = try Data(contentsOf: metadata)
+        let skip = run([source], target, move: true)
+        #expect(skip.skipped == 1)
+        #expect(try Data(contentsOf: metadata) == original)
+        let token = TransferCancellation()
+        let cancel = run([source], root.appendingPathComponent("copy"), move: true, cancellation: token, progress: { progress in
+            if progress.phase == "Копирование" { token.cancel() }
+        })
+        #expect(cancel.cancelled)
+        #expect(try Data(contentsOf: metadata) == original)
+        #expect(fm.fileExists(atPath: source.path))
+    }
+
+    @Test func overwriteUpdatesOnlyCopiedRecordAndAbsentSourceRecordPreservesTarget() throws {
+        let source = try file("source", "new"), target = try directory("destination")
+        _ = try file("destination/source", "old")
+        _ = try file("descript.ion", "source new description\n")
+        _ = try file("destination/descript.ion", "source old description\nkeep\t exact spacing  \r\n")
+        let replaced = run([source], target, conflict: { _ in .replace })
+        #expect(replaced.failed == 0 && replaced.issues.isEmpty)
+        #expect(try text(target.appendingPathComponent("descript.ion")) == "source new description\nkeep\t exact spacing  \r\n")
+        try Data().write(to: root.appendingPathComponent("descript.ion"))
+        _ = run([source], target, conflict: { _ in .replace })
+        #expect(try FileDescriptions.load(directory: target).description(for: "source") == "new description")
+    }
+
+    @Test func concurrentDestinationMetadataKeepsPublishedCopyAndMoveSource() throws {
+        let source = try file("source"), target = try directory("destination")
+        _ = try file("descript.ion", "source source description\n")
+        let metadata = try file("destination/descript.ion", "keep initial\n")
+        var changed = false
+        var errorPrompts = 0
+        let result = run([source], target, move: true, progress: { progress in
+            if progress.phase == "Копирование", !changed {
+                changed = true
+                try? Data("keep external\n".utf8).write(to: metadata)
+            }
+        }, error: { _ in errorPrompts += 1; return .retry })
+        #expect(result.completed == 1 && result.failed == 0 && !result.issues.isEmpty)
+        #expect(errorPrompts == 0)
+        #expect(fm.fileExists(atPath: source.path))
+        #expect(try text(target.appendingPathComponent("source")) == "data")
+        #expect(try text(metadata) == "keep external\n")
+        #expect(result.summary.contains("частично"))
+    }
+
+    @Test func malformedMetadataAndExplicitOptOutNeverLoseFilesOrRewriteMetadata() throws {
+        let source = try file("source"), target = try directory("destination")
+        let metadata = try file("descript.ion", "source first\nsource duplicate\n")
+        let result = run([source], target, move: true)
+        #expect(result.completed == 1 && !result.issues.isEmpty)
+        #expect(fm.fileExists(atPath: source.path))
+        #expect(try text(metadata) == "source first\nsource duplicate\n")
+        let disabled = TransferEngine.run(TransferRequest(sources: [source], destination: target.appendingPathComponent("disabled"), move: true, propagateDescriptions: false), cancellation: TransferCancellation(), onProgress: { _ in }, onConflict: { _ in .skip }, onError: { _ in .skip })
+        #expect(disabled.issues.isEmpty && !fm.fileExists(atPath: source.path))
+        #expect(try text(metadata) == "source first\nsource duplicate\n")
+    }
+
+    @Test func cancellationDuringSourceRemovalKeepsBothDescriptions() throws {
+        let source = try file("source"), target = try directory("destination")
+        _ = try file("descript.ion", "source keep\n")
+        let token = TransferCancellation()
+        let result = run([source], target, move: true, cancellation: token, progress: { progress in
+            if progress.phase == "Удаление источника" { token.cancel() }
+        })
+        #expect(result.cancelled && fm.fileExists(atPath: source.path))
+        #expect(try FileDescriptions.load(directory: root).description(for: "source") == "keep")
+        #expect(try FileDescriptions.load(directory: target).description(for: "source") == "keep")
+    }
+
+    @Test func directoryMergePreservesDestinationOnlyAndSkippedDescriptionRecords() throws {
+        let source = try directory("source"), target = try directory("destination")
+        _ = try directory("destination/source")
+        _ = try file("source/moved")
+        _ = try file("source/skipped")
+        _ = try file("source/descript.ion", "moved move description\nskipped source description\n")
+        _ = try file("destination/source/skipped", "existing")
+        let destinationMetadata = try file("destination/source/descript.ion", "keep\t exact bytes  \r\nskipped destination description\n")
+        let result = run([source], target, move: true, conflict: { $0.isDirectoryMerge ? .merge : .skip })
+        #expect(result.skipped == 1 && result.failed == 0)
+        #expect(try FileDescriptions.load(directory: source).descriptions == ["skipped": "source description"])
+        #expect(try FileDescriptions.load(directory: target.appendingPathComponent("source")).descriptions == ["keep": "exact bytes", "skipped": "destination description", "moved": "move description"])
+        #expect(try text(destinationMetadata).contains("keep\t exact bytes  \r\n"))
+        #expect(try text(target.appendingPathComponent("source/skipped")) == "existing")
+    }
+
+    @Test func freshDirectoryCopyPreservesNestedDescriptionBytes() throws {
+        let source = try directory("source"), target = try directory("destination")
+        _ = try file("source/data")
+        let raw = Data([0xFE, 0xFF, 0x80])
+        try raw.write(to: source.appendingPathComponent("descript.ion"))
+        let result = run([source], target)
+        #expect(result.failed == 0 && result.issues.isEmpty)
+        #expect(try Data(contentsOf: target.appendingPathComponent("source/descript.ion")) == raw)
+    }
+}
+
+extension TransferEngineTests {
+    @Test func completelyMergedMoveRemovesOnlyEmptiedControlFile() throws {
+        let source = try directory("source"), target = try directory("destination")
+        _ = try directory("destination/source")
+        _ = try file("source/one")
+        let two = try file("source/two")
+        _ = try file("source/descript.ion", "one first\ntwo second\n")
+        let result = run([source], target, move: true, conflict: { $0.isDirectoryMerge ? .merge : .skip })
+        #expect(result.failed == 0 && result.issues.isEmpty)
+        #expect(!fm.fileExists(atPath: source.path) && !fm.fileExists(atPath: two.path))
+        #expect(try FileDescriptions.load(directory: target.appendingPathComponent("source")).descriptions == ["one": "first", "two": "second"])
+    }
+
+    @Test func explicitlySelectedControlFileIsNeverRewrittenBySiblingTransfer() throws {
+        let source = try file("source"), metadata = try file("descript.ion", "source first\n"), target = try directory("destination")
+        let original = try Data(contentsOf: metadata)
+        let result = run([source, metadata], target, move: true)
+        #expect(result.failed == 0 && result.issues.isEmpty)
+        #expect(!fm.fileExists(atPath: source.path) && !fm.fileExists(atPath: metadata.path))
+        #expect(try Data(contentsOf: target.appendingPathComponent("descript.ion")) == original)
+    }
+}
+
+extension TransferEngineTests {
+    @Test func managedMergeBudgetCountsPayloadAndEmptyContainerWithoutControlFileBytes() throws {
+        for hasPayload in [true, false] {
+            let suffix = hasPayload ? "payload" : "control-only"
+            let source = try directory("source-" + suffix), destination = try directory("destination-" + suffix)
+            _ = try directory("destination-" + suffix + "/source-" + suffix)
+            let original = "data description\n"
+            _ = try file("source-" + suffix + "/descript.ion", original)
+            if hasPayload { _ = try file("source-" + suffix + "/data", "1234") }
+            var finalProgress: TransferProgress?
+            let result = run([source], destination, progress: { finalProgress = $0 }, conflict: { _ in .merge })
+            #expect(result.completed == 1 && result.failed == 0 && result.skipped == 0 && result.issues.isEmpty)
+            #expect(result.summary.hasPrefix("Операция завершена."))
+            #expect(finalProgress?.completedItems == 1 && finalProgress?.totalItems == 1)
+            #expect(finalProgress?.completedBytes == (hasPayload ? 4 : 0))
+            #expect(finalProgress?.totalBytes == (hasPayload ? 4 : 0))
+            #expect(try text(source.appendingPathComponent("descript.ion")) == original)
+            let target = destination.appendingPathComponent(source.lastPathComponent)
+            if hasPayload { #expect(try FileDescriptions.load(directory: target).description(for: "data") == "description") }
+            else { #expect(!fm.fileExists(atPath: target.appendingPathComponent("descript.ion").path)) }
+        }
+    }
+
+    @Test func cancelledDirectoryMoveRetainsControlFileUntilLastPayloadIsRemoved() throws {
+        let source = try directory("source"), destination = try directory("destination")
+        _ = try file("source/a-data", "first")
+        let remaining = try file("source/z-data", "last")
+        let original = Data("a-data first description\nz-data remaining description\n".utf8)
+        let metadata = source.appendingPathComponent("descript.ion")
+        try original.write(to: metadata)
+        let token = TransferCancellation()
+        let result = run([source], destination, move: true, cancellation: token, progress: { progress in
+            if progress.phase == "Удаление источника", URL(fileURLWithPath: progress.currentPath).lastPathComponent == "z-data" { token.cancel() }
+        })
+        #expect(result.cancelled && result.completed == 3)
+        #expect(!fm.fileExists(atPath: source.appendingPathComponent("a-data").path))
+        #expect(try text(remaining) == "last")
+        #expect(try Data(contentsOf: metadata) == original)
+        #expect(try Data(contentsOf: destination.appendingPathComponent("source/descript.ion")) == original)
+        #expect(try FileDescriptions.load(directory: source).description(for: "z-data") == "remaining description")
+    }
+}
+
+extension TransferEngineTests {
+    @Test func mergedMoveRetainsSourceDirectoryWhenParentDescriptionAppearsConcurrently() throws {
+        let source = try directory("source"), destination = try directory("destination")
+        _ = try directory("destination/source")
+        _ = try file("source/data", "published")
+        let metadata = root.appendingPathComponent("descript.ion")
+        var changed = false
+        let result = run([source], destination, move: true, progress: { progress in
+            if progress.phase == "Копирование", !changed {
+                changed = true
+                try? Data("source externally added description\n".utf8).write(to: metadata)
+            }
+        }, conflict: { _ in .merge })
+        #expect(result.completed == 1 && !result.issues.isEmpty)
+        #expect(fm.fileExists(atPath: source.path))
+        #expect(try text(metadata) == "source externally added description\n")
+        #expect(try text(destination.appendingPathComponent("source/data")) == "published")
+    }
+}

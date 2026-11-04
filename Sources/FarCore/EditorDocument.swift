@@ -2,12 +2,13 @@ import Foundation
 import Darwin
 
 public enum EditorLineEnding: String, CaseIterable, Codable, Sendable {
-    case preserve, lf, crlf
+    case preserve, lf, crlf, cr
     public var title: String {
         switch self {
         case .preserve: return "Сохранить исходные"
         case .lf: return "LF"
         case .crlf: return "CRLF"
+        case .cr: return "CR"
         }
     }
 }
@@ -206,7 +207,11 @@ public enum EditorDocument {
     private static func normalizedText(_ text: String, lineEnding: EditorLineEnding) -> String {
         guard lineEnding != .preserve else { return text }
         let lf = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
-        return lineEnding == .lf ? lf : lf.replacingOccurrences(of: "\n", with: "\r\n")
+        switch lineEnding {
+        case .preserve, .lf: return lf
+        case .crlf: return lf.replacingOccurrences(of: "\n", with: "\r\n")
+        case .cr: return lf.replacingOccurrences(of: "\n", with: "\r")
+        }
     }
 
     private static func validate(_ format: EditorFormat) throws {

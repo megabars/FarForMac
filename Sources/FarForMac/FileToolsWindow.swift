@@ -68,17 +68,26 @@ final class BatchRenameWindow: FileToolsWindowController, NSTextFieldDelegate {
     private let onComplete: () -> Void
     private let canMutate: () -> Bool
     private let template = NSTextField(string: "{name}_{n}.{ext}")
+    private let modePicker = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let help = NSTextField(wrappingLabelWithString: "")
     private let preview = NSTextView()
     private var plan: [BatchRenameEntry] = []
     private var reviewedTemplate = ""
-    private lazy var previewButton = button("Предпросмотр", #selector(makePreview))
-    private lazy var applyButton = button("Переименовать по предпросмотру", #selector(applyRename))
+    private var reviewedMode = BatchRenameMode.template
+    private var previewRevision = 0
+    private var selectedMode: BatchRenameMode { modePicker.indexOfSelectedItem == 1 ? .farMask : .template }
+    private lazy var previewButton = button(metadataText("Предпросмотр", "Preview"), #selector(makePreview))
+    private lazy var applyButton = button(metadataText("Переименовать по предпросмотру", "Apply reviewed renames"), #selector(applyRename))
 
     init(urls: [URL], canMutate: @escaping () -> Bool = { true }, onComplete: @escaping () -> Void) {
         self.urls = urls; self.onComplete = onComplete; self.canMutate = canMutate
-        super.init(title: "Групповое переименование", height: 490)
+        super.init(title: metadataText("Групповое переименование", "Batch rename"), height: 490)
         template.delegate = self
-        let help = NSTextField(wrappingLabelWithString: "Шаблон: {name} — имя без расширения, {ext} — расширение без точки, {n} — номер с 1. Точка вводится явно. Для папок {ext} пусто. Это буквальный шаблон, а не маски FAR. Пример для файлов: {name}_{n}.{ext}")
+        modePicker.addItems(withTitles: [metadataText("Шаблон {name}/{ext}/{n}", "Template {name}/{ext}/{n}"), metadataText("Маска имени FAR (* и ?)", "FAR filename mask (* and ?)")])
+        modePicker.target = self; modePicker.action = #selector(changeRenameMode)
+        modePicker.setAccessibilityLabel(metadataText("Режим переименования", "Rename mode"))
+        template.setAccessibilityLabel(metadataText("Шаблон или маска нового имени", "New filename template or mask"))
+        updateHelp()
         preview.isEditable = false; preview.isRichText = false
         preview.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         preview.isVerticallyResizable = true; preview.autoresizingMask = [.width]
@@ -86,47 +95,101 @@ final class BatchRenameWindow: FileToolsWindowController, NSTextFieldDelegate {
         let scroll = NSScrollView(); scroll.documentView = preview; scroll.hasVerticalScroller = true
         scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
         applyButton.isEnabled = false
-        status.stringValue = "Выбрано: \(urls.count). Сначала проверьте новые имена. Перезапись и циклы запрещены."
-        content([help, template, row([previewButton, applyButton]), scroll, status])
+        status.stringValue = metadataText("Выбрано: \(urls.count). Сначала проверьте новые имена. Перезапись и циклы запрещены.", "Selected: \(urls.count). Review new names first. Overwrites and cycles are rejected.")
+        content([modePicker, help, template, row([previewButton, applyButton]), scroll, status])
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     func controlTextDidChange(_ obj: Notification) {
+        invalidatePreview()
+    }
+    private func invalidatePreview() {
+        previewRevision += 1
         plan = []; applyButton.isEnabled = false; preview.string = ""
-        status.stringValue = "Шаблон изменён. Создайте новый предпросмотр."
+        status.stringValue = metadataText("Шаблон или режим изменён. Создайте новый предпросмотр.", "Pattern or mode changed. Create a new preview.")
+    }
+    @objc private func changeRenameMode() {
+        template.stringValue = selectedMode == .farMask ? "*.bak" : "{name}_{n}.{ext}"
+        updateHelp(); invalidatePreview()
+    }
+    private func updateHelp() {
+        help.stringValue = selectedMode == .farMask ? metadataText(
+            "Маска FAR: *.bak заменяет последнее расширение; *?.bak добавляет .bak к полному имени. ? копирует позицию, кроме точки; обычный символ заменяет позицию. Точка пропускает исходное имя до следующей точки. Скобки и {name} буквальны. Только имя, без пути. Unicode вне BMP занимает две позиции ?.",
+            "FAR mask: *.bak replaces the last extension; *?.bak appends .bak to the full name. ? copies a position except a dot; a literal replaces a position. A dot skips through the next source dot. Brackets and {name} are literal. Filename only, without a path. Non-BMP Unicode uses two ? positions.") : metadataText(
+            "Шаблон: {name} — имя без расширения, {ext} — расширение без точки, {n} — номер с 1. Точка вводится явно. Для папок {ext} пусто. Пример: {name}_{n}.{ext}",
+            "Template: {name} is the stem, {ext} the extension without a dot, {n} the index from 1. Enter dots explicitly. Directories have an empty {ext}. Example: {name}_{n}.{ext}")
     }
     @objc private func makePreview() {
         let value = template.stringValue
+        let mode = selectedMode, revision = previewRevision
+        isWorking = true
         previewButton.isEnabled = false; applyButton.isEnabled = false
-        status.stringValue = "Проверка имён…"
-        worker({ try FileTools.renamePlan(self.urls, template: value) }) { [self] result in
+        status.stringValue = metadataText("Проверка имён…", "Checking names…")
+        worker({ try FileTools.renamePlan(self.urls, template: value, mode: mode) }) { [self] result in
+            isWorking = false
             previewButton.isEnabled = true
-            guard value == template.stringValue else { return }
+            guard revision == previewRevision, value == template.stringValue, mode == selectedMode else { return }
             switch result {
             case .success(let entries):
-                plan = entries; reviewedTemplate = value
-                preview.string = entries.map { "\($0.source.url.lastPathComponent)  →  \($0.destination.lastPathComponent)" }.joined(separator: "\n")
+                plan = entries; reviewedTemplate = value; reviewedMode = mode
+                preview.string = (modePicker.titleOfSelectedItem ?? "") + "\n" + entries.map { "\($0.source.url.lastPathComponent)  →  \($0.destination.lastPathComponent)" }.joined(separator: "\n")
                 applyButton.isEnabled = true
-                status.stringValue = "Проверьте каждую строку. Будет переименовано объектов: \(entries.count)."
+                status.stringValue = metadataText("Проверьте каждую строку. Будет переименовано объектов: \(entries.count).", "Review each row. Items to rename: \(entries.count).")
             case .failure(let error): plan = []; status.stringValue = error.localizedDescription
             }
         }
     }
     @objc private func applyRename() {
-        guard !plan.isEmpty, reviewedTemplate == template.stringValue else { return }
-        guard canMutate() else { status.stringValue = "Другая файловая операция ещё выполняется."; return }
+        guard !plan.isEmpty, reviewedTemplate == template.stringValue, reviewedMode == selectedMode else { return }
+        guard canMutate() else { status.stringValue = metadataText("Другая файловая операция ещё выполняется.", "Another file operation is still running."); return }
         isWorking = true; hasPendingMutation = true
         let entries = plan
-        applyButton.isEnabled = false; previewButton.isEnabled = false; template.isEnabled = false
-        status.stringValue = "Переименование…"
-        worker({ try FileTools.executeRename(entries) }) { [self] result in
+        let propagateDescriptions = DescriptionPreferences.enabled
+        let descriptionEncodings = DescriptionPreferences.encodings
+        applyButton.isEnabled = false; previewButton.isEnabled = false; template.isEnabled = false; modePicker.isEnabled = false
+        status.stringValue = metadataText("Переименование…", "Renaming…")
+        worker({ try FileTools.executeRename(entries, propagateDescriptions: propagateDescriptions, descriptionEncodings: descriptionEncodings) }) { [self] result in
             isWorking = false; hasPendingMutation = false
             onComplete() // refresh even after a partial failure
-            template.isEnabled = true; previewButton.isEnabled = true; plan = []
+            template.isEnabled = true; modePicker.isEnabled = true; previewButton.isEnabled = true; plan = []
             switch result {
-            case .success(let count): status.stringValue = "Переименовано: \(count)."; preview.string = ""
+            case .success(let count): status.stringValue = metadataText("Переименовано: \(count).", "Renamed: \(count)."); preview.string = ""
             case .failure(let error): status.stringValue = error.localizedDescription
             }
         }
+    }
+
+    static func verifyFARRenameUI() async throws -> [String] {
+        guard AppRuntime.isSmoke, let directory = AppRuntime.smokeStateDirectory else { throw ExtensionAPIError("Rename smoke requires isolated state.") }
+        let root = directory.appendingPathComponent("rename-smoke-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("отчёт.part.txt")
+        try Data("preserved bytes".utf8).write(to: source)
+        let controller = BatchRenameWindow(urls: [source], onComplete: {})
+        controller.showWindow(nil); defer { controller.close() }
+        func waitForPreview() async throws {
+            for _ in 0..<1000 {
+                if !controller.isWorking { return }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            throw ExtensionAPIError("Rename smoke timed out.")
+        }
+        controller.modePicker.selectItem(at: 1); controller.changeRenameMode(); controller.makePreview()
+        try await waitForPreview()
+        guard controller.applyButton.isEnabled, controller.plan.first?.destination.lastPathComponent == "отчёт.part.bak",
+              controller.preview.string.contains("FAR"), FileManager.default.fileExists(atPath: source.path) else {
+            throw ExtensionAPIError("FAR rename preview did not preserve the source or mode.")
+        }
+        controller.modePicker.selectItem(at: 0); controller.changeRenameMode()
+        guard controller.plan.isEmpty, !controller.applyButton.isEnabled else { throw ExtensionAPIError("Rename mode change retained a stale plan.") }
+        controller.modePicker.selectItem(at: 1); controller.changeRenameMode(); controller.makePreview()
+        try await waitForPreview(); controller.applyRename(); try await waitForPreview()
+        let destination = root.appendingPathComponent("отчёт.part.bak")
+        guard !FileManager.default.fileExists(atPath: source.path),
+              try String(contentsOf: destination, encoding: .utf8) == "preserved bytes", controller.plan.isEmpty else {
+            throw ExtensionAPIError("FAR rename apply did not preserve content.")
+        }
+        return ["FAR destination masks preview without mutation and invalidate on mode change", "FAR rename asynchronous apply preserves file bytes"]
     }
 }
 
@@ -137,49 +200,251 @@ final class FilePropertiesWindow: FileToolsWindowController {
     private let canMutate: () -> Bool
     private let details = NSTextField(wrappingLabelWithString: "Загрузка…")
     private let permissions = NSTextField(string: "")
+    private let changePermissions = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let changeAccessed = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let changeModified = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let accessed = NSDatePicker()
+    private let modified = NSDatePicker()
+    private let ownership = NSTextField(wrappingLabelWithString: "")
+    private let changeGroup = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let groupPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+    private var groups: [MetadataGroup] = []
+    private var ownershipSnapshot: MetadataOwnershipSnapshot?
+    private let recursive = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let preview = NSTextView()
+    private var plan: MetadataMutationPlan?
+    private var cancellation: FileToolCancellation?
     private var source: FileToolItem?
-    private lazy var saveButton = button("Применить права", #selector(savePermissions))
+    private lazy var previewButton = button(metadataText("Предпросмотр изменений", "Preview changes"), #selector(makePreview))
+    private lazy var saveButton = button(metadataText("Применить по предпросмотру…", "Apply reviewed changes…"), #selector(savePermissions))
+    private lazy var cancelButton = button(L10n.text("Отмена"), #selector(cancelWork))
 
     init(url: URL, canMutate: @escaping () -> Bool = { true }, onComplete: @escaping () -> Void) {
         self.url = url; self.onComplete = onComplete; self.canMutate = canMutate
-        super.init(title: "Свойства — \(url.lastPathComponent)", height: 360)
+        super.init(title: metadataText("Свойства — ", "Properties — ") + url.lastPathComponent, width: 840, height: 770)
+        window?.minSize = NSSize(width: 800, height: 750)
         details.isSelectable = true
         permissions.placeholderString = "0755"
-        permissions.isEnabled = false; saveButton.isEnabled = false
-        content([details, NSTextField(labelWithString: "Права POSIX (восьмеричные, например 0644 или 0755):"), permissions, saveButton, status, NSView()])
+        changePermissions.title = metadataText("Изменить POSIX-права (000–7777):", "Change POSIX permissions (000–7777):")
+        changeAccessed.title = metadataText("Изменить дату доступа:", "Change access date:")
+        changeModified.title = metadataText("Изменить дату изменения:", "Change modification date:")
+        changeGroup.title = metadataText("Изменить группу:", "Change group:")
+        ownership.isSelectable = true
+        groupPicker.setAccessibilityLabel(metadataText("Группа текущего пользователя", "Current user group"))
+        groupPicker.target = self; groupPicker.action = #selector(invalidatePreview)
+        recursive.title = metadataText("Все выбранные изменения для вложенных файлов и папок", "Apply all selected changes to nested files and folders")
+        for picker in [accessed, modified] {
+            picker.datePickerStyle = .textFieldAndStepper
+            picker.datePickerElements = [.yearMonthDay, .hourMinuteSecond]
+            picker.locale = .current; picker.timeZone = .current
+        }
+        accessed.setAccessibilityLabel(metadataText("Дата доступа, местное время", "Access date, local time"))
+        modified.setAccessibilityLabel(metadataText("Дата изменения, местное время", "Modification date, local time"))
+        permissions.setAccessibilityLabel(metadataText("POSIX-права в восьмеричной форме", "Octal POSIX permissions"))
+        for checkbox in [changePermissions, changeAccessed, changeModified, changeGroup, recursive] { checkbox.target = self; checkbox.action = #selector(invalidatePreview) }
+        NotificationCenter.default.addObserver(self, selector: #selector(invalidatePreview), name: NSControl.textDidChangeNotification, object: permissions)
+        for picker in [accessed, modified] { picker.target = self; picker.action = #selector(invalidatePreview) }
+        preview.isEditable = false; preview.isRichText = false; preview.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        preview.isVerticallyResizable = true; preview.autoresizingMask = [.width]; preview.textContainer?.widthTracksTextView = true
+        let scroll = NSScrollView(); scroll.documentView = preview; scroll.hasVerticalScroller = true
+        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
+        let note = NSTextField(wrappingLabelWithString: metadataText("Время задаётся в текущем часовом поясе. Ссылки, специальные файлы и другие тома пропускаются. Метаданные общие для всех жёстких ссылок на файл. Группу можно менять только своим объектам на свою группу; смена группы может снять set-ID биты. Смена владельца требует повышенных прав и недоступна. ACL и даты создания/смены метаданных не редактируются. Отката нет.", "Dates use the current time zone. Links, special files and other volumes are skipped. Metadata affects all hard links to a file. Group changes require your own items and one of your groups; changing group may clear set-ID bits. Owner changes require elevated privileges and are unavailable. ACLs, creation and metadata-change dates are not edited. Changes cannot be rolled back."))
+        saveButton.isEnabled = false; previewButton.isEnabled = false; cancelButton.isEnabled = false
+        content([details, ownership, row([changeGroup, groupPicker]), row([changePermissions, permissions]), row([changeAccessed, accessed]), row([changeModified, modified]), recursive,
+                 note, row([previewButton, saveButton, cancelButton]), scroll, status])
+        setControlsEnabled(false)
         load()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    private func load() {
-        worker({ try FileTools.metadata(self.url) }) { [self] result in
+    private func load(summary: String? = nil) {
+        worker({ (try FileTools.metadata(self.url), try MetadataOwnership.snapshot(url: self.url), try MetadataOwnership.availableGroups()) }) { [self] result in
             switch result {
-            case .success(let item):
-                source = item
-                let type = item.isSymbolicLink ? "Символическая ссылка" : (item.isDirectory ? "Папка" : "Файл")
-                details.stringValue = "\(item.url.path)\n\(type) · \(item.size) байт\nИзменён: \(item.modified.formatted(date: .numeric, time: .standard))"
+            case .success(let result):
+                let (item, owner, availableGroups) = result
+                source = item; ownershipSnapshot = owner; groups = availableGroups
+                ownership.stringValue = metadataText("Владелец (только чтение): ", "Owner (read only): ") + "\(owner.ownerName) (UID \(owner.ownerID)) · " + metadataText("Группа: ", "Group: ") + "\(owner.groupName) (GID \(owner.groupID))"
+                groupPicker.removeAllItems(); groupPicker.addItems(withTitles: groups.map(\.title))
+                groupPicker.selectItem(at: groups.firstIndex(where: { $0.id == owner.groupID }) ?? 0)
+                if !owner.isOwnedByCurrentUser { changeGroup.state = .off }
+                let type = item.isSymbolicLink ? metadataText("Символическая ссылка", "Symbolic link") : (item.isDirectory ? metadataText("Папка", "Folder") : metadataText("Файл", "File"))
+                details.stringValue = "\(item.url.path)\n\(type) · \(item.size) " + metadataText("байт", "bytes")
                 permissions.stringValue = String(format: "%04o", Int(item.permissions))
-                permissions.isEnabled = !item.isSymbolicLink; saveButton.isEnabled = !item.isSymbolicLink
-                status.stringValue = item.isSymbolicLink ? "Права ссылки доступны только для чтения. Цель ссылки не изменяется." : "Изменяются только права выбранного объекта, без рекурсии."
+                accessed.dateValue = item.accessed; modified.dateValue = item.modified
+                setControlsEnabled(!item.isSymbolicLink)
+                previewButton.isEnabled = !item.isSymbolicLink
+                if !item.isDirectory { recursive.state = .off; recursive.isEnabled = false }
+                if let summary { status.stringValue = summary }
+                else if plan == nil { status.stringValue = item.isSymbolicLink ? metadataText("Ссылка доступна только для чтения; её цель не изменяется.", "The symbolic link is read only; its target is unchanged.") : metadataText("Выберите изменения и создайте предпросмотр. Даты доступа/изменения показаны выше.", "Choose changes and create a preview. Access and modification dates are shown above.") }
             case .failure(let error): status.stringValue = error.localizedDescription
             }
         }
+    }
+    private func selectedChanges() throws -> MetadataChanges {
+        MetadataChanges(permissions: changePermissions.state == .on ? try FileTools.parsePermissions(permissions.stringValue) : nil,
+                        accessed: changeAccessed.state == .on ? accessed.dateValue : nil,
+                        modified: changeModified.state == .on ? modified.dateValue : nil,
+                        groupID: changeGroup.state == .on && groups.indices.contains(groupPicker.indexOfSelectedItem) ? groups[groupPicker.indexOfSelectedItem].id : nil)
+    }
+    private func setControlsEnabled(_ enabled: Bool) {
+        for control in [permissions, changePermissions, changeAccessed, changeModified, accessed, modified, recursive] as [NSControl] { control.isEnabled = enabled }
+        let canChangeGroup = enabled && ownershipSnapshot?.isOwnedByCurrentUser == true && !groups.isEmpty
+        changeGroup.isEnabled = canChangeGroup; groupPicker.isEnabled = canChangeGroup
+        if source?.isDirectory != true { recursive.isEnabled = false }
+    }
+    @objc private func invalidatePreview() {
+        guard !isWorking else { return }
+        plan = nil; saveButton.isEnabled = false; preview.string = ""
+        status.stringValue = metadataText("Параметры изменены. Создайте новый предпросмотр.", "Settings changed. Create a new preview.")
+    }
+    @objc private func makePreview() {
+        guard !isWorking, source != nil else { return }
+        do {
+            let changes = try selectedChanges(), recurse = recursive.state == .on
+            let token = FileToolCancellation(); cancellation = token
+            isWorking = true; setControlsEnabled(false); previewButton.isEnabled = false; saveButton.isEnabled = false; cancelButton.isEnabled = true
+            status.stringValue = metadataText("Подготавливается список объектов…", "Preparing the item list…")
+            worker({ try MetadataMutation.prepare(url: self.url, changes: changes, recursive: recurse, cancellation: token) }) { [self] result in
+                isWorking = false; cancellation = nil; cancelButton.isEnabled = false; setControlsEnabled(true); previewButton.isEnabled = true
+                switch result {
+                case .success(let reviewed):
+                    plan = reviewed
+                    preview.string = describe(reviewed)
+                    saveButton.isEnabled = true
+                    status.stringValue = metadataText("Проверьте список. Изменений ещё нет.", "Review the list. No changes have been applied.")
+                case .failure(let error): plan = nil; status.stringValue = error.localizedDescription
+                }
+            }
+        } catch { status.stringValue = error.localizedDescription }
+    }
+    private func describe(_ plan: MetadataMutationPlan, limit: Int = 200) -> String {
+        var lines = [metadataText("Объектов: ", "Items: ") + String(plan.entries.count)]
+        if let value = plan.changes.permissions { lines.append(metadataText("Новые права для всех перечисленных объектов: ", "New permissions for every listed item: ") + String(format: "%04o", Int(value))) }
+        if let date = plan.changes.accessed { lines.append(metadataText("Дата доступа всех перечисленных объектов: ", "Access date for every listed item: ") + date.formatted()) }
+        if let date = plan.changes.modified { lines.append(metadataText("Дата изменения всех перечисленных объектов: ", "Modification date for every listed item: ") + date.formatted()) }
+        if let groupID = plan.changes.groupID { lines.append(metadataText("Новая группа всех перечисленных объектов (GID): ", "New group for every listed item (GID): ") + String(groupID)) }
+        lines.append(metadataText("Пропущено: ссылки/спецфайлы/другие тома/повторные hardlink: ", "Skipped: links/special files/other volumes/duplicate hard links: ") + "\(plan.skippedSymbolicLinks)/\(plan.skippedSpecialFiles)/\(plan.skippedOtherVolumes)/\(plan.skippedDuplicateHardLinks)")
+        if plan.entries.count > limit {
+            lines.append(metadataText("Показаны первые ", "Showing the first ") + "\(limit)/\(plan.entries.count). " + metadataText("Применяется весь подготовленный план.", "The entire prepared plan will be applied."))
+        }
+        lines += plan.entries.prefix(limit).map { entry in
+            var previous = String(format: "%04o", Int(entry.previousPermissions)) + " UID \(entry.previousOwnerID) GID \(entry.previousGroupID)"
+            if plan.changes.accessed != nil { previous += " · " + metadataText("доступ ", "access ") + entry.previousAccessed.formatted() }
+            if plan.changes.modified != nil { previous += " · " + metadataText("изменён ", "modified ") + entry.previousModified.formatted() }
+            return previous + "  " + entry.url.path
+        }
+        return lines.joined(separator: "\n")
     }
     @objc private func savePermissions() {
-        guard let source else { return }
+        guard let plan, !isWorking else { return }
         guard canMutate() else { status.stringValue = "Другая файловая операция ещё выполняется."; return }
+        let alert = NSAlert(); alert.messageText = metadataText("Применить изменения к объектам: ", "Apply changes to items: ") + String(plan.entries.count) + "?"
+        alert.informativeText = describe(plan, limit: 6) + "\n\n" + metadataText("Свойства папок применяются после вложенных объектов. Отмена/ошибка оставляет уже выполненные изменения. Новые объекты после предпросмотра не добавляются в план. Отката нет.", "Folder metadata is applied after its children. Cancellation or errors retain completed changes. New entries after the preview are not added to the plan. There is no rollback.")
+        alert.addButton(withTitle: L10n.text("Применить")); alert.addButton(withTitle: L10n.text("Отмена"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard canMutate() else { return }
+        performReviewedPlan(plan)
+    }
+    private func performReviewedPlan(_ plan: MetadataMutationPlan) {
+        guard !isWorking else { return }
         isWorking = true; hasPendingMutation = true
-        let value = permissions.stringValue
-        saveButton.isEnabled = false; permissions.isEnabled = false
-        worker({ try FileTools.setPermissions(value, for: source) }) { [self] result in
+        let token = FileToolCancellation(); cancellation = token
+        saveButton.isEnabled = false; previewButton.isEnabled = false; setControlsEnabled(false); cancelButton.isEnabled = true
+        worker({
+            var lastUpdate = ProcessInfo.processInfo.systemUptime
+            return MetadataMutation.apply(plan, cancellation: token) { [weak self] count, total, path in
+                let now = ProcessInfo.processInfo.systemUptime
+                guard now - lastUpdate >= 0.05 || count == total else { return }
+                lastUpdate = now
+                DispatchQueue.main.async { self?.status.stringValue = "\(count)/\(total) · \(path)" }
+            }
+        }) { [self] result in
             isWorking = false; hasPendingMutation = false
-            saveButton.isEnabled = true; permissions.isEnabled = true
+            cancellation = nil; self.plan = nil; cancelButton.isEnabled = false
+            setControlsEnabled(true); previewButton.isEnabled = true
+            onComplete()
             switch result {
-            case .success: onComplete(); load(); status.stringValue = "Права обновлены."
+            case .success(let report):
+                let summary = metadataText("Изменено: ", "Changed: ") + "\(report.completed)/\(report.total). " + (report.isCancelled ? metadataText("Операция отменена. ", "Operation cancelled. ") : "") + (report.error ?? "")
+                preview.string += "\n\n" + summary; status.stringValue = summary
+                setControlsEnabled(false); previewButton.isEnabled = false
+                load(summary: summary)
             case .failure(let error): status.stringValue = error.localizedDescription
             }
         }
     }
+    @objc private func cancelWork() { cancellation?.cancel(); status.stringValue = metadataText("Останавливается между объектами…", "Stopping between items…") }
+    override func windowWillClose(_ notification: Notification) { cancellation?.cancel(); super.windowWillClose(notification) }
+    static func runUISmokeChecks() async throws -> [String] {
+        guard AppRuntime.isSmoke, let directory = AppRuntime.smokeStateDirectory else { throw ExtensionAPIError("Properties smoke requires isolated state.") }
+        let root = directory.appendingPathComponent("metadata-smoke-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let child = root.appendingPathComponent("child")
+        try Data("original bytes".utf8).write(to: child)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: child.path)
+        let originalDate = try FileTools.metadata(child).modified
+        let originalAccessed = try FileTools.metadata(child).accessed
+        let controller = FilePropertiesWindow(url: root, onComplete: {})
+        controller.showWindow(nil); defer { controller.close() }
+        func waitFor(_ check: () -> Bool) async throws {
+            for _ in 0..<1000 {
+                if check() { return }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            throw ExtensionAPIError("Properties smoke timed out.")
+        }
+        try await waitFor { controller.source != nil && controller.previewButton.isEnabled }
+        guard controller.changeGroup.isEnabled, controller.groupPicker.numberOfItems > 0,
+              controller.ownership.stringValue.contains("UID"), controller.ownership.stringValue.contains("GID") else { throw ExtensionAPIError("Properties ownership controls are missing.") }
+        controller.changeGroup.state = .on
+        controller.changePermissions.state = .on; controller.permissions.stringValue = "0700"
+        controller.changeModified.state = .on; controller.modified.dateValue = Date(timeIntervalSince1970: 1_600_000_000)
+        controller.recursive.state = .on; controller.invalidatePreview(); controller.makePreview()
+        try await waitFor { !controller.isWorking }
+        guard let plan = controller.plan, plan.entries.count == 2, controller.saveButton.isEnabled,
+              try FileTools.metadata(child).permissions == 0o600,
+              try FileTools.metadata(child).modified == originalDate,
+              plan.changes.groupID != nil, plan.recursive else { throw ExtensionAPIError("Properties preview changed metadata or omitted its child.") }
+        // Exercise the production asynchronous apply path on an isolated reviewed fixture.
+        controller.performReviewedPlan(plan)
+        try await waitFor { !controller.isWorking && controller.previewButton.isEnabled }
+        guard try FileTools.metadata(child).permissions == 0o700,
+              try FileTools.metadata(child).modified == Date(timeIntervalSince1970: 1_600_000_000),
+              try FileTools.metadata(child).accessed == originalAccessed,
+              try MetadataOwnership.snapshot(url: child).groupID == plan.changes.groupID,
+              try FileTools.metadata(root).modified == Date(timeIntervalSince1970: 1_600_000_000),
+              try String(contentsOf: child, encoding: .utf8) == "original bytes",
+              controller.plan == nil, !controller.saveButton.isEnabled else { throw ExtensionAPIError("Properties apply did not apply recursive dates/group or preserve content and the unselected access date.") }
+        controller.changePermissions.state = .off; controller.changeModified.state = .off; controller.changeGroup.state = .off
+        controller.changeAccessed.state = .on; controller.accessed.dateValue = Date(timeIntervalSince1970: 1_400_000_000)
+        controller.invalidatePreview(); controller.makePreview()
+        try await waitFor { !controller.isWorking }
+        guard let datesOnly = controller.plan, datesOnly.entries.count == 2, datesOnly.recursive,
+              datesOnly.changes.permissions == nil, datesOnly.changes.modified == nil, datesOnly.changes.groupID == nil,
+              datesOnly.changes.accessed != nil else { throw ExtensionAPIError("Properties recursive date-only preview requires unrelated changes.") }
+        // Changing a group choice must discard the reviewed plan, even when the
+        // group checkbox is currently off. The production action is shared by
+        // all date, checkbox and group controls.
+        controller.groupPicker.sendAction(controller.groupPicker.action, to: controller.groupPicker.target)
+        guard controller.plan == nil, !controller.saveButton.isEnabled, controller.preview.string.isEmpty else {
+            throw ExtensionAPIError("Properties group choice retained a stale preview.")
+        }
+        controller.makePreview(); try await waitFor { !controller.isWorking }
+        guard let accessedPlan = controller.plan else { throw ExtensionAPIError("Properties could not rebuild date-only preview.") }
+        controller.performReviewedPlan(accessedPlan)
+        try await waitFor { !controller.isWorking && controller.previewButton.isEnabled }
+        for item in [root, child] {
+            guard try FileTools.metadata(item).accessed == Date(timeIntervalSince1970: 1_400_000_000),
+                  try FileTools.metadata(item).modified == Date(timeIntervalSince1970: 1_600_000_000) else {
+                throw ExtensionAPIError("Properties recursive access-only change lost the modification date.")
+            }
+        }
+        return ["Properties preview preserves bytes and permissions until apply", "Properties asynchronous apply changes recursive permissions, modification dates and a permitted group", "Properties group selection invalidates its reviewed plan", "Properties recursive access-only changes preserve modification dates"]
+    }
 }
+
+@MainActor
+private func metadataText(_ russian: String, _ english: String) -> String { L10n.language == .english ? english : russian }
 
 @MainActor
 final class DirectorySizeWindow: FileToolsWindowController {

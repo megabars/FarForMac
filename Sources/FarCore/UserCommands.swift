@@ -6,15 +6,19 @@ public struct UserCommandError: LocalizedError {
     public init(_ message: String) { errorDescription = message }
 }
 
-public enum UserCommandAction: String, Codable, Sendable { case execute, view, edit }
+public enum UserCommandAction: String, Codable, CaseIterable, Sendable {
+    case execute, view, edit, alternateExecute, alternateView, alternateEdit
+}
 
 public struct UserMenuEntry: Codable, Equatable, Sendable {
     public var title: String
     public var command: String?
     public var children: [UserMenuEntry]?
     public var key: String?
-    public init(title: String, command: String? = nil, children: [UserMenuEntry]? = nil, key: String? = nil) {
+    public var separator: Bool?
+    public init(title: String, command: String? = nil, children: [UserMenuEntry]? = nil, key: String? = nil, separator: Bool = false) {
         self.title = title; self.command = command; self.children = children; self.key = key
+        self.separator = separator ? true : nil
     }
 }
 
@@ -24,11 +28,19 @@ public struct UserFileAssociation: Codable, Equatable, Sendable {
     public var execute: String?
     public var view: String?
     public var edit: String?
-    public init(title: String, mask: String, execute: String? = nil, view: String? = nil, edit: String? = nil) {
+    public var alternateExecute: String?
+    public var alternateView: String?
+    public var alternateEdit: String?
+    public init(title: String, mask: String, execute: String? = nil, view: String? = nil, edit: String? = nil,
+                alternateExecute: String? = nil, alternateView: String? = nil, alternateEdit: String? = nil) {
         self.title = title; self.mask = mask; self.execute = execute; self.view = view; self.edit = edit
+        self.alternateExecute = alternateExecute; self.alternateView = alternateView; self.alternateEdit = alternateEdit
     }
     public func command(for action: UserCommandAction) -> String? {
-        switch action { case .execute: return execute; case .view: return view; case .edit: return edit }
+        switch action {
+        case .execute: return execute; case .view: return view; case .edit: return edit
+        case .alternateExecute: return alternateExecute; case .alternateView: return alternateView; case .alternateEdit: return alternateEdit
+        }
     }
 }
 
@@ -84,14 +96,14 @@ public struct UserCommandConfiguration: Codable, Equatable, Sendable {
         func menu(_ value: Any) throws {
             guard let entries = value as? [Any] else { throw UserCommandError("Поле menu/children должно быть массивом.") }
             for entry in entries {
-                let object = try keys(entry, allowed: ["title", "command", "children", "key"])
+                let object = try keys(entry, allowed: ["title", "command", "children", "key", "separator"])
                 if let children = object["children"] { try menu(children) }
             }
         }
         let root = try keys(value, allowed: ["version", "menu", "associations"])
         if let entries = root["menu"] { try menu(entries) }
         if let entries = root["associations"] as? [Any] {
-            for entry in entries { _ = try keys(entry, allowed: ["title", "mask", "execute", "view", "edit"]) }
+            for entry in entries { _ = try keys(entry, allowed: ["title", "mask", "execute", "view", "edit", "alternateExecute", "alternateView", "alternateEdit"]) }
         }
     }
 
@@ -111,13 +123,20 @@ public struct UserCommandConfiguration: Codable, Equatable, Sendable {
                 count += 1
                 guard count <= 512 else { throw UserCommandError("В меню допустимо не более 512 пунктов.") }
                 try title(entry.title)
+                if entry.separator == true {
+                    guard entry.command == nil, entry.children == nil, entry.key == nil else {
+                        throw UserCommandError("Разделитель меню не может содержать команду, подменю или клавишу.")
+                    }
+                    continue
+                }
                 guard (entry.command != nil) != (entry.children != nil) else {
                     throw UserCommandError("Пункт «\(entry.title)» должен содержать либо command, либо children.")
                 }
                 if let key = entry.key {
-                    guard key.count == 1, key.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) }),
-                          usedKeys.insert(key.lowercased()).inserted else {
-                        throw UserCommandError("Клавиша пункта должна быть одной буквой/цифрой и не повторяться в этом меню.")
+                    let characterKey = key.count == 1 && key.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) }
+                    let functionKey = key.uppercased().hasPrefix("F") && Int(key.dropFirst()).map { (1...24).contains($0) && "F\($0)" == key.uppercased() } == true
+                    guard characterKey || functionKey, usedKeys.insert(key.lowercased()).inserted else {
+                        throw UserCommandError("Клавиша пункта должна быть одной буквой/цифрой или F1–F24 и не повторяться в этом меню.")
                     }
                 }
                 if let command = entry.command { try UserCommandExpander.validate(command) }
@@ -132,10 +151,10 @@ public struct UserCommandConfiguration: Codable, Equatable, Sendable {
         for association in associations {
             try title(association.title)
             _ = try FileMask(association.mask)
-            guard association.execute != nil || association.view != nil || association.edit != nil else {
+            guard UserCommandAction.allCases.contains(where: { association.command(for: $0) != nil }) else {
                 throw UserCommandError("Ассоциация «\(association.title)» не содержит команд.")
             }
-            for action in [UserCommandAction.execute, .view, .edit] {
+            for action in UserCommandAction.allCases {
                 if let command = association.command(for: action) { try UserCommandExpander.validate(command) }
             }
         }
@@ -155,74 +174,13 @@ public struct UserCommandContext: Sendable {
     public let markedFiles: [URL]
     public let activeDirectory: URL
     public let passiveDirectory: URL
-    public init(currentFile: URL?, markedFiles: [URL], activeDirectory: URL, passiveDirectory: URL) {
+    public let passiveCurrentFile: URL?
+    public let passiveMarkedFiles: [URL]
+    public init(currentFile: URL?, markedFiles: [URL], activeDirectory: URL, passiveDirectory: URL,
+                passiveCurrentFile: URL? = nil, passiveMarkedFiles: [URL] = []) {
         self.currentFile = currentFile; self.markedFiles = markedFiles
         self.activeDirectory = activeDirectory; self.passiveDirectory = passiveDirectory
-    }
-}
-
-public enum UserCommandExpander {
-    private static let names: Set<String> = ["name", "path", "marked", "active", "passive"]
-    public static func validate(_ template: String) throws { _ = try tokens(template) }
-    private static func tokens(_ template: String) throws -> [(Range<String.Index>, String)] {
-        guard !template.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              template.utf8.count <= 16_384, !template.contains("\0") else {
-            throw UserCommandError("Команда должна быть непустой, без NUL и не длиннее 16 КиБ.")
-        }
-        var result: [(Range<String.Index>, String)] = []
-        var quote: Character?, escaped = false
-        var index = template.startIndex
-        let boundaries = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "|&;()< >"))
-        func boundary(_ character: Character) -> Bool { character.unicodeScalars.allSatisfy { boundaries.contains($0) } }
-        while index < template.endIndex {
-            let character = template[index]
-            let next = template.index(after: index)
-            if character == "{" {
-                guard let close = template[next...].firstIndex(of: "}") else { throw UserCommandError("Не закрыт параметр команды {…}.") }
-                let name = String(template[next..<close])
-                guard names.contains(name) else { throw UserCommandError("Неизвестный параметр команды {\(name)}.") }
-                let end = template.index(after: close)
-                guard quote == nil, !escaped,
-                      index == template.startIndex || boundary(template[template.index(before: index)]),
-                      end == template.endIndex || boundary(template[end]) else {
-                    throw UserCommandError("Параметр {\(name)} должен быть отдельным словом без кавычек и экранирования.")
-                }
-                result.append((index..<end, name)); index = end; continue
-            }
-            if escaped { escaped = false }
-            else if character == "\\", quote != "'" { escaped = true }
-            else if let current = quote { if character == current { quote = nil } }
-            else if character == "'" || character == "\"" { quote = character }
-            index = next
-        }
-        if !result.isEmpty, template.contains("$(") || template.contains("$'") || template.contains("$\"") || template.contains("`") || template.contains("<<") || template.contains("\n") || template.contains("\r") {
-            throw UserCommandError("Параметры поддерживаются в однострочных командах без подстановки команд и here-document; используйте отдельный скрипт.")
-        }
-        return result
-    }
-
-    public static func expand(_ template: String, context: UserCommandContext) throws -> String {
-        let substitutions = try tokens(template)
-        var result = "", cursor = template.startIndex
-        for (range, name) in substitutions {
-            let values: [String]
-            switch name {
-            case "name", "path":
-                guard let file = context.currentFile else { throw UserCommandError("Для {\(name)} выберите текущий файл.") }
-                values = [name == "name" ? file.lastPathComponent : file.path]
-            case "marked":
-                guard !context.markedFiles.isEmpty else { throw UserCommandError("Для {marked} пометьте хотя бы один файл.") }
-                values = context.markedFiles.map(\.path)
-            case "active": values = [context.activeDirectory.path]
-            default: values = [context.passiveDirectory.path]
-            }
-            result += template[cursor..<range.lowerBound]
-            result += try values.map(ShellCommand.quoteArgument).joined(separator: " ")
-            guard result.utf8.count <= 1_048_576 else { throw UserCommandError("Развёрнутая команда превышает 1 МиБ.") }
-            cursor = range.upperBound
-        }
-        result += template[cursor...]
-        return result
+        self.passiveCurrentFile = passiveCurrentFile; self.passiveMarkedFiles = passiveMarkedFiles
     }
 }
 
@@ -256,6 +214,10 @@ public struct UserCommandStore: Sendable {
             return LoadedUserMenu(entries: try UserCommandConfiguration.decode(data).menu, source: local, isLocal: true)
         }
         return LoadedUserMenu(entries: try loadGlobal().menu, source: globalURL, isLocal: false)
+    }
+    public func importFarMenu(at url: URL) throws -> FarMenuImportResult {
+        guard let data = try read(url) else { throw UserCommandError("Файл меню не найден.") }
+        return try FarMenuImporter.parse(data)
     }
     private func read(_ url: URL) throws -> Data? {
         let descriptor = open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
@@ -319,11 +281,13 @@ public struct UserCommandStore: Sendable {
         { "title": "Показать имя файла", "key": "1", "command": "printf '%s\\n' {name}" },
         { "title": "Каталоги", "children": [
           { "title": "Список активной папки", "command": "ls -la -- {active}" },
-          { "title": "Список пассивной папки", "command": "ls -la -- {passive}" }
+          { "title": "Список пассивной папки", "command": "ls -la -- {passive}" },
+          { "title": "Ввести текст", "command": "printf '%s\\n' {input:Текст|Пример}" },
+          { "title": "Список выбранных путей", "command": "cat {list}" }
         ] }
       ],
       "associations": [
-        { "title": "Сведения о файле", "mask": "*.txt,*.md", "execute": "file -- {path}" }
+        { "title": "Сведения о файле", "mask": "*.txt,*.md", "execute": "file -- {path}", "alternateView": "cat -- {path}" }
       ]
     }
     """#

@@ -1,14 +1,16 @@
 import Foundation
+import CoreFoundation
 import Darwin
 
 public enum FileDescriptionError: Error, LocalizedError, Equatable {
-    case changed, tooLarge, invalidEncoding, unsupportedFormat, invalidName, invalidDescription, notRegularFile
+    case changed, tooLarge, invalidEncoding, unrepresentableEncoding, unsupportedFormat, invalidName, invalidDescription, notRegularFile
     case io(String)
     public var errorDescription: String? {
         switch self {
         case .changed: return "Файл descript.ion изменился. Перечитайте описания перед сохранением."
         case .tooLarge: return "Файл описаний превышает допустимый размер 2 МиБ или 20 000 строк."
-        case .invalidEncoding: return "Файл описаний должен быть корректным UTF-8. Исходные байты сохранены; преобразуйте кодировку явно."
+        case .invalidEncoding: return "Файл описаний не соответствует выбранной кодировке. Выберите UTF-8, Windows-1251 или DOS-866 явно; исходные байты сохранены."
+        case .unrepresentableEncoding: return "Имя или описание нельзя записать в выбранной кодировке без потери символов. Исходные байты сохранены."
         case .unsupportedFormat: return "Неоднозначный формат descript.ion: проверьте кавычки, имена и повторяющиеся записи."
         case .invalidName: return "Это имя нельзя представить в descript.ion: недопустимы кавычки, переносы строк и пути."
         case .invalidDescription: return "Описание слишком длинное или содержит недопустимые управляющие символы."
@@ -18,13 +20,30 @@ public enum FileDescriptionError: Error, LocalizedError, Equatable {
     }
 }
 
-/// A bounded UTF-8 descript.ion snapshot. Untouched records retain their exact
-/// bytes, spacing, order, BOM and line endings. Legacy code pages are refused
-/// rather than guessed or silently rewritten. Filenames are matched exactly, without case folding.
+/// Legacy code pages are explicit: no heuristic decoding or lossy fallback.
+public enum FileDescriptionEncoding: String, Codable, CaseIterable, Sendable {
+    case utf8, windows1251, dos866
+    public var title: String {
+        switch self { case .utf8: return "UTF-8"; case .windows1251: return "Windows-1251"; case .dos866: return "DOS-866" }
+    }
+    public var stringEncoding: String.Encoding {
+        switch self {
+        case .utf8: return .utf8
+        case .windows1251: return .windowsCP1251
+        case .dos866: return String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.dosRussian.rawValue)))
+        }
+    }
+    public static func directoryKey(_ directory: URL) -> String { directory.standardizedFileURL.resolvingSymlinksInPath().path }
+}
+
+/// A bounded descript.ion snapshot. Untouched records retain their exact
+/// bytes, spacing, order, BOM and line endings. Legacy code pages are selected
+/// explicitly and must round-trip exactly. Filenames are matched without case folding.
 public struct FileDescriptions: Sendable {
     public static let maximumSize = 2 * 1_024 * 1_024
     public static let maximumLines = 20_000
     public let directory: URL
+    public let encoding: FileDescriptionEncoding
     public private(set) var descriptions: [String: String]
     private let originalDescriptions: [String: String]
     private let original: Data?
@@ -41,7 +60,7 @@ public struct FileDescriptions: Sendable {
         }
     }
 
-    public static func load(directory: URL) throws -> Self {
+    public static func load(directory: URL, encoding: FileDescriptionEncoding = .utf8) throws -> Self {
         guard directory.isFileURL else { throw FileDescriptionError.invalidName }
         let directory = directory.standardizedFileURL.resolvingSymlinksInPath()
         let fd = try openDirectory(directory)
@@ -49,12 +68,14 @@ public struct FileDescriptions: Sendable {
         let directoryID = try directoryID(fd)
         let (data, identity) = try read(fd)
         let bytes = data ?? Data()
-        let bom = bytes.starts(with: [0xEF, 0xBB, 0xBF])
-        guard let text = String(data: bom ? Data(bytes.dropFirst(3)) : bytes, encoding: .utf8) else {
+        let bom = encoding == .utf8 && bytes.starts(with: [0xEF, 0xBB, 0xBF])
+        let body = bom ? Data(bytes.dropFirst(3)) : bytes
+        guard let text = String(data: body, encoding: encoding.stringEncoding),
+              text.data(using: encoding.stringEncoding, allowLossyConversion: false) == body else {
             throw FileDescriptionError.invalidEncoding
         }
         let parsed = try parse(text)
-        return Self(directory: directory, descriptions: parsed.1, originalDescriptions: parsed.1,
+        return Self(directory: directory, encoding: encoding, descriptions: parsed.1, originalDescriptions: parsed.1,
                     original: data, identity: identity, directoryIdentity: directoryID, lines: parsed.0,
                     bom: bom, ending: parsed.0.first(where: { !$0.ending.isEmpty })?.ending ?? "\r\n")
     }
@@ -81,7 +102,7 @@ public struct FileDescriptions: Sendable {
     /// coordination. An uncooperative external writer can still race the final
     /// check and rename; this is not a filesystem compare-and-swap operation.
     @discardableResult public func save() throws -> Self {
-        if descriptions == originalDescriptions { return self }
+        if descriptions == originalDescriptions { try verifyCurrent(); return self }
         let data = try encoded()
         let fd = try Self.openDirectory(directory)
         defer { close(fd) }
@@ -125,9 +146,35 @@ public struct FileDescriptions: Sendable {
         }
         if let operationError { throw operationError }
         if let coordinationError { throw FileDescriptionError.io(coordinationError.localizedDescription) }
-        let saved = try Self.load(directory: directory)
+        let saved = try Self.load(directory: directory, encoding: encoding)
         guard saved.original == data else { throw FileDescriptionError.changed }
         return saved
+    }
+
+    /// Verify even an unmodified snapshot before using it as operation metadata.
+    public func verifyCurrent() throws {
+        let fd = try Self.openDirectory(directory); defer { close(fd) }
+        try verify(fd)
+    }
+
+    /// A completely emptied control file may be removed after a merged move.
+    /// Nonempty bytes (including unassociated records / blank formatting) survive.
+    @discardableResult func removeEmptyFileIfUnchanged() throws -> Bool {
+        guard original == Data(), descriptions.isEmpty else { return original == nil }
+        let fd = try Self.openDirectory(directory); defer { close(fd) }
+        let url = directory.appendingPathComponent("descript.ion")
+        var operationError: Error?, coordinationError: NSError?
+        NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: url, options: .forDeleting, error: &coordinationError) { coordinated in
+            do {
+                guard coordinated.standardizedFileURL == url else { throw FileDescriptionError.changed }
+                try verify(fd)
+                guard unlinkat(fd, "descript.ion", 0) == 0 else { throw Self.ioError() }
+                _ = fsync(fd)
+            } catch { operationError = error }
+        }
+        if let operationError { throw operationError }
+        if let coordinationError { throw FileDescriptionError.io(coordinationError.localizedDescription) }
+        return true
     }
 
     private func verify(_ fd: Int32) throws {
@@ -166,7 +213,9 @@ public struct FileDescriptions: Sendable {
             text += record(name, finalEnding: ending)
         }
         var data = bom ? Data([0xEF, 0xBB, 0xBF]) : Data()
-        data.append(contentsOf: text.utf8)
+        guard let body = text.data(using: encoding.stringEncoding, allowLossyConversion: false),
+              String(data: body, encoding: encoding.stringEncoding) == text else { throw FileDescriptionError.unrepresentableEncoding }
+        data.append(body)
         guard data.count <= Self.maximumSize else { throw FileDescriptionError.tooLarge }
         _ = try Self.parse(text)
         return data

@@ -8,6 +8,7 @@ public struct FileToolItem: Sendable {
     public let size: Int64
     public let permissions: UInt16
     public let modified: Date
+    public let accessed: Date
     fileprivate let device: dev_t
     fileprivate let inode: ino_t
     fileprivate let mode: mode_t
@@ -65,21 +66,22 @@ public enum FileTools {
         return items
     }
 
-    /// Literal template, not FAR wildcard syntax: {name} = stem, {ext} = extension
-    /// without a dot, {n} = one-based selection index. The user must review this plan.
-    public static func renamePlan(_ urls: [URL], template: String) throws -> [BatchRenameEntry] {
+    /// Builds a reviewed plan using either the literal {name}/{ext}/{n} template
+    /// or FAR's destination-name wildcard conversion. Neither mode changes folders.
+    public static func renamePlan(_ urls: [URL], template: String, mode: BatchRenameMode = .template) throws -> [BatchRenameEntry] {
         let items = try snapshot(urls)
         guard !items.isEmpty else { throw Failure("Нет выбранных объектов.") }
         let remainder = template.replacingOccurrences(of: "{name}", with: "")
             .replacingOccurrences(of: "{ext}", with: "").replacingOccurrences(of: "{n}", with: "")
-        guard !remainder.contains("{"), !remainder.contains("}") else {
+        guard mode != .template || (!remainder.contains("{") && !remainder.contains("}")) else {
             throw Failure("Допустимы только подстановки {name}, {ext}, {n}.")
         }
+        let mask = mode == .farMask ? try FilenameRenameMask(template) : nil
         let plan = try items.enumerated().map { index, source -> BatchRenameEntry in
             let ext = source.isDirectory ? "" : source.url.pathExtension
             let stem = ext.isEmpty ? source.url.lastPathComponent : source.url.deletingPathExtension().lastPathComponent
             // Split the original template so braces in filenames are never expanded again.
-            let name = template.components(separatedBy: "{name}").map {
+            let name = try mask?.destinationName(for: source.url.lastPathComponent) ?? template.components(separatedBy: "{name}").map {
                 $0.components(separatedBy: "{ext}").map {
                     $0.replacingOccurrences(of: "{n}", with: String(index + 1))
                 }.joined(separator: ext)
@@ -94,19 +96,37 @@ public enum FileTools {
     /// Revalidates the reviewed plan. Exclusive rename prevents racing writers from
     /// being overwritten. On failure, completed renames remain and are reported.
     @discardableResult
-    public static func executeRename(_ plan: [BatchRenameEntry]) throws -> Int {
+    public static func executeRename(_ plan: [BatchRenameEntry], propagateDescriptions: Bool = true,
+                                     descriptionEncodings: [String: FileDescriptionEncoding] = [:]) throws -> Int {
         try validate(plan)
-        var completed = 0
+        let groups = Dictionary(grouping: plan, by: { FileDescriptionEncoding.directoryKey($0.source.url.deletingLastPathComponent()) })
+        var descriptions = [String: FileDescriptionRenamePlan]()
+        if propagateDescriptions {
+            for (key, entries) in groups {
+                // An explicitly selected control file is ordinary user data; do not
+                // concurrently rewrite that same file as automatic metadata.
+                guard !entries.contains(where: { $0.source.url.lastPathComponent == "descript.ion" || $0.destination.lastPathComponent == "descript.ion" }) else { continue }
+                descriptions[key] = try FileDescriptionRenamePlan.prepare(directory: entries[0].source.url.deletingLastPathComponent(), encoding: descriptionEncodings[key] ?? .utf8)
+            }
+        }
+        var completed = [BatchRenameEntry](), operationError: Error?
         for entry in plan {
             do {
                 try verify(entry.source)
                 guard renameatx_np(AT_FDCWD, entry.source.url.path, AT_FDCWD, entry.destination.path, UInt32(RENAME_EXCL)) == 0 else {
                     throw posix("Переименовать", entry.source.url)
                 }
-                completed += 1
-            } catch { throw partial(error, completed, plan.count) }
+                completed.append(entry)
+            } catch { operationError = error; break }
         }
-        return completed
+        var warnings = [String]()
+        for (key, entries) in Dictionary(grouping: completed, by: { FileDescriptionEncoding.directoryKey($0.source.url.deletingLastPathComponent()) }) {
+            do { try descriptions[key]?.apply(completedRenames: entries.map { (source: $0.source.url.lastPathComponent, destination: $0.destination.lastPathComponent) }) }
+            catch { warnings.append("Описания в «\(key)» не обновлены: \(error.localizedDescription)") }
+        }
+        if let operationError { warnings.insert(operationError.localizedDescription, at: 0) }
+        if !warnings.isEmpty { throw partial(Failure(warnings.joined(separator: "\n")), completed.count, plan.count) }
+        return completed.count
     }
 
     public static func metadata(_ url: URL) throws -> FileToolItem {
@@ -302,6 +322,7 @@ public enum FileTools {
                      isSymbolicLink: info.st_mode & S_IFMT == S_IFLNK, size: Int64(info.st_size),
                      permissions: UInt16(info.st_mode & 0o7777),
                      modified: Date(timeIntervalSince1970: Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1e9),
+                     accessed: Date(timeIntervalSince1970: Double(info.st_atimespec.tv_sec) + Double(info.st_atimespec.tv_nsec) / 1e9),
                      device: info.st_dev, inode: info.st_ino, mode: info.st_mode)
     }
     private static func posix(_ action: String, _ url: URL) -> Failure {

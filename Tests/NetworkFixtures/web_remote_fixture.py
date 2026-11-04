@@ -70,6 +70,10 @@ class DAV(http.server.BaseHTTPRequestHandler):
             open(os.path.join(root, "credential-leak"), "w").write(self.headers.get("Authorization", ""))
             return self.reply(200, b"leaked")
         if p == "/slow": time.sleep(3); return self.reply(200, b"slow")
+        if p == "/unknown-length-search":
+            self.send_response(200); self.send_header("Connection", "close"); self.end_headers()
+            self.wfile.write(b"needle" * 8192); self.wfile.flush(); self.close_connection = True
+            return
         if p not in files: return self.reply(404)
         if self.headers.get("If-Match") and self.headers["If-Match"] != etags.get(p): return self.reply(412)
         data = files[p]
@@ -95,9 +99,19 @@ class DAV(http.server.BaseHTTPRequestHandler):
     def do_MOVE(self):
         if not self.authorized(): return
         src = self.path_value(); dest = urllib.parse.unquote(urllib.parse.urlsplit(self.headers["Destination"]).path)
-        if src not in files: return self.reply(404)
-        if dest in files and self.headers.get("Overwrite") == "F": return self.reply(412)
-        files[dest] = files.pop(src); etags[dest] = etags.pop(src, '"v1"'); self.reply(201)
+        if src not in files and src not in directories: return self.reply(404)
+        if (dest in files or dest in directories) and self.headers.get("Overwrite") == "F": return self.reply(412)
+        if src in files:
+            files[dest] = files.pop(src); etags[dest] = etags.pop(src, '"v1"')
+        else:
+            for old in list(files):
+                if old.startswith(src + "/"):
+                    new = dest + old[len(src):]
+                    files[new] = files.pop(old); etags[new] = etags.pop(old, '"v1"')
+            for old in list(directories):
+                if old == src or old.startswith(src + "/"):
+                    directories.remove(old); directories.add(dest + old[len(src):])
+        self.reply(201)
     def do_DELETE(self):
         if not self.authorized(): return
         p = self.path_value()
@@ -165,13 +179,28 @@ class FTP(socketserver.StreamRequestHandler):
                     files[target] = data
                 data_socket.close(); passive.close(); self.send("226 Complete")
             elif command == "RNFR": source = normalize(arg); self.send("350 Rename destination required")
-            elif command == "RNTO": files[normalize(arg)] = files.pop(source); self.send("250 Renamed")
+            elif command == "RNTO":
+                target = normalize(arg)
+                if source in files:
+                    files[target] = files.pop(source); self.send("250 Renamed")
+                elif source in directories and target not in directories and target not in files:
+                    for old in list(files):
+                        if old.startswith(source + "/"): files[target + old[len(source):]] = files.pop(old)
+                    for old in list(directories):
+                        if old == source or old.startswith(source + "/"):
+                            directories.remove(old); directories.add(target + old[len(source):])
+                    self.send("250 Renamed")
+                else: self.send("550 Missing or conflicting destination")
             elif command == "DELE":
                 p = normalize(arg)
                 if p in files: del files[p]; self.send("250 Deleted")
                 else: self.send("550 Missing")
             elif command == "MKD": directories.add(normalize(arg)); self.send("257 Created")
-            elif command == "RMD": directories.remove(normalize(arg)); self.send("250 Removed")
+            elif command == "RMD":
+                target = normalize(arg)
+                if target not in directories or any(p.startswith(target + "/") for p in list(files) + list(directories)):
+                    self.send("550 Missing or nonempty directory")
+                else: directories.remove(target); self.send("250 Removed")
             elif command == "QUIT": self.send("221 Bye"); return
             else: self.send("502 Unsupported")
 

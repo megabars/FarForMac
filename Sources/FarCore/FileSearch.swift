@@ -6,7 +6,7 @@ public enum SearchFileKind: String, Codable, CaseIterable, Sendable {
 }
 
 public enum SearchContentMode: String, Codable, CaseIterable, Sendable {
-    case none, literal, regex
+    case none, literal, regex, hex
 }
 
 public struct SearchOptions: Codable, Sendable {
@@ -24,6 +24,11 @@ public struct SearchOptions: Codable, Sendable {
     public var modifiedBefore: Date?
     public var maximumResults: Int = 10_000
     public var maximumContentBytes: Int = 16 * 1_024 * 1_024
+    /// Missing in saved v1 options means UTF-8, preserving older searches.
+    public var contentEncoding: ViewerEncoding?
+    /// Missing in earlier saved searches preserves local-only traversal.
+    public var searchArchives: Bool?
+    public var searchNestedArchives: Bool?
 
     public init(roots: [URL]) { self.roots = roots }
 }
@@ -45,8 +50,10 @@ public final class SearchCancellation: @unchecked Sendable {
     public var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
 }
 
-public struct SearchResult: Identifiable, Codable, Sendable {
+public struct SearchResult: Identifiable, Codable, Sendable, Equatable {
     public var id: String { url.path }
+    let capturedIdentityPath: String?
+    var searchIdentityPath: String { capturedIdentityPath ?? url.path }
     public let url: URL
     public let name: String
     public let isDirectory: Bool
@@ -55,6 +62,8 @@ public struct SearchResult: Identifiable, Codable, Sendable {
     public let modified: Date?
     public let snippet: String?
     public let lineNumber: Int?
+    /// Zero-based raw byte position for HEX results; text results use lineNumber.
+    public let byteOffset: Int64?
     fileprivate let stamp: SearchStamp
     fileprivate let contentStamp: SearchStamp?
 
@@ -67,9 +76,23 @@ public struct SearchResult: Identifiable, Codable, Sendable {
         }
         let stamp = SearchStamp(value)
         guard let kind = stamp.kind else { throw SearchProblem("Этот тип объекта не поддерживается временной панелью.") }
-        return SearchResult(url: url, name: url.lastPathComponent, isDirectory: kind == .directory,
+        return SearchResult(capturedIdentityPath: SearchLocation.localKey(url), url: url, name: url.lastPathComponent, isDirectory: kind == .directory,
                             isSymbolicLink: kind == .symbolicLink, size: stamp.size, modified: stamp.modified,
-                            snippet: nil, lineNumber: nil, stamp: stamp, contentStamp: nil)
+                            snippet: nil, lineNumber: nil, byteOffset: nil, stamp: stamp, contentStamp: nil)
+    }
+
+    func validateSavedReference() throws {
+        guard stamp.kind != nil, stamp.size >= 0, stamp.size == size,
+              (stamp.kind == .directory) == isDirectory, (stamp.kind == .symbolicLink) == isSymbolicLink,
+              (0..<1_000_000_000).contains(stamp.nanoseconds),
+              stamp.changedNanoseconds.map({ (0..<1_000_000_000).contains($0) }) ?? true,
+              modified == stamp.modified else { throw PanelSessionError("Неверные метаданные локального снимка.") }
+        if let capturedIdentityPath { try SavedReferenceValidation.localPath(capturedIdentityPath) }
+        if let contentStamp {
+            guard contentStamp.kind == .file, contentStamp.size >= 0,
+                  (0..<1_000_000_000).contains(contentStamp.nanoseconds),
+                  contentStamp.changedNanoseconds.map({ (0..<1_000_000_000).contains($0) }) ?? true else { throw PanelSessionError("Неверный снимок содержимого.") }
+        }
     }
 
     /// Rejects stale results before navigation, viewing or editing. A content result also
@@ -106,13 +129,14 @@ public struct SearchSummary: Sendable {
     public let cancelled: Bool
     public let limitReached: Bool
     public var summary: String {
-        let status = cancelled ? "Поиск отменён" : (limitReached ? "Достигнут предел результатов" : (errors > 0 ? "Поиск завершён частично" : "Поиск завершён"))
+        let status = cancelled ? "Поиск отменён" : (limitReached ? "Достигнут предел поиска" : (errors > 0 ? "Поиск завершён частично" : "Поиск завершён"))
         return "\(status). Проверено: \(scanned), найдено: \(matches), ошибок/пропусков: \(errors)."
     }
 }
 
 public enum SearchEvent: Sendable {
     case result(SearchResult)
+    case archiveResult(ProviderSearchResult)
     case issue(SearchIssue)
     case progress(SearchProgress)
 }
@@ -124,22 +148,39 @@ public enum SearchEvent: Sendable {
 /// by name or UF_HIDDEN; explicitly selected roots are still examined.
 /// Entries stream from readdir, with at most 128 open directory levels. Only ancestor
 /// identities are retained, preventing cycles without an unbounded visited-path set.
-/// Results are streamed and never retained by the worker. UTF-8 content must fit the
-/// byte cap in full; oversized/invalid/unreadable/changed files produce visible issues.
+/// Results are streamed and never retained by the worker. Literal content is decoded
+/// page by page with a bounded overlap; regex retains its full-file byte cap.
+/// Invalid/unreadable/changed files produce visible issues even after an early match.
 /// Regex deadlines are cooperative ICU deadlines, not hard real-time guarantees.
 public enum SearchEngine {
     public static func validate(_ request: SearchRequest) throws {
         _ = try SearchPlan(request)
     }
 
-    public static func run(_ request: SearchRequest, cancellation: SearchCancellation,
+    public static func run(_ request: SearchRequest, archiveLimits: ArchiveSearchLimits = .default, cancellation: SearchCancellation,
                            onEvent: @escaping (SearchEvent) -> Void) -> SearchSummary {
         do {
-            return SearchWorker(try SearchPlan(request), cancellation, onEvent).run()
+            return try SearchWorker(try SearchPlan(request), request, archiveLimits, cancellation, onEvent).run()
         } catch {
             onEvent(.issue(SearchIssue(path: "", message: error.localizedDescription)))
             return SearchSummary(scanned: 0, matches: 0, errors: 1,
                                  cancelled: cancellation.isCancelled, limitReached: false)
+        }
+    }
+}
+
+extension SearchEngine {
+    static func runShared(_ request: SearchRequest, archiveLimits: ArchiveSearchLimits,
+                          archiveBudget: ArchiveSearchBudget, cancellation: SearchCancellation,
+                          providerCancellation: ProviderSearchCancellation,
+                          shouldStop: @escaping () -> Bool,
+                          onEvent: @escaping (SearchEvent) -> Void) -> SearchSummary {
+        do {
+            return try SearchWorker(try SearchPlan(request), request, archiveLimits, cancellation, onEvent,
+                archiveBudget: archiveBudget, shouldStop: shouldStop, providerCancellation: providerCancellation).run()
+        } catch {
+            onEvent(.issue(SearchIssue(path: "", message: error.localizedDescription)))
+            return SearchSummary(scanned: 0, matches: 0, errors: 1, cancelled: cancellation.isCancelled, limitReached: false)
         }
     }
 }
@@ -157,10 +198,13 @@ fileprivate struct SearchStamp: Equatable, Codable, Sendable {
     let size: Int64
     let seconds: Int
     let nanoseconds: Int
+    let changedSeconds: Int?
+    let changedNanoseconds: Int?
     init(_ value: stat) {
         device = value.st_dev; inode = value.st_ino; mode = value.st_mode
         size = Int64(value.st_size)
         seconds = value.st_mtimespec.tv_sec; nanoseconds = value.st_mtimespec.tv_nsec
+        changedSeconds = value.st_ctimespec.tv_sec; changedNanoseconds = value.st_ctimespec.tv_nsec
     }
     var modified: Date { Date(timeIntervalSince1970: Double(seconds) + Double(nanoseconds) / 1_000_000_000) }
     var identity: SearchIdentity { SearchIdentity(device: device, inode: inode) }
@@ -202,6 +246,8 @@ private struct SearchPlan {
     let options: SearchOptions
     let mask: FileMask
     let content: NSRegularExpression?
+    let bytes: [UInt8]?
+    var hasContent: Bool { content != nil || bytes != nil }
     init(_ request: SearchRequest) throws {
         let value = request.options
         guard !value.roots.isEmpty, value.roots.count <= 128 else {
@@ -214,8 +260,9 @@ private struct SearchPlan {
         guard (1...10_000).contains(value.maximumResults) else {
             throw SearchProblem("Предел результатов должен быть от 1 до 10000.")
         }
-        guard (1...(64 * 1_024 * 1_024)).contains(value.maximumContentBytes) else {
-            throw SearchProblem("Предел чтения содержимого должен быть от 1 байта до 64 МиБ.")
+        let maximum = (value.contentMode == .literal || value.contentMode == .hex) ? 4_096 * 1_024 * 1_024 : 64 * 1_024 * 1_024
+        guard (1...maximum).contains(value.maximumContentBytes) else {
+            throw SearchProblem("Предел чтения: до 4096 МиБ для подстроки и HEX, до 64 МиБ для Regex.")
         }
         guard value.minSize.map({ $0 >= 0 }) ?? true, value.maxSize.map({ $0 >= 0 }) ?? true,
               value.minSize == nil || value.maxSize == nil || value.minSize! <= value.maxSize! else {
@@ -227,7 +274,8 @@ private struct SearchPlan {
             throw SearchProblem("Неверные границы даты изменения.")
         }
         mask = try FileMask(value.namePattern, groups: request.maskGroups)
-        if value.contentMode == .none {
+        bytes = value.contentMode == .hex ? try SearchContentScanner.hexBytes(value.contentQuery) : nil
+        if value.contentMode == .none || value.contentMode == .hex {
             content = nil
         } else {
             guard !value.contentQuery.isEmpty, value.contentQuery.utf16.count <= 4_096 else {
@@ -256,10 +304,30 @@ private final class SearchWorker {
     // distinct final symbolic links and hard-link names remain distinct results.
     var emitted = Set<String>()
     var currentPath = ""
-    var stopped: Bool { cancellation.isCancelled || limitReached }
+    var archives: ArchiveSearchWorker?
+    let shouldStop: () -> Bool
+    var stopped: Bool { cancellation.isCancelled || limitReached || shouldStop() || (archives?.limitReached ?? false) }
 
-    init(_ plan: SearchPlan, _ cancellation: SearchCancellation, _ onEvent: @escaping (SearchEvent) -> Void) {
-        self.plan = plan; self.cancellation = cancellation; self.onEvent = onEvent
+    init(_ plan: SearchPlan, _ request: SearchRequest, _ archiveLimits: ArchiveSearchLimits,
+         _ cancellation: SearchCancellation, _ onEvent: @escaping (SearchEvent) -> Void,
+         archiveBudget: ArchiveSearchBudget? = nil, shouldStop: @escaping () -> Bool = { false },
+         providerCancellation: ProviderSearchCancellation? = nil) throws {
+        self.plan = plan; self.cancellation = cancellation; self.onEvent = onEvent; self.shouldStop = shouldStop
+        if plan.options.searchArchives == true {
+            archives = try ArchiveSearchWorker(request: request, limits: archiveLimits,
+                cancellation: providerCancellation ?? ProviderSearchCancellation(search: cancellation),
+                shouldStop: { [weak self] in self?.stopped != false },
+                visit: { [weak self] path in
+                    guard let self else { return }; self.scanned += 1; self.currentPath = path; self.progress()
+                }, result: { [weak self] result in
+                    guard let self, !self.stopped else { return }
+                    self.matches += 1; self.onEvent(.archiveResult(result))
+                    if self.matches >= plan.options.maximumResults { self.limitReached = true }
+                }, issue: { [weak self] path, error in
+                    guard let self else { return }; self.errors += 1
+                    self.onEvent(.issue(SearchIssue(path: path, message: error.localizedDescription)))
+                }, progress: { [weak self] in self?.progress() }, sharedBudget: archiveBudget)
+        }
     }
 
     func run() -> SearchSummary {
@@ -277,7 +345,7 @@ private final class SearchWorker {
         }
         progress()
         return SearchSummary(scanned: scanned, matches: matches, errors: errors,
-                             cancelled: cancellation.isCancelled, limitReached: limitReached)
+                             cancelled: cancellation.isCancelled, limitReached: limitReached || (archives?.limitReached ?? false))
     }
 
     func issue(_ url: URL, _ message: String) {
@@ -316,29 +384,44 @@ private final class SearchWorker {
                     if let kind = stamp.kind, plan.options.kinds.contains(kind),
                        passesMetadata(stamp), !emitted.contains(resultKey(url)),
                        try plan.mask.matchesChecked(url.lastPathComponent) {
-                        var contentMatch: (snippet: String, line: Int)?
-                        if plan.content != nil {
+                        var contentMatch: SearchContentMatch?
+                        if plan.hasContent {
                             // Links are content candidates only when explicitly followed.
                             if target.kind == .file && (kind != .symbolicLink || plan.options.followSymbolicLinks) {
                                 contentMatch = try searchContent(url, parent: parent, name: name, expected: target,
                                                                 follow: kind == .symbolicLink)
                             }
                         }
-                        if !stopped && (plan.content == nil || contentMatch != nil) {
+                        if !stopped && (!plan.hasContent || contentMatch != nil) {
+                            if plan.hasContent {
+                                var current = stat()
+                                guard fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW) == 0, SearchStamp(current) == stamp else {
+                                    throw SearchProblem("Файл изменился во время поиска; результат пропущен.")
+                                }
+                            }
                             emitted.insert(resultKey(url))
                             matches += 1
-                            onEvent(.result(SearchResult(url: url, name: url.lastPathComponent,
+                            onEvent(.result(SearchResult(capturedIdentityPath: SearchLocation.localKey(url), url: url, name: url.lastPathComponent,
                                                          isDirectory: target.kind == .directory,
                                                          isSymbolicLink: kind == .symbolicLink, size: stamp.size,
                                                          modified: stamp.modified, snippet: contentMatch?.snippet,
-                                                         lineNumber: contentMatch?.line, stamp: stamp,
+                                                         lineNumber: contentMatch?.line, byteOffset: contentMatch?.byteOffset, stamp: stamp,
                                                          contentStamp: contentMatch == nil ? nil : target)))
                             if matches >= plan.options.maximumResults { limitReached = true }
                         }
                     }
                 } catch is SearchStopped {
                     return
-                } catch { issue(url, error.localizedDescription) }
+                } catch { if !cancellation.isCancelled { issue(url, error.localizedDescription) } }
+            }
+        }
+        if !stopped, stamp.kind == .file, let archives {
+            archives.searchLocal(url, expectedSource: value) {
+                var current = stat(), named = stat()
+                guard fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW) == 0, SearchStamp(current) == stamp,
+                      lstat(url.path, &named) == 0, SearchStamp(named) == stamp else {
+                    throw ArchiveError.changedArchive
+                }
             }
         }
         if stopped { return nil }
@@ -410,7 +493,7 @@ private final class SearchWorker {
     }
 
     func searchContent(_ url: URL, parent: Int32, name: String, expected: SearchStamp,
-                       follow: Bool) throws -> (snippet: String, line: Int)? {
+                       follow: Bool) throws -> SearchContentMatch? {
         if cancellation.isCancelled { throw SearchStopped() }
         guard expected.size <= Int64(plan.options.maximumContentBytes) else {
             throw SearchProblem("Содержимое пропущено: размер превышает предел \(plan.options.maximumContentBytes) байт.")
@@ -422,73 +505,51 @@ private final class SearchWorker {
         guard fstat(descriptor, &value) == 0, SearchStamp(value) == expected, SearchStamp(value).kind == .file else {
             throw SearchProblem("Файл изменился или больше не является обычным файлом.")
         }
-        var bytes = Data()
-        var buffer = [UInt8](repeating: 0, count: 65_536)
-        while true {
-            if cancellation.isCancelled { throw SearchStopped() }
-            // One extra byte distinguishes an exact-cap EOF from a growing/truncated search.
-            let length = min(buffer.count, plan.options.maximumContentBytes - bytes.count + 1)
-            let count = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, length) }
-            if count < 0 {
-                if errno == EINTR { continue }
-                throw SearchProblem(systemError("Не удалось прочитать содержимое"))
-            }
-            if count == 0 { break }
-            guard bytes.count + count <= plan.options.maximumContentBytes else {
-                throw SearchProblem("Содержимое пропущено: файл вырос сверх предела чтения.")
-            }
-            bytes.append(contentsOf: buffer.prefix(count))
+        let source = SearchByteSource(descriptor: descriptor, expected: expected, cancellation: cancellation)
+        let match: SearchContentMatch?
+        if let bytes = plan.bytes {
+            match = try SearchContentScanner.scanBytes(source: source, query: bytes, cancellation: cancellation)
+        } else if let expression = plan.content {
+            let document = try ViewerDocument(source: source, encoding: plan.options.contentEncoding ?? .utf8)
+            match = try SearchContentScanner.scan(document: document, expression: expression,
+                literal: plan.options.contentMode == .literal, queryLength: plan.options.contentQuery.utf16.count,
+                cancellation: cancellation)
+        } else { return nil }
+        try source.verifyUnchanged()
+        guard fstatat(parent, name, &value, 0) == 0, SearchStamp(value) == expected else {
+            throw SearchProblem("Содержимое изменилось во время поиска; файл пропущен.")
         }
+        return match
+
+    }
+}
+
+/// Borrows the already verified descriptor; never reopens a path during scanning.
+private struct SearchByteSource: ViewerByteSource {
+    let descriptor: Int32
+    let expected: SearchStamp
+    let cancellation: SearchCancellation
+    var size: Int64 { expected.size }
+    var identity: String { "search:\(expected.device):\(expected.inode)" }
+    func verifyUnchanged() throws {
+        if cancellation.isCancelled { throw SearchStopped() }
+        var value = stat()
         guard fstat(descriptor, &value) == 0, SearchStamp(value) == expected else {
             throw SearchProblem("Содержимое изменилось во время поиска; файл пропущен.")
         }
-        guard let text = String(data: bytes, encoding: .utf8), !bytes.contains(0) else {
-            throw SearchProblem("Содержимое пропущено: требуется текст UTF-8 без двоичных нулей.")
+    }
+    func read(offset: Int64, count: Int) throws -> Data {
+        try verifyUnchanged()
+        guard offset >= 0, offset <= size, count >= 0, count <= LocalViewerSource.maximumReadCount else { throw ViewerError.invalidRange }
+        var data = Data(count: min(count, Int(size - offset)))
+        var readCount = 0
+        while readCount < data.count {
+            let count = data.withUnsafeMutableBytes { pread(descriptor, $0.baseAddress!.advanced(by: readCount), $0.count - readCount, off_t(offset) + off_t(readCount)) }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else { throw SearchProblem("Не удалось прочитать содержимое: файл изменился или недоступен.") }
+            readCount += count
+            try verifyUnchanged()
         }
-        if cancellation.isCancelled { throw SearchStopped() }
-        guard let expression = plan.content else { return nil }
-        // Escaped literal patterns cannot backtrack catastrophically. Keep their
-        // existing byte/query bounds and cooperative cancellation, without charging
-        // time spent descheduled on a busy machine to a regex complexity budget.
-        // Only user-supplied regex syntax needs the 50 ms execution deadline.
-        let nsText = text as NSString
-        let searchRange = NSRange(location: 0, length: nsText.length)
-        let deadline: TimeInterval? = plan.options.contentMode == .regex
-            ? ProcessInfo.processInfo.systemUptime + 0.05 : nil
-        var match: NSRange?
-        var timedOut = false
-        var internalError = false
-        expression.enumerateMatches(in: text, options: [.reportProgress, .reportCompletion],
-                                    range: searchRange) { result, flags, stop in
-            if self.cancellation.isCancelled { stop.pointee = true }
-            else if let deadline, ProcessInfo.processInfo.systemUptime >= deadline { timedOut = true; stop.pointee = true }
-            else if flags.contains(.internalError) { internalError = true; stop.pointee = true }
-            else if let result { match = result.range; stop.pointee = true }
-        }
-        if cancellation.isCancelled { throw SearchStopped() }
-        if timedOut || deadline.map({ ProcessInfo.processInfo.systemUptime >= $0 }) == true {
-            throw SearchProblem("Содержимое пропущено: превышено время проверки выражения (50 мс).")
-        }
-        if internalError { throw SearchProblem("Содержимое пропущено: ошибка выполнения регулярного выражения.") }
-        guard let match else { return nil }
-        // Bound the snippet even for files consisting of a single very long line.
-        var start = max(0, match.location - 80)
-        var end = min(nsText.length, max(match.location + min(match.length, 160), match.location + 80))
-        if start > 0, (0xDC00...0xDFFF).contains(nsText.character(at: start)) { start -= 1 }
-        if end < nsText.length, end > 0, (0xD800...0xDBFF).contains(nsText.character(at: end - 1)) { end += 1 }
-        let snippet = nsText.substring(with: NSRange(location: start, length: end - start))
-            .components(separatedBy: .newlines).joined(separator: " ")
-        var line = 1
-        var previousWasCR = false
-        for (index, unit) in text.utf16.prefix(match.location).enumerated() {
-            if index & 65_535 == 0, cancellation.isCancelled { throw SearchStopped() }
-            switch unit {
-            case 0x0D, 0x85, 0x2028, 0x2029: line += 1
-            case 0x0A: if !previousWasCR { line += 1 }
-            default: break
-            }
-            previousWasCR = unit == 0x0D
-        }
-        return (snippet, line)
+        return data
     }
 }

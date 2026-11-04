@@ -10,21 +10,27 @@ public struct ViewerSearchQuery: Sendable {
     public var pattern: String
     public var mode: ViewerSearchMode
     public var caseSensitive: Bool
+    public var wholeWords: Bool
+    public var fuzzy: Bool
 
-    public init(pattern: String, mode: ViewerSearchMode = .literal, caseSensitive: Bool = false) {
+    public init(pattern: String, mode: ViewerSearchMode = .literal, caseSensitive: Bool = false, wholeWords: Bool = false, fuzzy: Bool = false) {
         self.pattern = pattern; self.mode = mode; self.caseSensitive = caseSensitive
+        self.wholeWords = wholeWords
+        self.fuzzy = fuzzy
     }
 }
 
 public struct ViewerSearchResult: Equatable, Sendable {
     public let byteRange: Range<Int64>
-    public init(byteRange: Range<Int64>) { self.byteRange = byteRange }
+    public let wrapped: Bool
+    public init(byteRange: Range<Int64>, wrapped: Bool = false) { self.byteRange = byteRange; self.wrapped = wrapped }
 }
 
 public enum ViewerSearchError: Error, LocalizedError, Equatable {
     case emptyQuery, queryTooLong, invalidHex, unsupportedMultilineRegex
     case invalidRegularExpression(String)
     case regexLineTooLong(offset: Int64), regexDeadlineExceeded, regexExecutionFailed, cancelled
+    case unsupportedFuzzyMode, emptyFoldedQuery, fuzzyContextTooLong(offset: Int64)
 
     public var errorDescription: String? {
         switch self {
@@ -39,19 +45,24 @@ public enum ViewerSearchError: Error, LocalizedError, Equatable {
         case .regexDeadlineExceeded: return "Поиск неполон: превышено время проверки регулярного выражения (50 мс на строку)."
         case .regexExecutionFailed: return "Поиск неполон: ошибка выполнения регулярного выражения."
         case .cancelled: return "Поиск отменён."
+        case .unsupportedFuzzyMode: return "Нестрогий поиск доступен только в режиме «Текст»; выключите флажок для Regex или Hex."
+        case .emptyFoldedQuery: return "Строка нестрогого поиска должна содержать символы, кроме удаляемых диакритических знаков."
+        case .fuzzyContextTooLong(let offset): return "Поиск неполон: нестрогий контекст с позиции \(offset) превышает 262144 кодовых единицы UTF-16."
         }
     }
 }
 
 /// Bounded-memory search over the viewer's decoded pages, returning original file byte ranges.
 /// Forward includes matches starting at `from`; backward requires a start strictly before `from`.
-/// Search never wraps. Regex searches logical lines separately (CRLF, CR, LF, NEL, LS, PS),
+/// Search stops at the boundary unless `wrap` requests one additional pass from the
+/// opposite boundary. Regex searches logical lines separately (CRLF, CR, LF, NEL, LS, PS),
 /// with a 1 MiB source-byte limit per line and a cooperative ICU deadline of 50 ms per line.
 /// An unexamined line or interrupted regex throws; it is never reported as an absent match.
 /// Empty regex matches are allowed. To repeat forward, advance an empty match by one byte;
 /// backward can resume at the previous match's lower bound.
 public enum ViewerSearch {
     public static let maximumRegexLineBytes = 1_048_576
+    public static let maximumFuzzyContextUTF16 = 262_144
 
     public static func validate(_ query: ViewerSearchQuery) throws {
         _ = try ViewerSearchPlan(query)
@@ -59,6 +70,7 @@ public enum ViewerSearch {
 
     public static func find(document: ViewerDocument, query: ViewerSearchQuery, from: Int64,
                             direction: ViewerSearchDirection = .forward,
+                            wrap: Bool = false,
                             cancellation: ViewerCancellation? = nil,
                             onProgress: ((Int64) -> Void)? = nil) throws -> ViewerSearchResult? {
         let worker = ViewerSearchWorker(document: document, plan: try ViewerSearchPlan(query),
@@ -67,16 +79,27 @@ public enum ViewerSearch {
         try worker.checkCancellation()
         try document.source.verifyUnchanged()
         let firstSearchableByte = query.mode == .hex ? 0 : Int64(document.bomLength)
-        if direction == .backward, worker.from <= firstSearchableByte { return nil }
         let result: ViewerSearchResult?
-        switch query.mode {
-        case .literal: result = try worker.literal()
-        case .regex: result = try worker.regex()
-        case .hex: result = try worker.hex()
+        if direction == .backward, worker.from <= firstSearchableByte { result = nil }
+        else {
+            switch query.mode {
+            case .literal: result = try query.fuzzy ? worker.fuzzy() : worker.literal()
+            case .regex: result = try worker.regex()
+            case .hex: result = try worker.hex()
+            }
         }
         try worker.checkCancellation()
         try document.source.verifyUnchanged()
-        return result
+        if let result { return result }
+        if wrap {
+            let boundary = direction == .forward ? firstSearchableByte : document.size
+            if boundary != worker.from,
+               let found = try find(document: document, query: query, from: boundary, direction: direction,
+                                    cancellation: cancellation, onProgress: onProgress) {
+                return ViewerSearchResult(byteRange: found.byteRange, wrapped: true)
+            }
+        }
+        return nil
     }
 }
 
@@ -84,15 +107,20 @@ private struct ViewerSearchPlan {
     let query: ViewerSearchQuery
     let expression: NSRegularExpression?
     let bytes: [UInt8]
+    let foldedPattern: String
 
     init(_ query: ViewerSearchQuery) throws {
         guard !query.pattern.isEmpty else { throw ViewerSearchError.emptyQuery }
         guard query.pattern.utf16.count <= 4_096 else { throw ViewerSearchError.queryTooLong }
+        guard !query.fuzzy || query.mode == .literal else { throw ViewerSearchError.unsupportedFuzzyMode }
+        foldedPattern = query.fuzzy ? SearchTextFolding.fold(query.pattern, caseSensitive: query.caseSensitive) : ""
+        guard !query.fuzzy || !foldedPattern.isEmpty else { throw ViewerSearchError.emptyFoldedQuery }
         self.query = query
         if query.mode == .regex {
             guard !Self.requiresMultipleLines(query.pattern) else { throw ViewerSearchError.unsupportedMultilineRegex }
             do {
-                expression = try NSRegularExpression(pattern: query.pattern,
+                let pattern = query.wholeWords ? #"(?<![\p{L}\p{M}\p{N}_])(?:"# + query.pattern + #")(?![\p{L}\p{M}\p{N}_])"# : query.pattern
+                expression = try NSRegularExpression(pattern: pattern,
                     options: query.caseSensitive ? [] : [.caseInsensitive])
             } catch { throw ViewerSearchError.invalidRegularExpression(error.localizedDescription) }
         } else { expression = nil }
@@ -185,7 +213,9 @@ private final class ViewerSearchWorker {
     }
 
     func literal() throws -> ViewerSearchResult? {
-        var cursor = direction == .forward ? max(from, Int64(document.bomLength)) : Int64(document.bomLength)
+        // Retain a preceding scalar for whole-word context, including a start inside
+        // a multibyte scalar. The page decoder aligns the initial read safely.
+        var cursor = direction == .forward ? max(from - 4, Int64(document.bomLength)) : Int64(document.bomLength)
         var buffer = ViewerSearchBuffer()
         var latest: ViewerSearchResult?
         // Unicode case folding can expand a scalar to several UTF-16 units.
@@ -204,7 +234,11 @@ private final class ViewerSearchWorker {
                 let match = text.range(of: plan.query.pattern, options: options, range: searchRange)
                 if match.location == NSNotFound { break }
                 let range = buffer.byteRange(match)
-                if eligible(range) {
+                let completeBoundary = !plan.query.wholeWords || (
+                    (match.location > 0 || buffer.offsets[0] == Int64(document.bomLength)) &&
+                    (NSMaxRange(match) < text.length || page.endOffset == document.size) &&
+                    SearchWordBoundary.isWholeWord(text as String, range: match))
+                if eligible(range) && completeBoundary {
                     let result = ViewerSearchResult(byteRange: range)
                     if direction == .forward { return result }
                     if latest == nil || range.lowerBound > latest!.byteRange.lowerBound { latest = result }
@@ -225,6 +259,56 @@ private final class ViewerSearchWorker {
             let limit = from + min(document.size - from, Int64(overlap * 4))
             if direction == .backward, cursor >= limit { break }
             buffer.retainSuffix(overlap)
+        }
+        return latest
+    }
+
+    func fuzzy() throws -> ViewerSearchResult? {
+        // Retain a preceding source scalar for original whole-word context.
+        var cursor = direction == .forward ? max(from - 4, Int64(document.bomLength)) : Int64(document.bomLength)
+        var buffer = ViewerSearchBuffer()
+        var latest: ViewerSearchResult?
+        let retainedUnits = plan.foldedPattern.utf16.count + 2
+        while cursor < document.size {
+            try checkCancellation()
+            let page = try document.page(at: cursor, byteCount: blockSize)
+            guard page.endOffset > cursor else { throw ViewerError.changedFile }
+            buffer.append(page)
+            guard buffer.units.count <= ViewerSearch.maximumFuzzyContextUTF16 else {
+                throw ViewerSearchError.fuzzyContextTooLong(offset: buffer.offsets[0])
+            }
+            let text = String(decoding: buffer.units, as: UTF16.self)
+            let folded = try SearchTextFolding(text, caseSensitive: plan.query.caseSensitive)
+            try checkCancellation()
+            var searchRange = NSRange(location: 0, length: buffer.units.count)
+            while searchRange.length > 0,
+                  let match = folded.firstRange(ofFolded: plan.foldedPattern, in: searchRange) {
+                try checkCancellation()
+                let range = buffer.byteRange(match)
+                // A following page can extend the source range with discarded
+                // marks. Defer its final scalar even without whole-word mode.
+                let completeTail = NSMaxRange(match) < buffer.units.count || page.endOffset == document.size
+                let whole = !plan.query.wholeWords || (
+                    (match.location > 0 || buffer.offsets[0] == Int64(document.bomLength)) &&
+                    completeTail && SearchWordBoundary.isWholeWord(text, range: match))
+                if eligible(range) && completeTail && whole {
+                    let result = ViewerSearchResult(byteRange: range)
+                    if direction == .forward { return result }
+                    if latest == nil || range.lowerBound > latest!.byteRange.lowerBound { latest = result }
+                }
+                var next = match.location + 1
+                if next < buffer.units.count, (0xDC00...0xDFFF).contains(buffer.units[next]) { next += 1 }
+                // Advance one original scalar: preserve overlapping matches while
+                // never returning the same source ligature expansion twice.
+                searchRange = NSRange(location: next, length: buffer.units.count - next)
+            }
+            cursor = page.endOffset
+            onProgress?(cursor)
+            let suffix = folded.suffixStart(keepingFoldedUnits: retainedUnits)
+            if direction == .backward, buffer.offsets[suffix] >= from { return latest }
+            if suffix > 0 {
+                buffer.units = Array(buffer.units[suffix...]); buffer.offsets = Array(buffer.offsets[suffix...])
+            }
         }
         return latest
     }

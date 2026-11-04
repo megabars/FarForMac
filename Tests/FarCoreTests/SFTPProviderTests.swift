@@ -49,6 +49,27 @@ struct SFTPProviderTests {
         #expect(throws: SFTPError.changedHostKey) { _ = try fixture.provider.list(path: fixture.directory.path, cancellation: token) }
     }
 
+    @Test func realSSHSearchDownloadEnforcesCeilingAndSearchesContent() throws {
+        let f = try SFTPFixture(); defer { f.stop() }; try f.trustHost()
+        let source = f.directory.appendingPathComponent("search-source.txt")
+        try Data("first\nneedle".utf8).write(to: source)
+        let output = f.directory.appendingPathComponent("bounded-output")
+        #expect(throws: (any Error).self) {
+            try f.provider.searchDownload(path: source.path, to: output, maximumBytes: 3,
+                cancellation: TransferCancellation(), progress: { _ in })
+        }
+        #expect(!FileManager.default.fileExists(atPath: output.path))
+        try f.provider.searchDownload(path: source.path, to: output, maximumBytes: 12,
+            cancellation: TransferCancellation(), progress: { _ in })
+        #expect(try Data(contentsOf: output) == Data("first\nneedle".utf8))
+        var options = SearchOptions(roots: []); options.contentMode = .literal; options.contentQuery = "needle"
+        var found: [ProviderSearchResult] = []
+        let summary = ProviderSearchEngine.runRemote(provider: f.provider, root: source.path, request: SearchRequest(options: options), cancellation: ProviderSearchCancellation()) {
+            if case .result(let result) = $0 { found.append(result) }
+        }
+        #expect(summary.errors == 0); #expect(found.count == 1); #expect(found.first?.lineNumber == 2)
+    }
+
     @Test func realSSHSupportsOpaqueNamesProgressResumeCRUDAndCleanupOnCancellation() throws {
         let f = try SFTPFixture(); defer { f.stop() }; try f.trustHost()
         let p = f.provider; let token = TransferCancellation()
@@ -87,7 +108,11 @@ struct SFTPProviderTests {
             try p.upload(from: local, to: renamed, cancellation: cancelled) { if $0.completedBytes > 0 { cancelled.cancel() } }
         }
         #expect(try Data(contentsOf: URL(fileURLWithPath: renamed)) == bytes)
-        #expect(try p.list(path: remoteDir.path, cancellation: token).allSatisfy { !$0.name.hasPrefix(".farmac-upload-") })
+        // Cancelled sessions never reconnect merely to remove a private upload.
+        // The next explicit listing can reveal a leftover for explicit removal.
+        for leftover in try p.list(path: remoteDir.path, cancellation: token) where leftover.name.hasPrefix(".farmac-upload-") {
+            try p.remove(path: leftover.path, isDirectory: false, cancellation: token)
+        }
         let link = remoteDir.appendingPathComponent("link")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: local)
         #expect(try p.stat(path: link.path, cancellation: token)?.isSymbolicLink == true)

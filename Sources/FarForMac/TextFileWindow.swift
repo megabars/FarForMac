@@ -1,21 +1,51 @@
 import AppKit
 import FarCore
 
+/// Shared controls for the modal dialog and its AppKit smoke check.
+@MainActor
+private final class EditorSearchOptionsControls: NSObject {
+    let regex = NSButton(checkboxWithTitle: "Регулярное выражение (в пределах строки)", target: nil, action: nil)
+    let fuzzy = NSButton(checkboxWithTitle: "Нестрогий поиск (акценты, лигатуры, цифры)", target: nil, action: nil)
+    let style = NSButton(checkboxWithTitle: "Сохранять стиль идентификаторов при замене", target: nil, action: nil)
+
+    init(query: EditorSearchQuery?) {
+        super.init()
+        regex.state = query?.regex == true ? .on : .off
+        fuzzy.state = query?.fuzzy == true ? .on : .off
+        style.state = query?.preserveStyle == true ? .on : .off
+        for control in [regex, fuzzy, style] { control.target = self; control.action = #selector(changed(_:)) }
+    }
+
+    @objc private func changed(_ sender: NSButton) {
+        if sender.state == .on {
+            for control in [regex, fuzzy, style] where control !== sender { control.state = .off }
+        }
+    }
+}
+
 /// Independent editor buffers. Persistent bytes, recovery and text operations
 /// live in FarCore; this controller owns only the AppKit document experience.
 @MainActor
 final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDelegate, NSMenuItemValidation {
+    var macroEnvironment: MacroEnvironment {
+        MacroEnvironment(context: .editor, fileName: workingCopyDisplayName ?? sourceURL?.lastPathComponent, isDirectory: false,
+                         hasSelection: textView.selectedRange().length > 0, isEditable: editable)
+    }
     static let helpText = """
     Редактор: F2 / ⌘S — сохранить; Shift F2 / ⇧⌘S — сохранить как.
     F7 / ⌘F — поиск; Shift F7 — далее; Alt F7 — назад; Ctrl F7 / ⌘⌥F — замена.
-    Alt F8 / ⌘L — строка и столбец; Ctrl F3 — номера строк.
+    Alt F8 / ⌘L — строка и столбец (абсолютные, +/−, %, hex); Ctrl F3 — номера строк.
+    Ctrl Shift 0…9 — установить закладку; Ctrl 0…9 — перейти; кнопка «Закладки» — список.
+    Поиск → «Все совпадения» — список до 10 000 результатов с переходом.
+    Нестрогий поиск сводит акценты, лигатуры и варианты цифр; стиль замены сохраняет регистр и _-. / camelCase.
+    Regex, нестрогий поиск и сохранение стиля выбираются по отдельности.
     Tab / Shift Tab или Alt I / Alt U — отступ / убрать отступ.
     Прямоугольный блок задаётся кнопкой «Блок» (строки включительно, последний столбец не включён).
     F6 — просмотр; F4 / F10 / Esc — закрыть; Shift F10 — сохранить и закрыть.
     ⌘Z / ⇧⌘Z — отменить / повторить. Shift F4 / ⌘N — новый файл.
     Предел текста — 8 МиБ; подсветка отключается после 256 КиБ.
     Новый файл: UTF-8 без BOM; ввод Enter — LF. Исходные и вставленные окончания строк сохраняются;
-    преобразование всех окончаний выполняется только при явном выборе LF / CRLF в «Сохранить как».
+    преобразование всех окончаний выполняется только при явном выборе LF / CRLF / CR в «Сохранить как».
     """
 
     var isEditable: Bool { editable }
@@ -28,6 +58,9 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         return sourceURL?.lastPathComponent ?? "Без имени"
     }
     var onArchiveWorkingCopySaved: ((URL) -> Void)?
+    var onWorkingCopyView: ((URL, Int64, ViewerEncoding) -> Bool)? {
+        didSet { viewButton?.isHidden = !editable || (onView == nil && onWorkingCopyView == nil) }
+    }
     var hasUnsavedChanges: Bool { isDirty }
     var workingFileURL: URL? { sourceURL }
     func saveForArchiveCommit() -> Bool { save() }
@@ -59,6 +92,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         let identity: String
         let encoding: ViewerEncoding
         let position: Int
+        var bookmarks: EditorBookmarks?
         let date: Date
     }
     private static let historyDefaultsKey = "editor.history.v1"
@@ -72,7 +106,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     private func persistHistory() {
         guard retainedArchiveWorkspace == nil, retainedRemoteWorkspace == nil, let sourceURL, let snapshot else { return }
         let record = HistoryRecord(path: sourceURL.standardizedFileURL.path, identity: snapshot.identity,
-                                   encoding: snapshot.format.encoding, position: textView.selectedRange().location, date: Date())
+                                   encoding: snapshot.format.encoding, position: textView.selectedRange().location, bookmarks: isDirty ? nil : bookmarks, date: Date())
         var records = Self.historyRecords().filter { $0.path != record.path }; records.append(record)
         records.sort { $0.date > $1.date }
         if let data = try? JSONEncoder().encode(Array(records.prefix(100))) { AppPreferences.defaults.set(data, forKey: Self.historyDefaultsKey) }
@@ -87,6 +121,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     private let pathLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
     private let saveButton = NSButton(title: "F2 Сохранить", target: nil, action: nil)
+    private var viewButton: NSButton?
     private let syntaxPopup = NSPopUpButton()
     private let tabsPopup = NSPopUpButton()
     private let spacesCheck = NSButton(checkboxWithTitle: "Пробелы", target: nil, action: nil)
@@ -108,6 +143,9 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     private var lastQuery: EditorSearchQuery?
     private var lastReplacement = ""
     private var rectangle: EditorRectangle?
+    private var bookmarks = EditorBookmarks()
+    private var bookmarkText = ""
+    private var pendingBookmarkChanges: [EditorTextChange]?
     private var tabSize = 4
     private var useSpaces = true
     private static let foreground = NSColor(calibratedRed: 0.88, green: 0.92, blue: 1, alpha: 1)
@@ -127,6 +165,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         recoveryID = UUID(); self.editable = editable; self.onView = onView
         super.init(window: Self.makeWindow())
         configureContent(loaded.text)
+        if history?.identity == loaded.identity { bookmarks = history?.bookmarks ?? EditorBookmarks() }
         let position = initialByteOffset.map { EditorDocument.utf16Offset(forByteOffset: $0, in: loaded) }
             ?? (history?.identity == loaded.identity ? history?.position ?? 0 : 0)
         select(NSRange(location: min(position, loaded.text.utf16.count), length: 0))
@@ -214,10 +253,11 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         let gotoButton = button("Строка…", #selector(gotoDocument(_:)))
         let blockButton = button("Блок…", #selector(blockDocument(_:))); blockButton.isHidden = !editable
         let lineButton = button("№", #selector(toggleLineNumbers(_:))); lineButton.toolTip = "Ctrl F3 — номера строк"
+        let bookmarkButton = button("Закладки…", #selector(bookmarksDocument(_:)))
         tabsPopup.addItems(withTitles: ["Tab 2", "Tab 4", "Tab 8"]); tabsPopup.selectItem(at: 1)
         tabsPopup.target = self; tabsPopup.action = #selector(tabsChanged(_:))
         spacesCheck.state = .on; spacesCheck.target = self; spacesCheck.action = #selector(tabsChanged(_:))
-        let toolbar = NSStackView(views: [findButton, replaceButton, gotoButton, blockButton, lineButton, NSView(), tabsPopup, spacesCheck])
+        let toolbar = NSStackView(views: [findButton, replaceButton, gotoButton, blockButton, lineButton, bookmarkButton, NSView(), tabsPopup, spacesCheck])
         toolbar.orientation = .horizontal; toolbar.spacing = 8
         scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = true; scroll.autohidesScrollers = true
         scroll.borderType = .bezelBorder; scroll.backgroundColor = Self.background
@@ -236,7 +276,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         textView.autoresizingMask = [.width]; textView.minSize = .zero
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.containerSize = textView.maxSize; textView.textContainer?.widthTracksTextView = false
-        textView.string = contents; textView.delegate = self
+        textView.string = contents; textView.delegate = self; bookmarkText = contents
         textView.indentSelection = { outdent in CommandWorkspace.shared.dispatch(outdent ? "editor.outdent" : "editor.indent") }
         scroll.documentView = textView
         ruler = EditorLineRuler(scrollView: scroll, editor: textView)
@@ -249,7 +289,8 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         saveButton.target = self; saveButton.action = #selector(saveDocument(_:)); saveButton.bezelStyle = .rounded; saveButton.isHidden = !editable
         let saveAsButton = button("Сохранить как…", #selector(saveAsDocument(_:))); saveAsButton.isHidden = !editable
-        let viewButton = button("F6 Просмотр", #selector(switchToViewer(_:))); viewButton.isHidden = !editable || onView == nil
+        let viewButton = button("F6 Просмотр", #selector(switchToViewer(_:))); self.viewButton = viewButton
+        viewButton.isHidden = !editable || (onView == nil && onWorkingCopyView == nil)
         let closeButton = button("Закрыть", #selector(closeRequested(_:)))
         let footer = NSStackView(views: [statusLabel, NSView(), viewButton, saveButton, saveAsButton, closeButton])
         footer.orientation = .horizontal; footer.spacing = 8
@@ -265,6 +306,9 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
 
     private var isDirty: Bool { editable && (recoveredDraft || textView.string != savedText || format != savedFormat) }
     func textDidChange(_ notification: Notification) {
+        if let changes = pendingBookmarkChanges { bookmarks.apply(changes: changes) }
+        else { bookmarks.update(from: bookmarkText, to: textView.string) }
+        pendingBookmarkChanges = nil; bookmarkText = textView.string
         generation += 1; searchGeneration += 1; searchPending = false; lastFoundRange = nil; operationStatus = ""; pendingDiscard = false
         updateState(); ruler?.needsDisplay = true; scheduleHighlight(); scheduleRecovery()
     }
@@ -286,6 +330,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         guard let replacementString else { return true }
         let updated = (textView.string as NSString).replacingCharacters(in: affectedCharRange, with: replacementString)
         guard withinBufferLimit(updated) else { operationStatus = "Изменение отклонено: предел текста 8 МиБ"; updateState(); NSSound.beep(); return false }
+        pendingBookmarkChanges = [EditorTextChange(range: affectedCharRange, replacementUTF16Length: replacementString.utf16.count)]
         return true
     }
     @objc private func scrolled(_ notification: Notification) { ruler?.needsDisplay = true }
@@ -482,7 +527,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
             do {
                 let loaded = try EditorDocument.load(url: sourceURL, encoding: format.encoding)
                 snapshot = loaded; format = loaded.format; savedFormat = loaded.format; savedText = loaded.text; recoveredDraft = false
-                textView.string = loaded.text; textView.undoManager?.removeAllActions()
+                textView.string = loaded.text; bookmarkText = loaded.text; bookmarks = EditorBookmarks(); textView.undoManager?.removeAllActions()
                 generation += 1; searchGeneration += 1; clearRecovery(); select(NSRange(location: 0, length: 0)); scheduleHighlight()
             } catch { showError("Не удалось перечитать файл", error) }
         case NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 2):
@@ -509,15 +554,25 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         }
     }
     @objc private func switchToViewer(_ sender: Any?) {
-        guard let onView else { return }
+        guard let onView = onWorkingCopyView ?? onView else { return }
         if sourceURL == nil, !save() { return }
         guard confirmClose(), let sourceURL else { return }
         let displayed = isDirty ? savedText : textView.string
         do {
             let offset = try EditorDocument.byteOffset(forUTF16Offset: min(textView.selectedRange().location, displayed.utf16.count), text: displayed, format: savedFormat)
-            if onView(sourceURL, offset, savedFormat.encoding) { window?.close() }
+            if onView(sourceURL, offset, savedFormat.encoding) {
+                if onWorkingCopyView != nil {
+                    if pendingDiscard && isDirty {
+                        format = savedFormat; recoveredDraft = false
+                        replaceBuffer(savedText, selection: textView.selectedRange(), action: "Отбросить изменения")
+                        textView.undoManager?.removeAllActions(); clearRecovery(); pendingDiscard = false
+                    }
+                    window?.orderOut(nil)
+                } else { window?.close() }
+            } else { pendingDiscard = false }
         } catch { showError("Не удалось перейти к просмотру", error) }
     }
+    func switchWorkingCopyToViewer() { switchToViewer(nil) }
     /// Called after every app termination guard has accepted closing.
     func finalizeClose() {
         persistHistory()
@@ -551,8 +606,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         let alert = NSAlert(); alert.messageText = replacing ? "Замена" : "Поиск"
         let pattern = field(lastQuery?.pattern ?? "", placeholder: "Текст или построчное выражение")
         let replacement = field(lastReplacement, placeholder: "Замена ($1 для regex)")
-        let regex = NSButton(checkboxWithTitle: "Регулярное выражение (в пределах строки)", target: nil, action: nil)
-        regex.state = lastQuery?.regex == true ? .on : .off
+        let options = EditorSearchOptionsControls(query: lastQuery)
         let caseSensitive = NSButton(checkboxWithTitle: "Учитывать регистр", target: nil, action: nil)
         caseSensitive.state = lastQuery?.caseSensitive == true ? .on : .off
         let words = NSButton(checkboxWithTitle: "Целые слова", target: nil, action: nil)
@@ -560,22 +614,51 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         let direction = NSPopUpButton(); direction.addItems(withTitles: ["Вперёд", "Назад"])
         var views: [NSView] = [row("Найти", pattern)]
         if replacing { views.append(row("Заменить", replacement)) }
-        views += [regex, caseSensitive, words, row("Направление", direction)]
+        views += [options.regex, options.fuzzy, options.style, caseSensitive, words, row("Направление", direction)]
         let stack = NSStackView(views: views); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 9
-        stack.frame = NSRect(x: 0, y: 0, width: 480, height: replacing ? 215 : 175); alert.accessoryView = stack
+        stack.frame = NSRect(x: 0, y: 0, width: 480, height: replacing ? 275 : 235); alert.accessoryView = stack
         alert.addButton(withTitle: replacing ? "Заменить" : "Найти")
-        if replacing { alert.addButton(withTitle: "Заменить всё") }
+        alert.addButton(withTitle: replacing ? "Заменить всё" : "Все совпадения")
         alert.addButton(withTitle: "Отмена")
         alert.window.initialFirstResponder = pattern
         let answer = alert.runModal()
-        guard answer == .alertFirstButtonReturn || (replacing && answer == .alertSecondButtonReturn) else { return }
-        let query = EditorSearchQuery(pattern: pattern.stringValue, regex: regex.state == .on,
-                                      caseSensitive: caseSensitive.state == .on, wholeWords: words.state == .on)
+        guard answer == .alertFirstButtonReturn || answer == .alertSecondButtonReturn else { return }
+        let query = EditorSearchQuery(pattern: pattern.stringValue, regex: options.regex.state == .on,
+                                      caseSensitive: caseSensitive.state == .on, wholeWords: words.state == .on,
+                                      fuzzy: options.fuzzy.state == .on, preserveStyle: options.style.state == .on)
         lastQuery = query; lastReplacement = replacement.stringValue
         if replacing {
             performReplacement(query: query, replacement: replacement.stringValue, all: answer == .alertSecondButtonReturn,
                                direction: direction.indexOfSelectedItem == 1 ? .backward : .forward)
-        } else { find(query, direction: direction.indexOfSelectedItem == 1 ? .backward : .forward) }
+        } else if answer == .alertSecondButtonReturn { findAll(query) }
+        else { find(query, direction: direction.indexOfSelectedItem == 1 ? .backward : .forward) }
+    }
+
+    private func findAll(_ query: EditorSearchQuery) {
+        let text = textView.string, revision = generation
+        searchGeneration += 1; let request = searchGeneration
+        searchPending = true; operationStatus = "Поиск… (Esc — отменить)"; updateState()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try EditorEditing.allMatches(in: text, query: query) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.closed, self.generation == revision, self.searchGeneration == request else { return }
+                self.searchPending = false
+                switch result {
+                case .success(let matches):
+                    self.operationStatus = "Совпадений: \(matches.matches.count)\(matches.truncated ? " (список ограничен)" : "")"
+                    let results = EditorSearchResultsWindow(result: matches) { [weak self] range in
+                        guard let self, !self.closed else { return }
+                        guard self.generation == revision else {
+                            self.operationStatus = "Документ изменился: выполните поиск заново"; self.updateState(); NSSound.beep(); return
+                        }
+                        self.select(range); self.window?.makeKeyAndOrderFront(nil); self.window?.makeFirstResponder(self.textView)
+                    }
+                    results.showWindow(nil)
+                case .failure(let error): self.showError("Поиск не выполнен", error)
+                }
+                self.updateState()
+            }
+        }
     }
 
     private func find(_ query: EditorSearchQuery, direction: ViewerSearchDirection) {
@@ -615,7 +698,8 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
                 guard let range = try EditorEditing.find(in: text, query: query, from: start, direction: direction) else { return nil }
                 let updated = try EditorEditing.replace(in: text, range: range, query: query, replacement: replacement)
                 let addedLength = updated.utf16.count - text.utf16.count + range.length
-                return EditorEdit(text: updated, selection: NSRange(location: range.location, length: addedLength), count: 1)
+                return EditorEdit(text: updated, selection: NSRange(location: range.location, length: addedLength), count: 1,
+                                  changes: [EditorTextChange(range: range, replacementUTF16Length: addedLength)])
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.closed, self.generation == revision, self.searchGeneration == request else { return }
@@ -633,9 +717,9 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
 
     private func apply(_ edit: EditorEdit, action: String) {
         guard editable else { return }
-        replaceBuffer(edit.text, selection: edit.selection, action: action)
+        replaceBuffer(edit.text, selection: edit.selection, action: action, bookmarkChanges: edit.changes)
     }
-    private func replaceBuffer(_ text: String, selection: NSRange, action: String) {
+    private func replaceBuffer(_ text: String, selection: NSRange, action: String, bookmarkChanges: [EditorTextChange]? = nil) {
         guard text != textView.string else { select(selection); return }
         // Keep temporarily unrepresentable characters editable: Save As can
         // select Unicode, and recovery still preserves the complete draft.
@@ -644,6 +728,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         textView.breakUndoCoalescing(); manager?.beginUndoGrouping()
         let full = NSRange(location: 0, length: textView.string.utf16.count)
         if textView.shouldChangeText(in: full, replacementString: text) {
+            pendingBookmarkChanges = bookmarkChanges ?? EditorTextChange.difference(from: textView.string, to: text).map { [$0] }
             textView.replaceCharacters(in: full, with: text); textView.didChangeText()
             manager?.setActionName(action)
         }
@@ -651,19 +736,49 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     }
 
     @objc func gotoDocument(_ sender: Any?) {
-        let position = EditorEditing.lineColumn(in: textView.string, offset: textView.selectedRange().location)
-        let line = field("\(position.line)", placeholder: "Строка, с 1")
-        let column = field("\(position.column)", placeholder: "Столбец, с 1")
+        let value = field("", placeholder: "Строка:столбец, +10:-2, 50%, 0x20, $10, 20h")
+        let hex = NSButton(checkboxWithTitle: "16-ричные значения без префикса", target: nil, action: nil)
         let alert = NSAlert(); alert.messageText = "Перейти к строке и столбцу"
-        let stack = NSStackView(views: [row("Строка", line), row("Столбец", column)])
-        stack.orientation = .vertical; stack.spacing = 8; stack.frame = NSRect(x: 0, y: 0, width: 420, height: 70)
+        alert.informativeText = "С 1; +/− относительно курсора; % от числа строк / длины строки. Разделители: пробел , . ; : . Пустая координата сохраняется. Суффикс m — десятичное, h — hex."
+        let stack = NSStackView(views: [value, hex]); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8
+        stack.frame = NSRect(x: 0, y: 0, width: 460, height: 65)
         alert.accessoryView = stack; alert.addButton(withTitle: "Перейти"); alert.addButton(withTitle: "Отмена")
-        alert.window.initialFirstResponder = line
+        alert.window.initialFirstResponder = value
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         do {
-            let offset = try EditorEditing.offset(in: textView.string, line: Int(line.stringValue) ?? 0, column: Int(column.stringValue) ?? 0)
+            let offset = try EditorEditing.gotoOffset(in: textView.string, expression: value.stringValue,
+                from: textView.selectedRange().location, hexadecimal: hex.state == .on)
             select(NSRange(location: offset, length: 0)); window?.makeFirstResponder(textView)
         } catch { showError("Позиция недоступна", error) }
+    }
+
+    private func setBookmark(_ slot: Int) {
+        bookmarks.set(slot: slot, offset: textView.selectedRange().location)
+        operationStatus = "Закладка \(slot) установлена"; updateState()
+    }
+    private func gotoBookmark(_ slot: Int) {
+        guard let offset = bookmarks.offset(slot: slot) else { NSSound.beep(); return }
+        select(NSRange(location: min(offset, textView.string.utf16.count), length: 0))
+        window?.makeFirstResponder(textView)
+    }
+    @objc private func bookmarksDocument(_ sender: Any?) {
+        let popup = NSPopUpButton()
+        for slot in 0...9 {
+            let detail: String
+            if let offset = bookmarks.offset(slot: slot) {
+                let position = EditorEditing.lineColumn(in: textView.string, offset: offset)
+                detail = "строка \(position.line), столбец \(position.column)"
+            } else { detail = "не установлена" }
+            popup.addItem(withTitle: "\(slot) — \(detail)")
+        }
+        popup.frame = NSRect(x: 0, y: 0, width: 360, height: 28)
+        let alert = NSAlert(); alert.messageText = "Закладки редактора"
+        alert.informativeText = "Ctrl+Shift+0…9 — установить; Ctrl+0…9 — перейти. Закладки следуют за правками; сохраняются при закрытии сохранённого локального документа."
+        alert.accessoryView = popup; alert.addButton(withTitle: "Перейти"); alert.addButton(withTitle: "Установить"); alert.addButton(withTitle: "Удалить"); alert.addButton(withTitle: "Отмена")
+        let response = alert.runModal(), slot = popup.indexOfSelectedItem
+        if response == .alertFirstButtonReturn { gotoBookmark(slot) }
+        else if response == .alertSecondButtonReturn { setBookmark(slot) }
+        else if response == .alertThirdButtonReturn { bookmarks.remove(slot: slot) }
     }
 
     @objc private func tabsChanged(_ sender: Any?) {
@@ -772,6 +887,11 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
 
     private func handleKey(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if flags == .control || flags == [.control, .shift],
+           let slot = [UInt16(29): 0, 18: 1, 19: 2, 20: 3, 21: 4, 23: 5, 22: 6, 26: 7, 28: 8, 25: 9][event.keyCode] {
+            if flags.contains(.shift) { setBookmark(slot) } else { gotoBookmark(slot) }
+            return true
+        }
         if event.keyCode == 53, flags.isEmpty, searchPending {
             searchGeneration += 1; searchPending = false; operationStatus = "Поиск / замена отменены"; updateState(); return true
         }
@@ -866,10 +986,65 @@ extension TextFileWindow {
         return nil
     }
     var extensionText: String { textView.string }
+    var extensionSelection: NSRange { textView.selectedRange() }
+    var extensionTabSize: Int { tabSize }
     var extensionRevision: Int { generation }
     func applyExtensionText(_ text: String, revision: Int, title: String) throws {
         guard !closed, editable, generation == revision, window?.isVisible == true else { throw ExtensionAPIError("Документ изменился или закрыт. Повторите запуск расширения.") }
         guard withinBufferLimit(text) else { throw EditorError.tooLarge }
         replaceBuffer(text, selection: NSRange(location: 0, length: 0), action: title)
+    }
+}
+
+extension TextFileWindow {
+    static func runEditingUISmokeChecks() throws -> [String] {
+        let editor = TextFileWindow(newIn: AppRuntime.smokeDirectory ?? FileManager.default.temporaryDirectory)
+        defer { editor.pendingDiscard = true; editor.finalizeClose(); editor.window?.close() }
+        func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
+            if !condition() { throw NSError(domain: "EditorSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+        }
+        editor.showWindow(nil)
+        editor.replaceBuffer("one\r\n🙂two\nlast", selection: NSRange(location: 8, length: 0), action: "Smoke")
+        let set = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.control, .shift], timestamp: 0,
+            windowNumber: editor.window?.windowNumber ?? 0, context: nil, characters: "!", charactersIgnoringModifiers: "!", isARepeat: false, keyCode: 18)!
+        try require(editor.handleKey(set), "Editor handles Ctrl Shift digit")
+        try require(editor.bookmarks.offset(slot: 1) == 8, "Numbered bookmark records editor caret")
+        editor.select(NSRange(location: 0, length: 0))
+        let go = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.control], timestamp: 0,
+            windowNumber: editor.window?.windowNumber ?? 0, context: nil, characters: "1", charactersIgnoringModifiers: "1", isARepeat: false, keyCode: 18)!
+        try require(editor.handleKey(go), "Editor handles Ctrl digit")
+        try require(editor.textView.selectedRange().location == 8, "Numbered bookmark moves editor caret")
+        editor.replaceBuffer("prefix one\r\n🙂two\nlast", selection: NSRange(location: 0, length: 0), action: "Smoke")
+        try require(editor.bookmarks.offset(slot: 1) == 15, "Bookmark follows editor buffer edit")
+        let matches = try EditorEditing.allMatches(in: editor.textView.string, query: .init(pattern: "two"))
+        try require(matches.matches.count == 1 && matches.matches[0].line == 2, "All matches use editor buffer positions")
+        editor.replaceBuffer("cat KEEP cat", selection: NSRange(location: 4, length: 0), action: "Smoke")
+        editor.bookmarks = EditorBookmarks(); editor.setBookmark(1)
+        let replaced = try EditorEditing.replaceAll(in: editor.textView.string, query: .init(pattern: "cat"), replacement: "dog")
+        editor.apply(replaced, action: "Smoke")
+        try require(editor.bookmarks.offset(slot: 1) == 4, "Disjoint replacement preserves untouched editor bookmark")
+        let options = EditorSearchOptionsControls(query: .init(pattern: "resume", fuzzy: true))
+        try require(options.fuzzy.state == .on && options.regex.state == .off, "Editor fuzzy checkbox restores query")
+        options.style.performClick(nil)
+        try require(options.style.state == .on && options.fuzzy.state == .off, "Editor style and fuzzy modes are exclusive")
+        options.regex.performClick(nil)
+        try require(options.regex.state == .on && options.style.state == .off, "Editor regex and style modes are exclusive")
+        editor.replaceBuffer("🙂résumé RÉSUMÉ", selection: NSRange(location: 0, length: 0), action: "Smoke")
+        let fuzzyQuery = EditorSearchQuery(pattern: "resume", fuzzy: true)
+        let fuzzyMatches = try EditorEditing.allMatches(in: editor.textView.string, query: fuzzyQuery)
+        try require(fuzzyMatches.matches.count == 2 && fuzzyMatches.matches[0].range == NSRange(location: 2, length: 8), "Editor fuzzy results select original decomposed accents")
+        editor.select(fuzzyMatches.matches[0].range)
+        try require(editor.textView.selectedRange() == fuzzyMatches.matches[0].range, "AppKit highlights original fuzzy range")
+        editor.replaceBuffer("UserName USER_NAME user-name", selection: NSRange(location: 0, length: 0), action: "Smoke")
+        editor.textView.undoManager?.removeAllActions()
+        let styleEdit = try EditorEditing.replaceAll(in: editor.textView.string, query: .init(pattern: "user_name", preserveStyle: true), replacement: "account_id")
+        editor.apply(styleEdit, action: "Сохранить стиль")
+        try require(editor.textView.string == "AccountId ACCOUNT_ID account-id", "AppKit applies style replacement across identifier separators")
+        try require(editor.textView.selectedRange() == styleEdit.selection, "AppKit selects final styled replacement")
+        editor.textView.undoManager?.undo()
+        try require(editor.textView.string == "UserName USER_NAME user-name", "Styled replace all is one undo action")
+        editor.textView.undoManager?.redo()
+        try require(editor.textView.string == styleEdit.text, "Styled replace all supports redo")
+        return ["Editor numbered bookmark shortcuts", "Editor bookmark follows buffer edit", "Editor all-match positions", "Editor fuzzy and style options", "Editor fuzzy original-range highlight", "Editor styled replacement undo redo"] + (try EditorSearchResultsWindow.runUISmokeChecks())
     }
 }

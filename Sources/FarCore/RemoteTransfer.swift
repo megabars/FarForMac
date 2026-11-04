@@ -349,6 +349,22 @@ public enum RemoteTransferEngine {
         }
     }
 
+    /// Directory conflict decisions must retain the reviewed expectation rather
+    /// than recapturing a newer destination as implicit permission to replace.
+    static func uploadReviewedFile(provider: RemoteProvider, from source: URL, to path: String,
+                                   expected: RemoteEntry, expectedHash: String,
+                                   cancellation: TransferCancellation,
+                                   progress: @escaping (NetworkProgress) -> Void) throws {
+        try validPath(path); try regular(expected); try check(cancellation)
+        guard expected.path == path, !(try LocalRemoteStamp(source)).directory,
+              try provider.stat(path: path, cancellation: cancellation) == expected else { throw RemoteTransferError.conflict(path) }
+        var budget = RemoteTreeBudget()
+        try scanLocal(source, cancellation, depth: 0, budget: &budget)
+        let workspace = try RemoteWorkspace()
+        try publish(provider, source, path, expected: expected, expectedHash: expectedHash,
+                    workspace: workspace, cancellation: cancellation, progress: progress)
+    }
+
     /// Explicit deletion only, with a fresh selection snapshot. Directories must be empty;
     /// recursive server-side deletion is deliberately never used by this worker.
     public static func delete(provider: RemoteProvider, entry: RemoteEntry,
@@ -409,7 +425,11 @@ public enum RemoteTransferEngine {
         try regular(entry); try check(cancellation)
         // An arbitrary .part is not a resume proof. Always restart in a fresh private
         // file rather than append a suffix to unverified bytes or weak FTP metadata.
-        try provider.download(path: entry.path, to: local, resumeOffset: 0, cancellation: cancellation, progress: progress)
+        if let bounded = provider as? RemoteBoundedDownloadProvider {
+            try bounded.boundedDownload(path: entry.path, to: local, maximumBytes: entry.size, cancellation: cancellation, progress: progress)
+        } else {
+            try provider.download(path: entry.path, to: local, resumeOffset: 0, cancellation: cancellation, progress: progress)
+        }
         let stamp = try LocalRemoteStamp(local)
         guard !stamp.directory && !stamp.link, stamp.size == entry.size,
               try required(provider, entry.path, cancellation) == entry else {
@@ -527,7 +547,7 @@ public enum RemoteTransferEngine {
     private static func parent(_ path: String) -> String { String(path.prefix((path.lastIndex(of: "/").map { path.distance(from: path.startIndex, to: $0) } ?? 0) + 1)) }
 }
 
-private struct LocalRemoteStamp: Equatable {
+struct LocalRemoteStamp: Equatable, Sendable {
     let device: dev_t, inode: ino_t, mode: mode_t
     let size: Int64, modifiedSeconds: Int, modifiedNanoseconds: Int, changedSeconds: Int, changedNanoseconds: Int
     var directory: Bool { mode & S_IFMT == S_IFDIR }
@@ -543,17 +563,26 @@ private struct LocalRemoteStamp: Equatable {
         modifiedSeconds = value.st_mtimespec.tv_sec; modifiedNanoseconds = value.st_mtimespec.tv_nsec
         changedSeconds = value.st_ctimespec.tv_sec; changedNanoseconds = value.st_ctimespec.tv_nsec
     }
+    /// Reject substitution by FIFO/device/link without ever blocking on open.
+    /// The descriptor is pinned to the reviewed regular inode before reading.
+    func openForReading(_ url: URL) throws -> Int32 {
+        let fd = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0, opened.st_mode & S_IFMT == S_IFREG,
+              opened.st_dev == device, opened.st_ino == inode else { close(fd); throw RemoteTransferError.conflict(url.path) }
+        return fd
+    }
     func sameObject(_ other: Self) -> Bool { device == other.device && inode == other.inode }
     static func optional(_ url: URL) throws -> Self? {
         do { return try Self(url) } catch let error as POSIXError where error.code == .ENOENT { return nil }
     }
 }
-private enum RemoteDigest {
+enum RemoteDigest {
     static func hash(_ url: URL, cancellation: TransferCancellation? = nil) throws -> String {
         let before = try LocalRemoteStamp(url)
         guard !before.directory && !before.link else { throw RemoteTransferError.invalidPath }
-        let fd = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let fd = try before.openForReading(url)
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         defer { try? handle.close() }
         var digest = SHA256()

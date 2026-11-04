@@ -16,6 +16,10 @@ public enum ViewerEncoding: String, CaseIterable, Codable, Sendable {
     }
 }
 
+public enum ViewerDisplayMode: Int, Codable, Sendable {
+    case text, hex, dump
+}
+
 public enum ViewerError: Error, LocalizedError, Equatable {
     case notRegularFile, unsupportedURL, changedFile, invalidRange, cancelled, lineNotFound
     case io(String)
@@ -253,6 +257,72 @@ public struct ViewerDocument: Sendable {
         }
         try source.verifyUnchanged()
         return ViewerPage(text: String(scalars), startOffset: start, endOffset: contextStart + Int64(index), invalidSequences: invalid, spans: spans)
+    }
+
+    /// FAR dump has one cell per encoding unit, not a hex address/byte table.
+    /// UTF-8 continuation bytes occupy visible `›` cells. Controls are inert
+    /// pictures, so AppKit cannot interpret a file's newline, tab or bidi controls.
+    /// Rows use a fixed cell count; display width of non-BMP / wide glyphs remains
+    /// a font-dependent macOS adaptation rather than console-cell equivalence.
+    public func dumpPage(at offset: Int64, byteCount: Int = 65_536, columns: Int = 80) throws -> ViewerPage {
+        guard offset >= 0, offset <= size, byteCount > 0, (1...1_000).contains(columns) else { throw ViewerError.invalidRange }
+        try source.verifyUnchanged()
+        let unitSize = encoding == .utf16LE || encoding == .utf16BE ? 2 : 1
+        let start = offset == size ? size : offset / Int64(unitSize) * Int64(unitSize)
+        let budget = min(byteCount, Self.maximumPageByteCount)
+        let length = min(size - start, Int64(max(unitSize, budget / unitSize * unitSize)))
+        let end = start + length
+        let contextStart = max(0, start - 3)
+        let bytes = Array(try source.read(offset: contextStart, count: Int(min(size - contextStart, length + (start - contextStart) + 3))))
+        var output = String.UnicodeScalarView(), spans: [ViewerPage.Span] = [], invalid = false
+        var index = Int(start - contextStart), utf16 = 0, cells = 0
+        func append(_ scalar: UInt32, bytes range: Range<Int64>) {
+            output.append(Unicode.Scalar(scalar)!)
+            let width = scalar > 0xFFFF ? 2 : 1
+            spans.append(.init(bytes: range, utf16: utf16..<(utf16 + width)))
+            utf16 += width
+        }
+        while index < Int(end - contextStart) {
+            let position = contextStart + Int64(index)
+            if cells > 0, cells % columns == 0 { append(10, bytes: position..<position) }
+            var value: UInt32
+            if unitSize == 2 {
+                if index + 1 < bytes.count {
+                    let unit = Self.word(bytes, index, encoding)
+                    if (0xD800...0xDBFF).contains(unit), index + 3 < bytes.count,
+                       (0xDC00...0xDFFF).contains(Self.word(bytes, index + 2, encoding)) {
+                        value = Self.decode(bytes, at: index, encoding: encoding).value
+                    } else if (0xDC00...0xDFFF).contains(unit), index >= 2,
+                              (0xD800...0xDBFF).contains(Self.word(bytes, index - 2, encoding)) {
+                        value = 0x203A
+                    } else if (0xD800...0xDFFF).contains(unit) { value = 0xFFFD; invalid = true }
+                    else { value = unit }
+                } else { value = 0xFFFD; invalid = true }
+            } else if encoding == .utf8 {
+                let continuation = (max(0, index - 3)..<index).contains { candidate in
+                    let scalar = Self.decode(bytes, at: candidate, encoding: .utf8)
+                    return scalar.valid && candidate + scalar.length > index
+                }
+                if continuation { value = 0x203A }
+                else {
+                    let scalar = Self.decode(bytes, at: index, encoding: encoding)
+                    value = scalar.value; invalid = invalid || !scalar.valid
+                }
+            } else {
+                let scalar = Self.decode(bytes, at: index, encoding: encoding)
+                value = scalar.value; invalid = invalid || !scalar.valid
+            }
+            if value < 32 { value += 0x2400 }
+            else if value == 127 { value = 0x2421 }
+            else if (0x80...0x9F).contains(value) || value == 0x2028 || value == 0x2029 ||
+                        Unicode.Scalar(value)!.properties.generalCategory == .format {
+                value = 0xFFFD
+            }
+            append(value, bytes: position..<(position + min(end - position, Int64(unitSize))))
+            index += unitSize; cells += 1
+        }
+        try source.verifyUnchanged()
+        return ViewerPage(text: String(output), startOffset: start, endOffset: end, invalidSequences: invalid, spans: spans)
     }
 
     /// Linear, bounded-memory scan. Lines are one-based; CRLF is one separator.

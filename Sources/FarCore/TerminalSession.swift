@@ -11,14 +11,19 @@ public final class TerminalSession: @unchecked Sendable {
         public var shell: String?
         public var columns: Int
         public var rows: Int
+        public var shellArguments: [String]?
+        public var environmentOverrides: [String: String]
 
         public init(command: String? = nil, directory: URL, shell: String? = nil,
-                    columns: Int = 100, rows: Int = 30) {
+                    columns: Int = 100, rows: Int = 30, shellArguments: [String]? = nil,
+                    environmentOverrides: [String: String] = [:]) {
             self.command = command
             self.directory = directory
             self.shell = shell
             self.columns = columns
             self.rows = rows
+            self.shellArguments = shellArguments
+            self.environmentOverrides = environmentOverrides
         }
     }
 
@@ -87,11 +92,17 @@ public final class TerminalSession: @unchecked Sendable {
                 throw SessionError.system("terminal arguments", EINVAL)
             }
             // Interactive mode enables shell job control for foreground programs.
-            let arguments = configuration.command.map { [shell, "-i", "-c", $0] } ?? [shell, "-i"]
+            let arguments = configuration.shellArguments.map { [shell] + $0 }
+                ?? configuration.command.map { [shell, "-i", "-c", $0] } ?? [shell, "-i"]
+            guard arguments.allSatisfy({ !$0.utf8.contains(0) }),
+                  configuration.environmentOverrides.allSatisfy({ !$0.key.isEmpty && !$0.key.contains("=") && !$0.key.utf8.contains(0) && !$0.value.utf8.contains(0) }) else {
+                throw SessionError.system("terminal environment", EINVAL)
+            }
             var environment = ProcessInfo.processInfo.environment
             environment["TERM"] = "vt100"
             environment.removeValue(forKey: "COLORTERM")
             environment["PWD"] = configuration.directory.path
+            environment.merge(configuration.environmentOverrides) { _, new in new }
             let argv = arguments.map { strdup($0) }
             let envp = environment.sorted(by: { $0.key < $1.key }).map { strdup("\($0.key)=\($0.value)") }
             defer { argv.forEach { free($0) }; envp.forEach { free($0) } }
@@ -141,6 +152,15 @@ public final class TerminalSession: @unchecked Sendable {
     }
 
     public func send(_ text: String) throws { try send(Data(text.utf8)) }
+    /// Command-bar submissions must never become input to a foreground program.
+    public func sendToForegroundShell(_ text: String) throws {
+        try synchronized {
+            guard let child = pid, descriptor >= 0, tcgetpgrp(descriptor) == child else {
+                throw SessionError.system("shell is not in foreground", EBUSY)
+            }
+            try send(text)
+        }
+    }
     public func send(_ data: Data) throws {
         try synchronized {
             guard pid != nil, descriptor >= 0, !stopping else { throw SessionError.notRunning }
@@ -166,6 +186,11 @@ public final class TerminalSession: @unchecked Sendable {
             guard foreground > 1, foreground != getpgrp(), getsid(foreground) == child else {
                 throw SessionError.system("terminal foreground process", ESRCH)
             }
+            // A program may never read its stdin. Do not hand its queued text
+            // to the shell after interruption (including our unwritten buffer).
+            input.removeAll()
+            writer?.cancel(); writer = nil
+            guard tcflush(descriptor, TCIFLUSH) == 0 else { throw error("flush terminal input") }
             guard kill(-foreground, SIGINT) == 0 else { throw error("interrupt terminal") }
         }
     }

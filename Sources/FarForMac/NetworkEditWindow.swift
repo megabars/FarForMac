@@ -9,6 +9,7 @@ import FarCore
     private let canCommit: () -> Bool, onCommitted: () -> Void
     private var pending = false, discard = false, revision = 0, editorClosed = false
     private var observer: NSObjectProtocol?
+    private var viewingSession: WorkingCopyViewerSession?
     private lazy var saveButton = button("Сохранить на сервер", #selector(commit))
     init(snapshot: RemoteEditSnapshot, workspace: RemoteWorkspace, provider: any RemoteProvider, editor: TextFileWindow,
          canCommit: @escaping () -> Bool, onCommitted: @escaping () -> Void) {
@@ -18,12 +19,16 @@ import FarCore
         let info = NSTextField(wrappingLabelWithString: "\(provider.connection.displayName)\n\(snapshot.entry.path)\nРедактор сохраняет только локальную копию. Для отправки нажмите «Сохранить на сервер». Перед записью проверяется удалённая версия.")
         content([info, status, NSView(), row([button("Редактор", #selector(showEditor)), NSView(), button("Закрыть", #selector(closeSession)), saveButton])])
         status.stringValue = "Сервер ещё не изменён."
+        viewingSession = WorkingCopyViewerSession(editor: editor, url: snapshot.localURL, title: snapshot.entry.name,
+                                                   remoteWorkspace: workspace)
         editor.onArchiveWorkingCopySaved = { [weak self] url in
             guard let self else { return }
             if url.standardizedFileURL == self.snapshot.localURL.standardizedFileURL { self.pending = true; self.revision += 1; self.discard = false; self.status.stringValue = "Копия сохранена; отправьте её на сервер отдельной кнопкой." }
         }
         observer = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: editor.window, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.editorClosed = true }
+            MainActor.assumeIsolated {
+                self?.editorClosed = true; self?.viewingSession?.close(); self?.viewingSession = nil
+            }
         }
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -66,14 +71,51 @@ import FarCore
     }
     func finalizeClose() { if discard { pending = false; discard = false } }
     func cancel() { operations.cancel() }
-    func cleanupForTermination() { workspace.cleanup() }
+    func cleanupForTermination() { viewingSession?.close(); viewingSession = nil; workspace.cleanup() }
     override func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard !isWorking, (editorClosed || editor.confirmClose()), confirmClose() else { return false }
         if !editorClosed { editor.finalizeClose(); editor.closeArchiveWorkingCopyWithoutSaving() }
         finalizeClose(); return true
     }
     override func windowWillClose(_ notification: Notification) {
+        viewingSession?.close(); viewingSession = nil
         if let observer { NotificationCenter.default.removeObserver(observer); self.observer = nil }
-        workspace.cleanup(); super.windowWillClose(notification)
+        // ARC removes the workspace after its final editor/viewer lease ends.
+        super.windowWillClose(notification)
     }
+}
+
+extension NetworkEditWindow {
+    static func runWorkingCopyUISmokeChecks() async throws -> [String] {
+        let provider = WorkingCopySmokeProvider()
+        let workspace = try RemoteWorkspace(parent: AppRuntime.smokeDirectory ?? FileManager.default.temporaryDirectory)
+        let snapshot = try workspace.open(provider: provider, path: "/member.txt")
+        let editor = try TextFileWindow(url: snapshot.localURL); editor.retainedRemoteWorkspace = workspace
+        let controller = NetworkEditWindow(snapshot: snapshot, workspace: workspace, provider: provider, editor: editor,
+            canCommit: { true }, onCommitted: {})
+        controller.showWindow(nil)
+        defer { controller.window?.performClose(nil) }
+        guard let session = controller.viewingSession else { throw ViewerError.unsupportedURL }
+        let checks = try await WorkingCopyViewerSession.exerciseUISmoke(editor: editor, session: session, kind: "Remote")
+        guard provider.writes == 0, !controller.pending else {
+            throw NSError(domain: "WorkingCopySmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: "F6 never uploads remote bytes"])
+        }
+        return checks + ["Remote F6 never uploads working copy"]
+    }
+}
+
+/// In-process fixture: it cannot open sockets and rejects every mutation.
+private final class WorkingCopySmokeProvider: RemoteProvider {
+    let connection = NetworkConnection(name: "UI fixture", kind: .sftp, host: "fixture.invalid")
+    let bytes = Data("one\n🙂two\n".utf8)
+    private(set) var writes = 0
+    private var entry: RemoteEntry { RemoteEntry(path: "/member.txt", isDirectory: false, size: Int64(bytes.count), version: "fixture-v1") }
+    func list(path: String, cancellation: TransferCancellation) throws -> [RemoteEntry] { [entry] }
+    func stat(path: String, cancellation: TransferCancellation) throws -> RemoteEntry? { path == entry.path ? entry : nil }
+    func download(path: String, to: URL, resumeOffset: Int64, cancellation: TransferCancellation, progress: @escaping (NetworkProgress) -> Void) throws { try bytes.write(to: to) }
+    private func reject() throws { writes += 1; throw NetworkError.unsupported("Fixture mutation forbidden") }
+    func upload(from: URL, to: String, cancellation: TransferCancellation, progress: @escaping (NetworkProgress) -> Void) throws { try reject() }
+    func rename(from: String, to: String, replace: Bool, cancellation: TransferCancellation) throws { try reject() }
+    func remove(path: String, isDirectory: Bool, cancellation: TransferCancellation) throws { try reject() }
+    func makeDirectory(path: String, cancellation: TransferCancellation) throws { try reject() }
 }

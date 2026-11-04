@@ -24,14 +24,16 @@ public struct MacroConfiguration: Codable, Equatable, Sendable {
         for macro in macros {
             guard !macro.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   macro.name.utf8.count <= 256, !macro.name.utf8.contains(0), macro.steps.count <= MacroController.maximumSteps,
-                  macro.steps.allSatisfy({ $0.commandID.isValid }) else { throw MacroError.invalidConfiguration }
+                  macro.steps.allSatisfy({ $0.commandID.isValid && (1...MacroController.maximumSteps).contains($0.repeatCount) }) else { throw MacroError.invalidConfiguration }
+            // Each repeat counts against the same budget; check individual bounds before summing.
+            guard macro.steps.reduce(0, { $0 + $1.repeatCount }) <= MacroController.maximumSteps else { throw MacroError.invalidConfiguration }
+            try macro.conditions?.validate()
         }
-        var keys = Set<String>()
+        var validated = MacroConfiguration(macros: macros)
         for binding in bindings {
-            let key = binding.key.lowercased()
-            let validKey = (key.count == 1 && key.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) }) || (1...20).contains(where: { key == "f\($0)" })
-            let signature = binding.context.rawValue + ":" + binding.modifiers.map(\.rawValue).sorted().joined(separator: ",") + ":" + key
-            guard validKey, !binding.modifiers.isEmpty, macros.contains(where: { $0.id == binding.macroID }), keys.insert(signature).inserted else { throw MacroError.invalidConfiguration }
+            do { try MacroShortcutPolicy.validate(binding, in: validated) }
+            catch { throw MacroError.invalidConfiguration }
+            validated.bindings.append(binding)
         }
     }
 }

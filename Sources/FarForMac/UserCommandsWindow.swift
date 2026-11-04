@@ -1,7 +1,7 @@
 import AppKit
 import FarCore
 
-/// Owns the JSON editor only; menu rendering and explicit execution belong to AppDelegate.
+/// Edits configuration and explicitly imports legacy menus; reading never executes commands.
 @MainActor
 final class UserCommandsWindow: NSWindowController, NSWindowDelegate, NSTextViewDelegate, NSUserInterfaceValidations {
     private let store: UserCommandStore
@@ -21,7 +21,7 @@ final class UserCommandsWindow: NSWindowController, NSWindowDelegate, NSTextView
 
         let path = NSTextField(wrappingLabelWithString: store.globalURL.path)
         path.font = .monospacedSystemFont(ofSize: 11, weight: .regular); path.isSelectable = true
-        let help = NSTextField(wrappingLabelWithString: "F2 открывает меню. Ассоциации задают execute, view и edit для маски файлов. Параметры {name}, {path}, {marked}, {active}, {passive} вставляются с POSIX-кавычками: пишите их отдельными словами без своих кавычек. Конфигурация сама ничего не запускает.")
+        let help = NSTextField(wrappingLabelWithString: "F2 открывает меню. Ассоциации: execute/view/edit и alternateExecute/alternateView/alternateEdit. Параметры {name}, {path}, {stem}, {extension}, {marked}, {active}, {passive}, {input:Название|текст}, {list}/{list0} — отдельные слова без своих кавычек. Конфигурация сама ничего не запускает.")
         help.font = .systemFont(ofSize: 12)
         let localHelp = NSTextField(wrappingLabelWithString: "Локальное меню: .farformac-menu.json в активной папке, тот же JSON с полями version и menu. Оно заменяет глобальное меню при F2; перед запуском показываются источник и готовая команда. Ассоциации берутся из глобальной конфигурации.")
         localHelp.font = .systemFont(ofSize: 11); localHelp.textColor = .secondaryLabelColor
@@ -39,11 +39,12 @@ final class UserCommandsWindow: NSWindowController, NSWindowDelegate, NSTextView
         scroll.documentView = textView
         status.font = .systemFont(ofSize: 11); status.textColor = .secondaryLabelColor
         let example = NSButton(title: "Вставить пример", target: self, action: #selector(insertExample))
+        let importMenu = NSButton(title: L10n.text("Импорт FarMenu.ini…"), target: self, action: #selector(importFarMenu))
         let validate = NSButton(title: "Проверить", target: self, action: #selector(validateText))
         let save = NSButton(title: "Сохранить", target: self, action: #selector(saveDocument(_:)))
         save.keyEquivalent = "s"; save.keyEquivalentModifierMask = [.command]
         let close = NSButton(title: "Закрыть", target: self, action: #selector(closeEditor))
-        let actions = NSStackView(views: [example, validate, NSView(), close, save]); actions.spacing = 10
+        let actions = NSStackView(views: [example, importMenu, validate, NSView(), close, save]); actions.spacing = 10
         let content = NSView()
         for view in [path, help, localHelp, scroll, status, actions] {
             view.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(view)
@@ -157,10 +158,105 @@ final class UserCommandsWindow: NSWindowController, NSWindowDelegate, NSTextView
         textView.string = UserCommandStore.example; pendingDiscard = false; dirty = true; window?.isDocumentEdited = true
         setStatus("Пример вставлен. Проверьте команды и сохраните конфигурацию.")
     }
+    @objc private func importFarMenu() {
+        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.message = L10n.text("Выберите FarMenu.ini в UTF-8 или UTF-16. Импорт изменяет только текст редактора.")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let result = try store.importFarMenu(at: url)
+            // Validate the current buffer before replacing anything, including associations.
+            _ = try UserCommandConfiguration.decode(Data(textView.string.utf8))
+            let alert = NSAlert(); alert.messageText = L10n.text("Заменить меню импортированным?")
+            alert.informativeText = result.warnings.joined(separator: "\n\n")
+            alert.addButton(withTitle: L10n.text("Импортировать")); alert.addButton(withTitle: L10n.text("Отмена"))
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            try installImportedMenu(result)
+        } catch { setStatus(error.localizedDescription, error: true) }
+    }
+    private func installImportedMenu(_ result: FarMenuImportResult) throws {
+        var config = try UserCommandConfiguration.decode(Data(textView.string.utf8))
+        config.menu = result.menu; try config.validate()
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(config)
+        _ = try UserCommandConfiguration.decode(data)
+        textView.string = String(decoding: data, as: UTF8.self)
+        pendingDiscard = false; dirty = true; window?.isDocumentEdited = true
+        setStatus(L10n.text("Меню импортировано в редактор. Ассоциации сохранены. Проверьте POSIX-команды и нажмите «Сохранить»."))
+    }
+    static func runUserCommandUISmokeChecks() throws -> [String] {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("FarCommandUI-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = UserCommandStore(globalURL: directory.appendingPathComponent("commands.json"))
+        let controller = UserCommandsWindow(store: store)
+        defer { controller.window?.orderOut(nil) }
+        let imported = try FarMenuImporter.parse(Data("F3: Inspect\n  printf '%s' !.!\n".utf8))
+        try controller.installImportedMenu(imported)
+        guard controller.dirty, controller.window?.isDocumentEdited == true,
+              !FileManager.default.fileExists(atPath: store.globalURL.path) else { throw UserCommandError("Import must leave a dirty buffer without saving or execution") }
+        let decoded = try UserCommandConfiguration.decode(Data(controller.textView.string.utf8))
+        guard decoded.menu == imported.menu, !decoded.associations.isEmpty else { throw UserCommandError("Import must preserve associations") }
+        controller.saveText()
+        guard !controller.dirty, try store.loadGlobal().menu == imported.menu else { throw UserCommandError("Imported menu failed validated save") }
+        let inputs = try UserCommandExpander.inputs(in: "printf '%s' {input:Search|default} {input:Other}")
+        let form = UserCommandParameterForm(inputs: inputs)
+        form.fields[0].stringValue = "O'Brien $(bad); Unicode ф"
+        form.fields[1].stringValue = ""
+        guard form.values[inputs[0].identifier] == form.fields[0].stringValue,
+              form.values[inputs[1].identifier] == "", form.fields[0].accessibilityLabel() == "Search" else {
+            throw UserCommandError("Interactive parameter form lost a value or accessibility label")
+        }
+        return ["FarMenu import changes the editor buffer and preserves associations until validated Save", "Interactive parameter fields preserve literal values, empty arguments and accessibility labels"]
+    }
     @objc private func closeEditor() { window?.performClose(nil) }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard confirmClose() else { return false }
         finalizeClose()
         return true
     }
+}
+
+/// A single input dialog collects every unique parameter before command preview.
+@MainActor
+final class UserCommandParameterForm {
+    let view: NSScrollView
+    let fields: [NSTextField]
+    private let inputs: [UserCommandInput]
+    var values: [String: String] { Dictionary(uniqueKeysWithValues: zip(inputs, fields).map { ($0.identifier, $1.stringValue) }) }
+    init(inputs: [UserCommandInput]) {
+        self.inputs = inputs
+        fields = inputs.map { input in
+            let field = NSTextField(string: input.defaultValue)
+            field.setAccessibilityLabel(input.title)
+            field.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+            return field
+        }
+        let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8
+        for (input, field) in zip(inputs, fields) {
+            let label = NSTextField(wrappingLabelWithString: input.title)
+            stack.addArrangedSubview(label); stack.addArrangedSubview(field)
+            field.translatesAutoresizingMaskIntoConstraints = false
+            field.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        let height = CGFloat(inputs.count) * 64 + 8
+        let document = UserCommandParameterDocumentView(frame: NSRect(x: 0, y: 0, width: 470, height: height))
+        stack.translatesAutoresizingMaskIntoConstraints = false; document.addSubview(stack)
+        NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 4), stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -4), stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 4)])
+        view = NSScrollView(frame: NSRect(x: 0, y: 0, width: 490, height: min(420, height)))
+        view.hasVerticalScroller = true; view.documentView = document; view.borderType = .bezelBorder
+    }
+    static func collect(_ inputs: [UserCommandInput], title: String) -> [String: String]? {
+        guard !inputs.isEmpty else { return [:] }
+        let form = UserCommandParameterForm(inputs: inputs)
+        let alert = NSAlert(); alert.messageText = title
+        alert.informativeText = L10n.text("Введите параметры. Каждое значение передаётся одним буквальным аргументом; команда появится для проверки следующим шагом.")
+        alert.accessoryView = form.view
+        alert.addButton(withTitle: L10n.text("Продолжить")); alert.addButton(withTitle: L10n.text("Отмена"))
+        alert.window.initialFirstResponder = form.fields.first
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return form.values
+    }
+}
+
+@MainActor private final class UserCommandParameterDocumentView: NSView {
+    override var isFlipped: Bool { true }
 }

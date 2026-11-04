@@ -60,6 +60,45 @@ final class FileToolsTests {
         #expect(try String(contentsOf: a, encoding: .utf8) == "replacement")
     }
 
+    @Test func farRenamePlanIsExplicitAndPreservesDirectoryAndLinkKinds() throws {
+        let a = try file("отчёт.part.txt", content: "unchanged bytes")
+        let folder = try directory("folder.part.txt")
+        let link = root.appendingPathComponent("link.part.txt")
+        try manager.createSymbolicLink(at: link, withDestinationURL: a)
+        let plan = try FileTools.renamePlan([a, folder, link], template: "*.bak", mode: .farMask)
+        #expect(plan.map(\.destination.lastPathComponent) == ["отчёт.part.bak", "folder.part.bak", "link.part.bak"])
+        #expect(plan[1].source.isDirectory)
+        #expect(plan[2].source.isSymbolicLink)
+        #expect(manager.fileExists(atPath: a.path))
+        #expect(try FileTools.executeRename(plan) == 3)
+        #expect(try String(contentsOf: plan[0].destination, encoding: .utf8) == "unchanged bytes")
+        #expect(try FileTools.metadata(plan[1].destination).isDirectory)
+        #expect(try FileTools.metadata(plan[2].destination).isSymbolicLink)
+        #expect(try manager.destinationOfSymbolicLink(atPath: plan[2].destination.path) == a.path)
+        let literal = try file("sample.txt")
+        #expect(try FileTools.renamePlan([literal], template: "{name}.*", mode: .farMask).first?.destination.lastPathComponent == "{name}.txt")
+        #expect(try FileTools.renamePlan([literal], template: "*.bak").first?.destination.lastPathComponent == "*.bak")
+    }
+
+    @Test func farRenameRejectsCollisionsEmptyResultsPathsAndReplacedSources() throws {
+        let a = try file("a.txt"), b = try file("a.md")
+        #expect(throws: (any Error).self) { try FileTools.renamePlan([a, b], template: "*.bak", mode: .farMask) }
+        #expect(throws: (any Error).self) { try FileTools.renamePlan([a], template: "*", mode: .farMask) }
+        #expect(throws: (any Error).self) { try FileTools.renamePlan([a], template: "../*.bak", mode: .farMask) }
+        #expect(throws: (any Error).self) { try FileTools.renamePlan([a], template: "folder\\*.bak", mode: .farMask) }
+        let hidden = try file(".hidden")
+        #expect(throws: (any Error).self) { try FileTools.renamePlan([hidden], template: "?", mode: .farMask) }
+        let plan = try FileTools.renamePlan([a], template: "*.bak", mode: .farMask)
+        let destination = try file("a.bak", content: "preserved destination")
+        #expect(throws: (any Error).self) { try FileTools.executeRename(plan) }
+        #expect(try String(contentsOf: destination, encoding: .utf8) == "preserved destination")
+        try manager.removeItem(at: destination)
+        try manager.moveItem(at: a, to: root.appendingPathComponent("old-a"))
+        _ = try file("a.txt", content: "replacement")
+        #expect(throws: (any Error).self) { try FileTools.executeRename(plan) }
+        #expect(try String(contentsOf: a, encoding: .utf8) == "replacement")
+    }
+
     @Test func permissionsValidateOctalAndNeverFollowSymbolicLinks() throws {
         #expect(try FileTools.parsePermissions("0755") == 0o755)
         #expect(try FileTools.parsePermissions("644") == 0o644)
@@ -145,5 +184,30 @@ final class FileToolsTests {
         try manager.createSymbolicLink(atPath: dangling.path, withDestinationPath: "missing")
         #expect(try FileTools.permanentlyDelete(FileTools.snapshot([dangling])) == 1)
         #expect(throws: (any Error).self) { try FileTools.metadata(dangling) }
+    }
+}
+
+extension FileToolsTests {
+    @Test func executedRenameMovesDescriptionsAndPreservesUnrelatedBytes() throws {
+        let first = try file("first.txt"), second = try file("second.txt")
+        let metadata = try file("descript.ion", content: "first.txt First\nsecond.txt Second\nkeep\t exact bytes  \r\n")
+        let plan = try FileTools.renamePlan([first, second], template: "{name}.bak")
+        #expect(try FileTools.executeRename(plan) == 2)
+        #expect(try FileDescriptions.load(directory: root).descriptions == ["first.bak": "First", "second.bak": "Second", "keep": "exact bytes"])
+        #expect(try String(contentsOf: metadata, encoding: .utf8).contains("keep\t exact bytes  \r\n"))
+    }
+
+    @Test func unrepresentableDescriptionRenameReportsRetainedFilesAndOriginalMetadata() throws {
+        let source = try file("source")
+        let metadata = root.appendingPathComponent("descript.ion")
+        let original = try #require("source Описание\n".data(using: .windowsCP1251))
+        try original.write(to: metadata)
+        let plan = try FileTools.renamePlan([source], template: "🙂")
+        let key = FileDescriptionEncoding.directoryKey(root)
+        #expect(throws: (any Error).self) { try FileTools.executeRename(plan, descriptionEncodings: [key: .windows1251]) }
+        #expect(manager.fileExists(atPath: plan[0].destination.path))
+        #expect(try String(contentsOf: plan[0].destination, encoding: .utf8) == "hello")
+        #expect(try Data(contentsOf: metadata) == original)
+        #expect(!manager.fileExists(atPath: source.path))
     }
 }

@@ -10,6 +10,8 @@ final class ArchivePanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
     var onSwitchPanel: (() -> Void)?
     var onAction: ((NSEvent) -> Bool)?
     var onView: ((String) -> Void)?
+    var onOpenArchive: ((String) -> Void)?
+    var frameDisplayPath: String? { didSet { updateHeading() } }
     var onDirectoryChange: (() -> Void)?
     private(set) var snapshot: ArchiveSnapshot
     private(set) var currentDirectory = ""
@@ -23,6 +25,20 @@ final class ArchivePanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private var active = false
     private var shiftMarking: Bool?
 
+    struct NavigationState {
+        let directory: String
+        let cursor: String?
+        let marks: Set<String>
+        let cursors: [String: String]
+    }
+    func captureNavigationState() -> NavigationState {
+        NavigationState(directory: currentDirectory, cursor: cursorPath, marks: marks, cursors: cursorByDirectory)
+    }
+    func restoreNavigationState(_ state: NavigationState) {
+        currentDirectory = state.directory; marks = state.marks; cursorByDirectory = state.cursors
+        rebuild(preferredCursor: state.cursor)
+    }
+
     private struct Row {
         let path: String
         let name: String
@@ -33,7 +49,7 @@ final class ArchivePanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     var caption: String {
-        "\(snapshot.sourceURL.lastPathComponent) !/\(currentDirectory)"
+        "\(frameDisplayPath ?? snapshot.sourceURL.lastPathComponent) !/\(currentDirectory)"
     }
     var cursorPath: String? {
         guard table.selectedRow > 0, table.selectedRow < rows.count + 1 else { return nil }
@@ -94,9 +110,17 @@ final class ArchivePanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
         table.enumerateAvailableRowViews { view, _ in (view as? FileRow)?.active = value; view.needsDisplay = true }
     }
     func update(snapshot: ArchiveSnapshot) {
-        let cursor = cursorPath
+        let sameArchive = self.snapshot.sourceURL.standardizedFileURL == snapshot.sourceURL.standardizedFileURL
+        let cursor = sameArchive ? cursorPath : nil
+        if !sameArchive { currentDirectory = ""; marks.removeAll(); cursorByDirectory.removeAll() }
         self.snapshot = snapshot
         rebuild(preferredCursor: cursor)
+    }
+
+    func reveal(path: String) {
+        currentDirectory = Self.parent(path)
+        marks.removeAll()
+        rebuild(preferredCursor: path)
     }
 
     private func rebuild(preferredCursor: String? = nil) {
@@ -119,7 +143,7 @@ final class ArchivePanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
             if $0.directory != $1.directory { return $0.directory }
             return $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
-        heading.stringValue = "АРХИВ · \(snapshot.format.rawValue.uppercased()) · \(caption)"
+        updateHeading()
         table.reloadData()
         let wanted = preferredCursor ?? cursorByDirectory[currentDirectory]
         let index = wanted.flatMap { path in rows.firstIndex { $0.path == path } }.map { $0 + 1 } ?? (rows.isEmpty ? 0 : 1)
@@ -127,12 +151,13 @@ final class ArchivePanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     private static func parent(_ path: String) -> String { path.split(separator: "/").dropLast().joined(separator: "/") }
+    private func updateHeading() { heading.stringValue = "АРХИВ · \(snapshot.format.displayName) · \(caption)" }
     private func select(_ index: Int) {
         let row = max(0, min(index, rows.count))
         table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false); table.scrollRowToVisible(row)
     }
     private func updateSummary() {
-        summary.stringValue = "Объектов: \(rows.count) · Отмечено: \(marks.count) · \(snapshot.entries.contains(where: \.isEncrypted) ? "Зашифрованный архив · запись недоступна" : "F3 просмотр · F4 правка · F5 извлечение · F8 удаление")"
+        summary.stringValue = "Объектов: \(rows.count) · Отмечено: \(marks.count) · \(snapshot.isReadOnly ? L10n.text("Архив только для чтения · F3 просмотр · F5 извлечь") : "F3 просмотр · F4 правка · F5 извлечение · F6 перенос · F7 папка · F8 удаление")"
     }
     private func toggleMark(move: Bool) {
         guard let path = cursorPath else { return }
@@ -149,14 +174,18 @@ final class ArchivePanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
         }
         select(table.selectedRow + amount)
     }
-    @objc private func openSelection() {
+    @objc func openSelection() {
         if table.selectedRow == 0 { parent(); return }
         guard let path = cursorPath else { return }
         if cursorIsDirectory {
             cursorByDirectory[currentDirectory] = path
             marks.removeAll()
             currentDirectory = path; rebuild()
-        } else { onView?(path) }
+        } else if Self.isArchiveName(path) { onOpenArchive?(path) }
+        else { onView?(path) }
+    }
+    static func isArchiveName(_ path: String) -> Bool {
+        ["zip", "tar", "7z", "rar", "tgz", "tbz", "tbz2", "txz", "gz", "bz2", "xz"].contains((path as NSString).pathExtension.lowercased())
     }
     private func parent() {
         guard !currentDirectory.isEmpty else { onClose?(); return }
@@ -167,6 +196,7 @@ final class ArchivePanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
     private func handleKey(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if event.keyCode == 121, modifiers == .control, let path = cursorPath, !cursorIsDirectory { onOpenArchive?(path); return true }
         if event.keyCode == 48, modifiers.isEmpty || modifiers == .shift { onSwitchPanel?(); return true }
         if event.keyCode == 53, modifiers.isEmpty { onClose?(); return true }
         if event.keyCode == 51, modifiers.isEmpty { parent(); return true }

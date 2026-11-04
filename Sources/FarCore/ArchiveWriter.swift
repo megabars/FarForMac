@@ -4,11 +4,12 @@ import CArchive
 
 public enum ArchiveOverwritePolicy: Sendable { case replace, skip, error }
 public enum ArchiveWriteError: LocalizedError {
-    case conflict(String), encryptedReadOnly, sourceChanged(String), io(String)
+    case conflict(String), encryptedReadOnly, nestedReadOnly, sourceChanged(String), io(String)
     public var errorDescription: String? {
         switch self {
         case .conflict(let path): return "Объект уже существует в архиве: «\(path)»."
         case .encryptedReadOnly: return "Зашифрованные архивы доступны только для чтения: сохранение шифрования не поддерживается."
+        case .nestedReadOnly: return "Вложенный архив доступен только для чтения. Извлеките его для изменения; запись в родительский архив не выполняется."
         case .sourceChanged(let path): return "Источник изменился: «\(path)»."
         case .io(let text): return text
         }
@@ -16,8 +17,22 @@ public enum ArchiveWriteError: LocalizedError {
 }
 
 /// Synchronous, transactional archive worker. Invoke away from the main thread.
-/// Only regular files and directories are accepted; sources are never moved or deleted.
+/// Only regular files and directories are accepted; local filesystem sources are never moved or deleted.
 public enum ArchiveWriter {
+    /// Creates an explicit directory entry, including an empty one. Parents may be implicit.
+    public static func createDirectory(_ snapshot: ArchiveSnapshot, path: String,
+                                       cancellation: TransferCancellation = TransferCancellation(),
+                                       onProgress: @escaping (ArchiveProgress) -> Void = { _ in }) throws -> ArchiveSnapshot {
+        try update(snapshot, directories: [path], cancellation: cancellation, onProgress: onProgress)
+    }
+
+    /// Renames/moves disjoint entry trees in one archive transaction. Existing destinations are never merged or replaced.
+    public static func move(_ snapshot: ArchiveSnapshot, entries: [String: String],
+                            cancellation: TransferCancellation = TransferCancellation(),
+                            onProgress: @escaping (ArchiveProgress) -> Void = { _ in }) throws -> ArchiveSnapshot {
+        try update(snapshot, moves: entries, cancellation: cancellation, onProgress: onProgress)
+    }
+
     public static func create(sources: [URL], destination: URL, format: ArchiveFormat,
                               policy: ArchiveOverwritePolicy = .error,
                               cancellation: TransferCancellation = TransferCancellation(),
@@ -42,6 +57,7 @@ public enum ArchiveWriter {
 
     public static func update(_ snapshot: ArchiveSnapshot, additions: [URL] = [], deletions: [String] = [],
                               replacements: [String: URL] = [:], prefix: String = "",
+                              directories: [String] = [], moves: [String: String] = [:],
                               policy: ArchiveOverwritePolicy = .error,
                               cancellation: TransferCancellation = TransferCancellation(),
                               onProgress: @escaping (ArchiveProgress) -> Void = { _ in }) throws -> ArchiveSnapshot {
@@ -49,6 +65,7 @@ public enum ArchiveWriter {
         try worker.check()
         try snapshot.verifyCurrent()
         guard !snapshot.entries.contains(where: \.isEncrypted) else { throw ArchiveWriteError.encryptedReadOnly }
+        guard !snapshot.isReadOnly else { throw ArchiveWriteError.nestedReadOnly }
         let target = try worker.destination(snapshot.sourceURL)
         let original = try WriteStamp(target)
         let headers = try worker.headers(snapshot)
@@ -59,6 +76,21 @@ public enum ArchiveWriter {
             let path = try worker.path(entry.path)
             let local = try workspace.url(for: path)
             nodes[path] = WriteNode(url: local, stamp: try WriteStamp(local), header: headers[path])
+        }
+        // Mapping is applied to a complete immutable view of the original tree, never one move at a time.
+        try worker.move(moves, in: &nodes)
+        let directorySource = workspace.rootURL.appendingPathComponent(".far-new-directory-\(UUID().uuidString)")
+        if !directories.isEmpty {
+            try worker.fm.createDirectory(at: directorySource, withIntermediateDirectories: false,
+                                          attributes: [.posixPermissions: 0o700])
+            for value in directories {
+                try worker.check()
+                let name = try worker.path(value)
+                guard nodes[name] == nil, !nodes.keys.contains(where: { $0.hasPrefix(name + "/") }) else {
+                    throw ArchiveWriteError.conflict(name)
+                }
+                nodes[name] = WriteNode(url: directorySource, stamp: try WriteStamp(directorySource), header: nil)
+            }
         }
         for value in deletions {
             let path = try worker.path(value)
@@ -159,13 +191,68 @@ private final class ArchiveWriteWorker {
         }
     }
     func path(_ value: String) throws -> String {
-        let value = value.hasSuffix("/") ? String(value.dropLast()) : value
+        let value = (value.hasSuffix("/") ? String(value.dropLast()) : value).precomposedStringWithCanonicalMapping
         let components = value.split(separator: "/", omittingEmptySubsequences: false)
         guard !value.isEmpty, !value.hasPrefix("/"), !value.contains("\\"), !value.contains(":"),
               !value.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }),
-              components.count <= ArchiveLimits.default.maximumPathDepth,
-              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { throw ArchiveError.invalidPath(value) }
+              value.utf8.count <= 16_384, components.count <= ArchiveLimits.default.maximumPathDepth,
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && $0.utf8.count <= 255 }) else { throw ArchiveError.invalidPath(value) }
         return value
+    }
+    func folded(_ value: String) -> String {
+        value.folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX")).precomposedStringWithCanonicalMapping
+    }
+    func move(_ proposed: [String: String], in nodes: inout [String: WriteNode]) throws {
+        var mappings: [(source: String, target: String)] = []
+        for source in proposed.keys.sorted() {
+            try check()
+            let old = try path(source), new = try path(proposed[source]!)
+            guard nodes[old] != nil || nodes.keys.contains(where: { $0.hasPrefix(old + "/") }) else {
+                throw ArchiveError.invalidPath(old)
+            }
+            guard old != new, !folded(new).hasPrefix(folded(old) + "/") else { throw ArchiveError.invalidPath(new) }
+            for prior in mappings {
+                let a = folded(old), b = folded(prior.source), c = folded(new), d = folded(prior.target)
+                guard a != b, !a.hasPrefix(b + "/"), !b.hasPrefix(a + "/"),
+                      c != d, !c.hasPrefix(d + "/"), !d.hasPrefix(c + "/") else { throw ArchiveWriteError.conflict(new) }
+            }
+            mappings.append((old, new))
+        }
+        let original = nodes
+        func selected(_ key: String) -> Bool { mappings.contains { key == $0.source || key.hasPrefix($0.source + "/") } }
+        var result = original.filter { !selected($0.key) }
+        for mapping in mappings {
+            let target = folded(mapping.target)
+            // Include implicit directories and case/Unicode collisions in the conflict check.
+            guard !result.keys.contains(where: { folded($0) == target || folded($0).hasPrefix(target + "/") }) else {
+                throw ArchiveWriteError.conflict(mapping.target)
+            }
+            for (key, node) in original where key == mapping.source || key.hasPrefix(mapping.source + "/") {
+                let destination = try path(mapping.target + key.dropFirst(mapping.source.count))
+                guard result[destination] == nil else { throw ArchiveWriteError.conflict(destination) }
+                result[destination] = node
+            }
+        }
+        try validateTopology(result)
+        nodes = result
+    }
+    func validateTopology(_ nodes: [String: WriteNode]) throws {
+        guard nodes.count <= ArchiveLimits.default.maximumEntries else { throw ArchiveError.limitExceeded("число элементов") }
+        var topology: [String: (path: String, directory: Bool)] = [:]
+        for name in nodes.keys.sorted() {
+            try check()
+            let name = try path(name)
+            let components = name.split(separator: "/")
+            for count in 1...components.count {
+                let path = components.prefix(count).joined(separator: "/")
+                let directory = count < components.count || nodes[name]!.stamp.directory
+                let key = folded(path)
+                if let old = topology[key], old.path != path || old.directory != directory {
+                    throw ArchiveWriteError.conflict(path)
+                }
+                topology[key] = (path, directory)
+            }
+        }
     }
     func add(_ source: URL, path proposed: String, to nodes: inout [String: WriteNode], policy: ArchiveOverwritePolicy) throws {
         try check()
@@ -206,8 +293,14 @@ private final class ArchiveWriteWorker {
         try snapshot.verifyCurrent()
         guard let reader = archive_read_new() else { throw ArchiveWriteError.io("Не удалось создать читатель архива.") }
         defer { archive_read_free(reader) }
-        archive_read_support_format_zip(reader); archive_read_support_format_tar(reader); archive_read_support_filter_all(reader)
-        guard archive_read_open_filename(reader, snapshot.sourceURL.path, 65536) == ARCHIVE_OK else { throw message(reader) }
+        archive_read_support_format_zip(reader); archive_read_support_format_tar(reader)
+        let fd = Darwin.open(snapshot.sourceURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw ArchiveError.changedArchive }
+        defer { Darwin.close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { throw ArchiveError.changedArchive }
+        try ArchiveCompression.prepare(reader, fd: fd, size: info.st_size, cancellation: cancellation)
+        guard archive_read_open_fd(reader, fd, 65536) == ARCHIVE_OK else { throw message(reader) }
         var result: [String: WriteHeader] = [:], entry: OpaquePointer?
         while true {
             try check()
@@ -220,8 +313,6 @@ private final class ArchiveWriteWorker {
             guard archive_entry_is_encrypted(entry) == 0 else { throw ArchiveWriteError.encryptedReadOnly }
             guard archive_entry_filetype(entry) == S_IFREG || archive_entry_filetype(entry) == S_IFDIR,
                   archive_entry_symlink(entry) == nil, archive_entry_hardlink(entry) == nil else { throw ArchiveError.unsafeEntry(name) }
-            // Filtered TAR must retain its compression; this writer intentionally supports plain TAR only.
-            guard archive_filter_code(reader, 0) == ARCHIVE_FILTER_NONE else { throw ArchiveError.unsupportedFormat }
             result[name] = header
             guard archive_read_data_skip(reader) == ARCHIVE_OK else { throw message(reader) }
         }
@@ -231,6 +322,7 @@ private final class ArchiveWriteWorker {
     func commit(_ nodes: [String: WriteNode], to target: URL, format: ArchiveFormat,
                 original: WriteStamp?, snapshot: ArchiveSnapshot?) throws -> ArchiveSnapshot {
         try check()
+        try validateTopology(nodes)
         var byteTotal: Int64 = 0
         for node in nodes.values where node.stamp.regular {
             guard node.stamp.size <= ArchiveLimits.default.maximumTotalBytes - byteTotal else { throw ArchiveError.limitExceeded("общий размер") }
@@ -249,7 +341,7 @@ private final class ArchiveWriteWorker {
         guard fsync(fd) == 0 else { throw ArchiveWriteError.io(String(cString: strerror(errno))) }
         let verified = try ArchiveReader.open(stage, cancellation: cancellation, onProgress: progress)
         let expected = Set(nodes.keys)
-        guard Set(verified.entries.map(\.path)) == expected else { throw ArchiveWriteError.io("Проверка записанного архива не пройдена.") }
+        guard verified.format == format, Set(verified.entries.map(\.path)) == expected else { throw ArchiveWriteError.io("Проверка записанного архива не пройдена.") }
         let proof = try ArchiveReader.extract(verified, cancellation: cancellation, onProgress: progress)
         defer { proof.cleanup() }
         for (name, node) in nodes where node.stamp.regular {
@@ -300,6 +392,15 @@ private final class ArchiveWriteWorker {
         defer { archive_write_free(writer) }
         let configured = format == .zip ? archive_write_set_format_zip(writer) : archive_write_set_format_pax_restricted(writer)
         guard configured == ARCHIVE_OK else { throw message(writer) }
+        let filtered: Int32
+        switch format {
+        case .zip, .tar: filtered = archive_write_add_filter_none(writer)
+        case .tarGzip: filtered = archive_write_add_filter_gzip(writer)
+        case .tarBzip2: filtered = archive_write_add_filter_bzip2(writer)
+        case .tarXz: filtered = archive_write_add_filter_xz(writer)
+        }
+        // Refuse ARCHIVE_WARN, which may enable an external compressor fallback.
+        guard filtered == ARCHIVE_OK else { throw message(writer) }
         // ZIP's UTF-8 flag otherwise depends on the process locale, even when
         // archive_entry_set_pathname_utf8 supplies UTF-8 bytes. Set an explicit
         // output charset without changing the locale of the application.

@@ -68,7 +68,7 @@ final class UserCommandsTests {
             UserCommandConfiguration(menu: [UserMenuEntry(title: "neither")]),
             UserCommandConfiguration(menu: [UserMenuEntry(title: "empty", children: [])]),
             UserCommandConfiguration(menu: [UserMenuEntry(title: "a", command: "true", key: "A"), UserMenuEntry(title: "b", command: "true", key: "a")]),
-            UserCommandConfiguration(menu: [UserMenuEntry(title: "a", command: "true", key: "F1")]),
+            UserCommandConfiguration(menu: [UserMenuEntry(title: "a", command: "true", key: "F25")]),
             UserCommandConfiguration(associations: [UserFileAssociation(title: "bad", mask: "[")]),
             UserCommandConfiguration(associations: [UserFileAssociation(title: "no commands", mask: "*")]),
             UserCommandConfiguration(menu: (0..<513).map { UserMenuEntry(title: "\($0)", command: "true") })
