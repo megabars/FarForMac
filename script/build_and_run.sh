@@ -36,10 +36,11 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHighResolutionCapable</key><true/>
-<key>NSHumanReadableCopyright</key><string>FarForMac — independent macOS file manager.</string>
+<key>NSHumanReadableCopyright</key><string>Copyright © 2026 Ivan Mezentsev. All rights reserved.</string>
 </dict></plist>
 PLIST
 cp THIRD_PARTY_NOTICES.md "$BUNDLE/Contents/Resources/"
+cp LICENSE "$BUNDLE/Contents/Resources/"
 cp Examples/Extensions/text-tools.py "$BUNDLE/Contents/Resources/Extensions/"
 chmod 755 "$BUNDLE/Contents/Resources/Extensions/text-tools.py"
 if [[ -n "${DEVELOPER_ID_IDENTITY:-}" ]]; then

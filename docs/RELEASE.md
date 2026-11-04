@@ -30,9 +30,20 @@ launch environment. The core application does not require Python. A release
 that promises working bundled extensions on clean macOS must first bundle a
 licensed runtime or replace these examples with a native helper.
 
-`THIRD_PARTY_NOTICES.md` is copied into the app. The owner has deliberately deferred a license for the project's own code.
-No project license is added by this workflow; public redistribution remains
-a separate owner decision.
+The project's own code is covered by the proprietary evaluation license in
+`LICENSE`, copyright 2026 Ivan Mezentsev. It grants free evaluation of 0.7.0
+without a fixed expiry; it does not promise free future versions or grant
+routine production use, redistribution or resale rights. Third-party license
+rights, applicable GitHub hosting rights and mandatory legal exceptions are
+preserved. See `docs/LICENSING.md` for an explanatory summary.
+
+New bundles include `LICENSE` alongside `THIRD_PARTY_NOTICES.md`; verification
+checks that the license covers the bundle's application version. A future
+version requires an explicit licensing decision. The original published
+0.7.0 build 3 ZIP is unchanged and accompanied by a separate LICENSE asset;
+for that historical archive, use `codesign --verify --deep --strict` for the
+signature check instead of the new validator requiring an embedded LICENSE.
+The original v0.7.0 tag remains pinned to its release commit.
 
 ## Signing and notarization
 

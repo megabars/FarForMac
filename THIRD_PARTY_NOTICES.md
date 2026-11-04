@@ -1,5 +1,8 @@
 # Third-party notices
 
+FarForMac's own code is licensed separately under the proprietary evaluation
+terms in LICENSE. Those terms do not replace or restrict the licenses below.
+
 ## libarchive
 
 The application links to the libarchive library supplied by macOS. The unmodified

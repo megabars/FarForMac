@@ -1,0 +1,106 @@
+FarForMac Proprietary Evaluation License
+Revision 1 — 4 November 2026
+Covered application version: 0.7.0
+
+Copyright (c) 2026 Ivan Mezentsev. All rights reserved, except for the
+permissions expressly granted below and the rights described in section 5.
+
+1. Scope and licensor
+
+Ivan Mezentsev (the "Licensor") grants this license for the Licensor's own
+FarForMac version 0.7.0 application, source code, example extensions and
+documentation (the "Software"). Third-party components are excluded from
+this proprietary grant and remain subject to their own terms.
+
+The official project is https://github.com/megabars/FarForMac. Requests for
+additional permissions may be directed to the maintainer of that repository.
+This license also grants the permissions below for previously obtained
+official copies of FarForMac 0.7.0. It does not retroactively remove any rights
+already validly granted under other applicable terms.
+
+2. Free evaluation permission
+
+Subject to these terms, you receive a non-exclusive, royalty-free license to
+download, install and run version 0.7.0 on devices you own or control solely
+to test and evaluate its functionality. Individuals and organizations may
+evaluate the Software, including for a possible future business purchase.
+You may make reasonable backup copies for that evaluation.
+
+You may inspect the supplied source, compile it and privately modify it for
+your own testing, debugging and evaluation. These permissions do not grant
+the right to distribute your modified code or builds, except as provided in
+section 5. You may report defects and publish truthful reviews or test
+results. You are not required to submit feedback or personal data.
+
+This evaluation permission has no fixed expiry date while you comply with
+these terms. It is not a paid subscription and does not automatically convert
+to one. Routine production use beyond testing and evaluation requires a
+separate permission from the Licensor.
+
+3. Reserved rights and restrictions
+
+Except where section 5 applies or the Licensor separately authorizes it in
+writing, you may not sell, sublicense, rent, redistribute or publicly host
+the Software or modified versions, incorporate its proprietary code into
+another product, or offer it as a service to third parties. Share a link to
+the official project instead of distributing copies.
+
+Do not remove or misrepresent copyright or license notices, represent the
+Software as your own work, or suggest endorsement by the Licensor, Far Group
+or other third parties without permission. No trademark or endorsement
+rights are granted by this license. Rights not expressly granted are reserved.
+
+4. Future versions and contributions
+
+These terms cover version 0.7.0 only. They do not promise free future versions,
+updates, support, a commercial license or any particular feature. Future
+versions may be offered for a fee or under different terms. Such changes do
+not by themselves end the evaluation permission for your version 0.7.0 copy
+or impose a retroactive fee for its permitted use.
+
+Submitting a suggestion or bug report does not transfer ownership of your
+code or other contributions. Rights needed to incorporate third-party code
+contributions must be agreed separately; this license is not a contributor
+copyright assignment.
+
+5. Third-party rights, hosting terms and mandatory law
+
+THIRD_PARTY_NOTICES.md identifies supplied third-party notices. Their licenses
+continue to govern their respective components. Nothing here restricts rights
+they grant, claims ownership of third-party material, or permits removing
+their required notices. A license applicable to FAR itself does not become
+the license of FarForMac's independently written proprietary code.
+
+Where the repository is publicly available on GitHub, rights to view and fork
+it granted under GitHub's applicable terms are not restricted by this license.
+Those hosting rights do not by themselves grant broader redistribution or
+commercial exploitation rights in the Licensor's proprietary code.
+
+Nothing in these terms excludes or limits rights that applicable law does
+not allow to be excluded or limited, including applicable consumer rights,
+statutory exceptions, and lawful interoperability or reverse-engineering
+rights. Those rights prevail over conflicting restrictions here.
+
+6. Preliminary software, warranties and liability
+
+The Software is a preliminary evaluation release and may contain defects.
+Keep independent backups of important data before testing file operations.
+To the extent permitted by applicable law, the Software is supplied "as is"
+and "as available", without warranties of fitness for a particular purpose,
+merchantability, non-infringement, uninterrupted operation or data integrity.
+
+To the extent permitted by applicable law, the Licensor is not liable for
+indirect or consequential loss, lost profits, loss of data or business
+interruption arising from use of the Software. These exclusions do not apply
+to liability that cannot lawfully be excluded or limited.
+
+7. Ending use and interpretation
+
+You may end your use at any time. If you materially breach these terms, the
+Licensor may terminate the permissions granted to you by notice. In that
+case, stop uses relying on this license and remove copies held solely under
+it, subject to any retention rights required by law. Your own files and data
+remain yours; this license never grants the Licensor rights to them.
+
+The English text in this file is the operative license. Any explanatory
+summary is for convenience only, subject always to mandatory applicable law.
