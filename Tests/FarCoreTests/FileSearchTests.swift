@@ -246,6 +246,38 @@ struct FileSearchTests {
         #expect(collect(options).summary.errors == 1)
     }
 
+    @Test func explicitPrefixSearchesLargeFilesWithoutReadingTheSuffix() throws {
+        let tree = try SearchTree()
+        let early = tree.url("early.txt"), late = tree.url("late.txt")
+        try (Data("needle α".utf8) + Data([0])).write(to: early)
+        try tree.file("late.txt", "xxxxxx needle")
+        var options = SearchOptions(roots: [early, late])
+        options.contentMode = .literal; options.contentQuery = "needle"
+        options.maximumContentBytes = 8; options.firstContentBytes = 8
+        for encoding in [ViewerEncoding.utf8, .automatic] {
+            options.contentEncoding = encoding
+            let found = collect(options)
+            #expect(found.results.map(\.name) == ["early.txt"])
+            #expect(found.summary.errors == 0)
+        }
+        options.firstContentBytes = 5
+        #expect(collect(options).results.isEmpty)
+    }
+
+    @Test func hexPrefixIncludesExactBoundaryButNotCrossingMatch() throws {
+        let tree = try SearchTree()
+        let file = tree.url("binary")
+        try Data([0x10, 0x00, 0xff, 0x42, 0xff]).write(to: file)
+        var options = SearchOptions(roots: [file])
+        options.contentMode = .hex; options.contentQuery = "00 FF"
+        options.maximumContentBytes = 3; options.firstContentBytes = 3
+        #expect(collect(options).results.first?.byteOffset == 1)
+        options.firstContentBytes = 2
+        let capped = collect(options)
+        #expect(capped.results.isEmpty)
+        #expect(capped.summary.errors == 0)
+    }
+
     @Test
     func missingAndDeniedRootsReportErrorsAlongsideOtherResults() throws {
         let tree = try SearchTree()

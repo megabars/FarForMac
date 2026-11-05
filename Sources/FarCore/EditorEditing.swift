@@ -148,13 +148,16 @@ public enum EditorEditing {
     }
 
     public static func replaceAll(in text: String, query: EditorSearchQuery,
-                                  replacement: String) throws -> EditorEdit {
+                                  replacement: String, from: Int? = nil,
+                                  direction: ViewerSearchDirection = .forward) throws -> EditorEdit {
         let plan = try EditorSearchPlan(query)
         let source = text as NSString
         guard source.length <= maximumOutputUTF16 else { throw EditorEditingError.operationTooLarge }
         guard replacement.utf16.count <= maximumOutputUTF16 else { throw EditorEditingError.operationTooLarge }
         var projectedLength = source.length
         var changes = [(NSRange, String)]()
+        let forward = direction == .forward
+        let origin = min(source.length + 1, max(0, from ?? (forward ? 0 : source.length + 1)))
         func append(_ range: NSRange, _ inserted: String) throws {
             guard changes.count < maximumMatches else { throw EditorEditingError.operationTooLarge }
             try checkOutput(base: projectedLength - range.length, inserted: inserted.utf16.count)
@@ -162,38 +165,68 @@ public enum EditorEditing {
             changes.append((range, inserted))
         }
         if query.regex {
-            for line in EditorLine.table(text) {
+            let lines = EditorLine.table(text)
+            for line in forward ? lines : Array(lines.reversed()) {
+                if forward ? line.end < origin : line.start >= origin { continue }
                 let value = source.substring(with: line.range)
                 try checkLine(value, offset: line.start)
                 let deadline = ProcessInfo.processInfo.systemUptime + 0.05
-                var cursor = 0
-                while cursor <= line.range.length {
-                    guard let match = try regexFirst(value, plan: plan, from: cursor, deadline: deadline) else { break }
-                    guard changes.count < maximumMatches else { throw EditorEditingError.operationTooLarge }
+                var cursor = forward ? scalarBoundary(value, at: max(0, origin - line.start), forward: true) : 0
+                var backwardMatches = [NSTextCheckingResult]()
+                func appendMatch(_ match: NSTextCheckingResult) throws {
                     let remaining = maximumOutputUTF16 - (projectedLength - match.range.length)
                     let inserted = try expandedReplacement(replacement, match: match, value: value, plan: plan, remaining: remaining)
                     try append(NSRange(location: line.start + match.range.location, length: match.range.length), inserted)
-                    cursor = NSMaxRange(match.range)
-                    if match.range.length == 0 {
-                        if cursor == line.range.length { break }
-                        cursor = scalarBoundary(value, at: cursor + 1, forward: true)
+                }
+                while cursor <= line.range.length {
+                    guard let match = try regexFirst(value, plan: plan, from: cursor, deadline: deadline) else { break }
+                    if forward { try appendMatch(match) }
+                    else {
+                        guard line.start + match.range.location < origin else { break }
+                        guard backwardMatches.count < maximumMatches else { throw EditorEditingError.operationTooLarge }
+                        backwardMatches.append(match)
                     }
+                    if forward && match.range.length > 0 { cursor = NSMaxRange(match.range) }
+                    else if match.range.location < line.range.length {
+                        cursor = scalarBoundary(value, at: match.range.location + 1, forward: true)
+                    } else { break }
+                }
+                var rightEdge = line.range.length
+                for match in backwardMatches.reversed() where NSMaxRange(match.range) <= rightEdge {
+                    try appendMatch(match)
+                    rightEdge = match.range.location
                 }
             }
         } else {
             let folding = query.fuzzy ? try SearchTextFolding(text, caseSensitive: query.caseSensitive) : nil
-            var cursor = 0
-            while let match = try literalFind(text, plan: plan, from: cursor, direction: .forward, folding: folding) {
+            var cursor = forward ? origin : 0
+            var backwardMatches = [NSRange]()
+            func appendMatch(_ match: NSRange) throws {
                 let inserted = query.preserveStyle ? try plan.style!.replacement(replacement, in: text, range: match) : replacement
-                try append(match, inserted); cursor = NSMaxRange(match)
+                try append(match, inserted)
+            }
+            while let match = try literalFind(text, plan: plan, from: cursor, direction: .forward, folding: folding) {
+                if forward { try appendMatch(match); cursor = NSMaxRange(match) }
+                else {
+                    guard match.location < origin else { break }
+                    guard backwardMatches.count < maximumMatches else { throw EditorEditingError.operationTooLarge }
+                    backwardMatches.append(match)
+                    cursor = scalarBoundary(text, at: match.location + 1, forward: true)
+                }
+            }
+            var rightEdge = source.length
+            for match in backwardMatches.reversed() where NSMaxRange(match) <= rightEdge {
+                try appendMatch(match)
+                rightEdge = match.location
             }
         }
         guard let finalChange = changes.last else {
             return EditorEdit(text: text, selection: NSRange(location: 0, length: 0), count: 0)
         }
+        if !forward { changes.reverse() }
         let result = NSMutableString(string: text)
         for (range, inserted) in changes.reversed() { result.replaceCharacters(in: range, with: inserted) }
-        let shift = changes.dropLast().reduce(0) { $0 + $1.1.utf16.count - $1.0.length }
+        let shift = forward ? changes.dropLast().reduce(0) { $0 + $1.1.utf16.count - $1.0.length } : 0
         return EditorEdit(text: result as String,
                           selection: NSRange(location: finalChange.0.location + shift, length: finalChange.1.utf16.count),
                           count: changes.count, changes: changes.map { EditorTextChange(range: $0.0, replacementUTF16Length: $0.1.utf16.count) })
@@ -277,20 +310,9 @@ public enum EditorEditing {
     /// (AppKit has no virtual cursor beyond EOL). Empty components preserve position.
     public static func gotoOffset(in text: String, expression: String, from: Int,
                                   hexadecimal: Bool = false) throws -> Int {
-        guard expression.utf16.count <= 4096 else { throw EditorEditingError.invalidPosition }
-        let parts = expression.components(separatedBy: CharacterSet(charactersIn: ",.;:"))
-        let values: [String]
-        if parts.count > 1 {
-            guard parts.count == 2 else { throw EditorEditingError.invalidPosition }
-            values = parts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        } else {
-            values = expression.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-            guard values.count <= 2 else { throw EditorEditingError.invalidPosition }
-        }
         let current = lineColumn(in: text, offset: from)
         let lines = EditorLine.table(text)
-        let row = try EditorGotoCoordinate(values.first ?? "", hexadecimal: hexadecimal)
-        let col = try EditorGotoCoordinate(values.count > 1 ? values[1] : "", hexadecimal: hexadecimal)
+        let (row, col) = try EditorGotoCoordinate.pair(expression, hexadecimal: hexadecimal)
         let lineIndex = try row.resolve(current: current.line - 1, extent: lines.count, maximum: lines.count - 1)
         let value = (text as NSString).substring(with: lines[lineIndex].range)
         let column = try col.resolve(current: current.column - 1, extent: value.unicodeScalars.count,

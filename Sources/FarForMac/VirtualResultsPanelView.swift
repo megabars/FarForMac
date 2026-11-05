@@ -7,6 +7,7 @@ final class VirtualResultsPanelView: NSView, NSTableViewDataSource, NSTableViewD
     var onFocus: (() -> Void)?
     var onClose: (() -> Void)?
     var onSwitchPanel: (() -> Void)?
+    var onDelete: (() -> Void)?
     var onAction: ((NSEvent) -> Bool)?
     var onReveal: ((SearchMatch) -> Void)?
     var onChange: (() -> Void)?
@@ -65,7 +66,7 @@ final class VirtualResultsPanelView: NSView, NSTableViewDataSource, NSTableViewD
     /// AppKit may keep a detached view alive until its current event/autorelease
     /// pool ends. End the source lease explicitly when the host closes the panel.
     func releaseReferences() {
-        onFocus = nil; onClose = nil; onSwitchPanel = nil; onAction = nil
+        onDelete = nil; onFocus = nil; onClose = nil; onSwitchPanel = nil; onAction = nil
         onReveal = nil; onChange = nil; onResultsChange = nil
         collection.removeAll(); visible.removeAll(); selection = PanelSelection()
         table.reloadData()
@@ -90,6 +91,9 @@ final class VirtualResultsPanelView: NSView, NSTableViewDataSource, NSTableViewD
     func append(_ results: [SearchMatch]) throws { try Self.checkCount(collection.items + results); collection.append(results); rebuild(); onResultsChange?(collection.items) }
     func setFilter(_ value: String) { filter = value; rebuild() }
     func setSortOptions(_ value: FileSortOptions) { options = value; rebuild() }
+    func removeCompleted(ids: Set<String>) {
+        collection.remove(ids: ids); rebuild(); onResultsChange?(collection.items)
+    }
     func removeSelection() {
         collection.remove(ids: Set(selectedResults.map(\.id)))
         rebuild(); onResultsChange?(collection.items)
@@ -160,7 +164,7 @@ final class VirtualResultsPanelView: NSView, NSTableViewDataSource, NSTableViewD
     private func updateSummary() {
         let savedCount = collection.items.filter { if case .saved = $0 { return true }; return false }.count
         let offline = savedCount == 0 ? "" : " · " + L10n.text("Не проверено") + ": \(savedCount) " + L10n.text("(проверка перед действием)")
-        summary.stringValue = L10n.text("Показано") + ": \(visible.count)/\(collection.items.count) · " + L10n.text("Отмечено") + ": \(selection.markedIDs.count)" + L10n.text(" · Enter — к источнику · F7/F8/Del — убрать ссылку · Esc — к папке") + offline
+        summary.stringValue = L10n.text("Показано") + ": \(visible.count)/\(collection.items.count) · " + L10n.text("Отмечено") + ": \(selection.markedIDs.count)" + L10n.text(" · Enter — к источнику · F7 — убрать ссылку · F8/Del — удалить объект · Esc — к папке") + offline
     }
     private func compare(_ left: String, _ right: String) -> ComparisonResult {
         var flags: String.CompareOptions = options.caseSensitive ? [] : [.caseInsensitive]
@@ -179,7 +183,8 @@ final class VirtualResultsPanelView: NSView, NSTableViewDataSource, NSTableViewD
         if event.keyCode == 53, modifiers.isEmpty { onClose?(); return true }
         if event.keyCode == 48, modifiers.isEmpty || modifiers == .shift { onSwitchPanel?(); return true }
         if [36, 76].contains(event.keyCode), modifiers.isEmpty { revealSelection(); return true }
-        if [51, 117, 98, 100].contains(event.keyCode), modifiers.isEmpty { removeSelection(); return true }
+        if event.keyCode == 98, modifiers.isEmpty { removeSelection(); return true }
+        if [51, 117, 100].contains(event.keyCode), modifiers.isEmpty { onDelete?(); return true }
         if [49, 114].contains(event.keyCode), modifiers.isEmpty {
             if event.keyCode == 114 { toggleMarkAndAdvance() }
             else if let current = cursorResult { selection.saveMarks(); selection.toggle(current.id); rebuild() }
@@ -292,6 +297,13 @@ extension PanelView {
         panel.clearMarks()
         panel.focusFilter(); panel.filterField.stringValue = "ui-smoke.invalid"; panel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: panel.filterField))
         guard panel.virtualPanel?.visible.count == 1 else { throw PanelSessionError("Virtual full-origin filter mismatch") }
+        var deletionRequests = 0
+        panel.virtualPanel?.onDelete = { deletionRequests += 1 }
+        let beforeDeletion = panel.virtualResults.count
+        if let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 100) {
+            panel.virtualPanel?.table.keyDown(with: event)
+        }
+        guard deletionRequests == 1, panel.virtualResults.count == beforeDeletion else { throw PanelSessionError("F8 removed a reference instead of requesting confirmed source deletion") }
         panel.removeVirtualSelection()
         guard panel.virtualResults.count == 2, mutationCounts == [3, 2],
               try Data(contentsOf: local) == Data("local source".utf8),

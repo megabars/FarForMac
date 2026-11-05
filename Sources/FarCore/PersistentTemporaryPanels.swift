@@ -122,7 +122,7 @@ private enum SavedPanelsJSON {
             let result = try dictionary(payload, keys: ["connection", "entry", "snippet", "lineNumber", "byteOffset"])
             if let entry = result["entry"] { _ = try dictionary(entry, keys: ["path", "isDirectory", "isSymbolicLink", "size", "modified", "version"]) }
             if let object = result["connection"] {
-                let connection = try dictionary(object, keys: ["id", "name", "kind", "host", "port", "username", "rootPath", "privateKeyPath", "timeoutSeconds", "sftpAuthenticationMode", "sftpJumpHosts"])
+                let connection = try dictionary(object, keys: ["id", "name", "profileGroup", "kind", "host", "port", "username", "rootPath", "privateKeyPath", "timeoutSeconds", "sftpAuthenticationMode", "sftpJumpHosts"])
                 if let jumps = connection["sftpJumpHosts"] as? [Any] {
                     guard jumps.count <= 4 else { throw PanelSessionError("Слишком много SSH-шлюзов.") }
                     for jump in jumps { _ = try dictionary(jump, keys: ["host", "port", "username", "privateKeyPath", "authenticationMode"]) }

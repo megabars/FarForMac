@@ -287,7 +287,7 @@ import Testing
         let found = collect(request)
         #expect(found.archived.count == 1000)
         #expect(found.summary.matches == 1000)
-        #expect(found.summary.errors == 0)
+        #expect(found.summary.errors == 0, "\(found.issues.map { $0.path + ": " + $0.message }.joined(separator: "\n"))")
         #expect(!found.summary.limitReached)
         #expect(Set(found.archived.map(\.id)).count == 1000)
     }

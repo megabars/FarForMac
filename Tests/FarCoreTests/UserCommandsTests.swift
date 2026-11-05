@@ -66,7 +66,6 @@ final class UserCommandsTests {
             UserCommandConfiguration(menu: [UserMenuEntry(title: "", command: "true")]),
             UserCommandConfiguration(menu: [UserMenuEntry(title: "both", command: "true", children: [])]),
             UserCommandConfiguration(menu: [UserMenuEntry(title: "neither")]),
-            UserCommandConfiguration(menu: [UserMenuEntry(title: "empty", children: [])]),
             UserCommandConfiguration(menu: [UserMenuEntry(title: "a", command: "true", key: "A"), UserMenuEntry(title: "b", command: "true", key: "a")]),
             UserCommandConfiguration(menu: [UserMenuEntry(title: "a", command: "true", key: "F25")]),
             UserCommandConfiguration(associations: [UserFileAssociation(title: "bad", mask: "[")]),
@@ -128,5 +127,22 @@ final class UserCommandsTests {
         try store.saveGlobalText(UserCommandStore.example)
         #expect(throws: (any Error).self) { try store.saveGlobalText("{}") }
         #expect(try store.loadGlobalText() == UserCommandStore.example)
+    }
+
+    @Test func localMenuEditingPersistsEmptySubmenusAndRejectsStaleEdits() throws {
+        let store = UserCommandStore(globalURL: root.appendingPathComponent("commands.json"))
+        try store.saveGlobalText(UserCommandStore.example)
+        let localURL = root.appendingPathComponent(UserCommandStore.localFilename)
+        let association = UserFileAssociation(title: "Source", mask: "*.txt", execute: "true")
+        let local = UserCommandConfiguration(associations: [association])
+        try encoded(local).write(to: localURL)
+        let previous = try #require(try store.loadLocalMenu(in: root))
+        let submenu = UserMenuEntry(title: "New submenu", children: [])
+        let current = try store.saveMenu([submenu], replacing: previous)
+        #expect(current.entries == [submenu])
+        #expect(try UserCommandConfiguration.decode(Data(contentsOf: localURL)).associations == [association])
+        #expect(try store.loadGlobalText() == UserCommandStore.example)
+        #expect(throws: (any Error).self) { try store.saveMenu([], replacing: previous) }
+        #expect(try store.loadMenu(in: root).entries == [submenu])
     }
 }

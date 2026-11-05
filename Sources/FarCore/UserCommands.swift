@@ -140,8 +140,7 @@ public struct UserCommandConfiguration: Codable, Equatable, Sendable {
                     }
                 }
                 if let command = entry.command { try UserCommandExpander.validate(command) }
-                if let children = entry.children {
-                    guard !children.isEmpty else { throw UserCommandError("Подменю «\(entry.title)» пустое.") }
+                if let children = entry.children, !children.isEmpty {
                     try entries(children, depth: depth + 1)
                 }
             }
@@ -188,6 +187,8 @@ public struct LoadedUserMenu: Sendable {
     public let entries: [UserMenuEntry]
     public let source: URL
     public let isLocal: Bool
+    fileprivate let configuration: UserCommandConfiguration
+    fileprivate let originalData: Data?
 }
 
 /// Reads are explicit: constructing the store or changing panel directory performs no I/O or execution.
@@ -209,11 +210,38 @@ public struct UserCommandStore: Sendable {
         return text
     }
     public func loadMenu(in directory: URL) throws -> LoadedUserMenu {
-        let local = directory.appendingPathComponent(Self.localFilename)
-        if let data = try read(local) {
-            return LoadedUserMenu(entries: try UserCommandConfiguration.decode(data).menu, source: local, isLocal: true)
+        if let local = try loadLocalMenu(in: directory) { return local }
+        return try loadMainMenu()
+    }
+    public func loadLocalMenu(in directory: URL) throws -> LoadedUserMenu? {
+        let url = directory.appendingPathComponent(Self.localFilename)
+        guard let data = try read(url) else { return nil }
+        let config = try UserCommandConfiguration.decode(data)
+        return LoadedUserMenu(entries: config.menu, source: url, isLocal: true, configuration: config, originalData: data)
+    }
+    public func loadMainMenu() throws -> LoadedUserMenu {
+        let data = try read(globalURL)
+        let config = try data.map(UserCommandConfiguration.decode) ?? UserCommandConfiguration()
+        return LoadedUserMenu(entries: config.menu, source: globalURL, isLocal: false, configuration: config, originalData: data)
+    }
+    public func saveMenu(_ entries: [UserMenuEntry], replacing original: LoadedUserMenu) throws -> LoadedUserMenu {
+        guard original.isLocal ? original.source.lastPathComponent == Self.localFilename : original.source == globalURL else {
+            throw UserCommandError("Неизвестный источник пользовательского меню.")
         }
-        return LoadedUserMenu(entries: try loadGlobal().menu, source: globalURL, isLocal: false)
+        var config = original.configuration
+        config.menu = entries
+        try config.validate()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(config)
+        _ = try UserCommandConfiguration.decode(data)
+        try save(data, to: original.source) {
+            guard try read(original.source) == original.originalData else {
+                throw UserCommandError("Файл меню изменился. Откройте меню заново.")
+            }
+        }
+        return LoadedUserMenu(entries: entries, source: original.source, isLocal: original.isLocal,
+            configuration: config, originalData: data)
     }
     public func importFarMenu(at url: URL) throws -> FarMenuImportResult {
         guard let data = try read(url) else { throw UserCommandError("Файл меню не найден.") }
@@ -250,7 +278,10 @@ public struct UserCommandStore: Sendable {
     public func saveGlobalText(_ text: String) throws {
         let data = Data(text.utf8)
         _ = try UserCommandConfiguration.decode(data)
-        let directory = globalURL.deletingLastPathComponent()
+        try save(data, to: globalURL)
+    }
+    private func save(_ data: Data, to destination: URL, verify: () throws -> Void = {}) throws {
+        let directory = destination.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         var info = stat()
         guard lstat(directory.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else {
@@ -269,7 +300,9 @@ public struct UserCommandStore: Sendable {
                 offset += count
             }
         }
-        guard fsync(descriptor) == 0, rename(temporary.path, globalURL.path) == 0 else {
+        guard fsync(descriptor) == 0 else { throw UserCommandError("Не удалось сохранить конфигурацию команд.") }
+        try verify()
+        guard rename(temporary.path, destination.path) == 0 else {
             throw UserCommandError("Не удалось сохранить конфигурацию команд.")
         }
     }

@@ -115,12 +115,31 @@ private final class NetworkDownloadBatch {
     }
     func connect(in panel: PanelView) {
         guard available() else { return }
-        let window = NetworkConnectionWindow(); connectionWindow = window
+        let window = NetworkConnectionWindow(profiles: AppRuntime.isSmoke ? [] : nil); connectionWindow = window
         window.onConnect = { [weak self, weak panel] connection, password, save, saveSecret in
             guard let self, let panel else { return }
             self.connect(connection, password: password, in: panel, save: save, saveSecret: saveSecret)
         }
         window.showWindow(nil)
+    }
+    func connectProfile(_ connection: NetworkConnection, password suppliedPassword: String? = nil, in panel: PanelView) {
+        guard available(), NetworkConnectionWindow.confirmCleartextConnection(connection.kind) else { return }
+        do {
+            var password = suppliedPassword
+            let needsPassword = connection.kind != .sftp || connection.sftpAuthenticationMode == .password
+            if needsPassword, password == nil { password = try NetworkCredentials.password(for: connection.id) }
+            if needsPassword, password == nil {
+                let alert = NSAlert(); alert.messageText = "Вход на сервер"
+                alert.informativeText = "\(connection.username)@\(connection.host):\(connection.port)"
+                let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+                field.placeholderString = "Пароль"; field.setAccessibilityLabel("Пароль")
+                alert.accessoryView = field; alert.addButton(withTitle: "Подключиться"); alert.addButton(withTitle: "Отмена")
+                alert.window.initialFirstResponder = field
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+                password = field.stringValue; field.stringValue = ""
+            }
+            connect(connection, password: password, in: panel, save: false, saveSecret: false)
+        } catch { onError(error) }
     }
     private func connect(_ connection: NetworkConnection, password: String?, in panel: PanelView, save: Bool, saveSecret: Bool) {
         guard available() else { return }
@@ -298,7 +317,7 @@ private final class NetworkDownloadBatch {
         } catch { onError(error); return false }
     }
     func transfer(from active: PanelView, to passive: PanelView, move: Bool, cursorOnly: Bool = false) {
-        guard available(), !active.isVirtual, !passive.isVirtual else { return }
+        guard available(), !active.isResource, !passive.isResource, !active.isVirtual, !passive.isVirtual, !passive.isTemporary else { return }
         if active.isRemote && passive.isRemote {
             guard move else { onStatus("Копирование между двумя сетевыми панелями пока недоступно."); return }
             moveRemote(from: active, to: passive, cursorOnly: cursorOnly); return

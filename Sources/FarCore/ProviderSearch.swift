@@ -253,9 +253,13 @@ struct ProviderSearchPlan {
     }
     func scan(_ source: LocalViewerSource, _ cancellation: ProviderSearchCancellation) throws -> SearchContentMatch? {
         try checkContentSize(source.size)
-        if let bytes { return try SearchContentScanner.scanBytes(source: source, query: bytes, cancellation: cancellation.contentCancellation) }
+        if let bytes {
+            return try SearchContentScanner.scanBytes(source: SearchContentScanner.prefix(source, firstBytes: options.firstContentBytes),
+                query: bytes, cancellation: cancellation.contentCancellation)
+        }
         guard let expression else { return nil }
-        return try SearchContentScanner.scan(document: ViewerDocument(source: source, encoding: options.contentEncoding ?? .utf8),
+        return try SearchContentScanner.scan(document: SearchContentScanner.document(source, encoding: options.contentEncoding ?? .utf8,
+                firstBytes: options.firstContentBytes),
             expression: expression, literal: options.contentMode == .literal, queryLength: options.contentQuery.utf16.count,
             cancellation: cancellation.contentCancellation)
     }

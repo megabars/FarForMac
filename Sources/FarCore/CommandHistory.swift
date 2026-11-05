@@ -13,10 +13,12 @@ public struct ActivityHistoryEntry: Codable, Identifiable, Equatable, Sendable {
     /// Working directory in which a command was explicitly submitted.
     public let directory: String?
     public let date: Date
+    public let locked: Bool?
+    public var isLocked: Bool { locked == true }
 
     public init(id: UUID = UUID(), kind: ActivityHistoryKind, value: String,
-                directory: String? = nil, date: Date = Date()) {
-        self.id = id; self.kind = kind; self.value = value; self.directory = directory; self.date = date
+                directory: String? = nil, date: Date = Date(), locked: Bool? = nil) {
+        self.id = id; self.kind = kind; self.value = value; self.directory = directory; self.date = date; self.locked = locked
     }
 }
 
@@ -52,7 +54,7 @@ public struct CommandHistory: Codable, Sendable {
     public mutating func record(kind: ActivityHistoryKind, value: String,
                                 directory: String? = nil, date: Date = Date()) throws {
         let existing = entries.first { $0.kind == kind && $0.value == value && $0.directory == directory }
-        let entry = ActivityHistoryEntry(id: existing?.id ?? UUID(), kind: kind, value: value, directory: directory, date: date)
+        let entry = ActivityHistoryEntry(id: existing?.id ?? UUID(), kind: kind, value: value, directory: directory, date: date, locked: existing?.locked)
         guard Self.valid(entry) else { throw CommandHistoryError.invalidEntry }
         entries.removeAll { $0.id == entry.id }
         entries.insert(entry, at: 0)
@@ -67,9 +69,23 @@ public struct CommandHistory: Codable, Sendable {
         }
     }
 
-    public mutating func remove(id: UUID) { entries.removeAll { $0.id == id } }
+    public mutating func toggleLock(id: UUID) {
+        guard let index = entries.firstIndex(where: { $0.id == id }) else { return }
+        let entry = entries[index]
+        entries[index] = ActivityHistoryEntry(id: entry.id, kind: entry.kind, value: entry.value,
+            directory: entry.directory, date: entry.date, locked: entry.isLocked ? nil : true)
+    }
+
+    public mutating func remove(id: UUID) { entries.removeAll { $0.id == id && !$0.isLocked } }
     public mutating func clear(kind: ActivityHistoryKind? = nil) {
-        if let kind { entries.removeAll { $0.kind == kind } } else { entries.removeAll() }
+        entries.removeAll { !$0.isLocked && (kind == nil || $0.kind == kind) }
+    }
+    public mutating func removeMissing(kinds: Set<ActivityHistoryKind>) {
+        entries.removeAll { entry in
+            guard entry.kind != .command, kinds.contains(entry.kind), !entry.isLocked else { return false }
+            var info = stat()
+            return fstatat(AT_FDCWD, entry.value, &info, 0) != 0 && (errno == ENOENT || errno == ENOTDIR)
+        }
     }
 
     public static var defaultFileURL: URL {
@@ -138,14 +154,16 @@ public struct CommandHistory: Codable, Sendable {
     }
 
     private mutating func trim() {
-        if entries.count > capacity { entries.removeLast(entries.count - capacity) }
         // Reserve JSON escaping overhead. This also keeps in-memory/defaults
         // histories bounded when every submitted command is near 64 KiB.
-        var bytes = 0
-        entries = Array(entries.prefix { entry in
-            bytes += entry.value.utf8.count * 6 + (entry.directory?.utf8.count ?? 0) * 6 + 512
-            return bytes <= Self.maximumStoredBytes
-        })
+        var bytes = 0, kept = Set<UUID>()
+        for entry in entries.filter(\.isLocked) + entries.filter({ !$0.isLocked }) {
+            let size = entry.value.utf8.count * 6 + (entry.directory?.utf8.count ?? 0) * 6 + 512
+            guard kept.count < capacity, size <= Self.maximumStoredBytes - bytes else { break }
+            bytes += size
+            kept.insert(entry.id)
+        }
+        entries.removeAll { !kept.contains($0.id) }
     }
 
     private static func valid(_ entry: ActivityHistoryEntry) -> Bool {

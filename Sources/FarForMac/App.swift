@@ -12,7 +12,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     let status = label("Готово", size: 11, color: Palette.accent)
     private var editors: [TextFileWindow] = []
     private var viewers: [ViewerWindow] = []
-    private let network = NetworkCoordinator()
+    let network = NetworkCoordinator()
+    var savedConnectionsPanels: [String: SavedConnectionsPanelView] = [:]
+    let farMainMenu = FarMainMenuView()
     private let archiveOperations = ArchiveOperationController()
     private let virtualOperations = NetworkOperationController()
     private var lastVirtualResults: [SearchMatch] = []
@@ -43,6 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var groupsWindow: MaskGroupsWindow?
     private var searchWindow: SearchWindow?
     private var toolWindows: [NSWindowController] = []
+    var canChangePanelResource: Bool { !busy && !toolMutationPending && !operationQueue.hasPendingOperations }
     private var toolMutationPending: Bool {
         searchWindow?.isProviderSearching == true || savedPanelRestore.isWorking || virtualOperations.isWorking || network.isWorking || archiveOperations.isWorking || archiveEdits.contains(where: { $0.isWorking }) || toolWindows.contains { ($0 as? FileToolsWindowController)?.hasPendingMutation == true }
     }
@@ -79,11 +82,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let branding = horizontal([brand], spacing: 5)
         let spacer = NSView()
         let home = toolbarButton("Домой", symbol: "house", action: "home")
-        let volumes = toolbarButton("Диски", symbol: "externaldrive", action: "volumes")
         let terminal = toolbarButton("Терминал", symbol: "terminal", action: "terminal")
         let hidden = toolbarButton("Скрытые", symbol: "eye", action: "hidden")
         let operations = toolbarButton("Операции", symbol: "list.bullet.rectangle", action: "operations")
-        let toolbar = inset(horizontal([branding, spacer, home, volumes, terminal, hidden, operations], spacing: 12), x: 18, y: 15)
+        let toolbar = inset(horizontal([branding, spacer, home, terminal, hidden, operations], spacing: 12), x: 18, y: 15)
 
         let defaults = AppPreferences.defaults
         func location(_ key: String) -> URL {
@@ -98,6 +100,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         network.onError = { [weak self] error in self?.showError(error) }
         network.onChanged = { [weak self] in self?.refresh() }
         for panel in [left!, right!] {
+            panel.onChooseResource = { [weak self] panel, anchor in self?.showResourceMenu(for: panel, anchor: anchor) }
+
             panel.onRemoteRefresh = { [weak self] panel in self?.network.refresh(panel) }
             panel.onRemoteDisconnect = { [weak self] provider in
                 guard let self else { return }
@@ -118,6 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             panel.onFocus = { [weak self] pane in self?.activate(pane) }
             panel.onError = { [weak self] error in self?.showError(error) }
             panel.onVirtualReveal = { [weak self] panel, match in self?.activate(panel); self?.revealSearchMatch(match) }
+            panel.onVirtualDelete = { [weak self] panel in self?.activate(panel); self?.deleteVirtualResults() }
             panel.onVirtualOpen = { [weak self] panel, match in self?.activate(panel); self?.openSearchMatch(match, editable: false) }
             panel.onVirtualResultsChange = { [weak self] matches in
                 guard let self, !self.synchronizingTemporaryPanels else { return }
@@ -146,7 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 let key = ObjectIdentifier(panel)
                 if self.recordedPanelPaths[key] != panel.directory.path {
                     self.recordedPanelPaths[key] = panel.directory.path
-                    shell.recordActivity(.folder, value: panel.directory.path)
+                    if panel.recordDirectoryActivity { shell.recordActivity(.folder, value: panel.directory.path) }
                 }
                 if panel === self.active { shell.updateDirectory() }
                 self.updateAuxiliaryPanels()
@@ -164,9 +169,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         shellWorkspace = ShellWorkspace(context: { [weak self] in
             guard let self else { return UserCommandContext(currentFile: nil, markedFiles: [], activeDirectory: URL(fileURLWithPath: "/"), passiveDirectory: URL(fileURLWithPath: "/")) }
             return UserCommandContext(currentFile: self.active.cursorEntry?.url, markedFiles: self.active.markedEntries.map(\.url), activeDirectory: self.active.directory, passiveDirectory: self.passive.directory, passiveCurrentFile: self.passive.cursorEntry?.url, passiveMarkedFiles: self.passive.markedEntries.map(\.url))
-        }, navigate: { [weak self] url in self?.active.load(url, preserveSelection: false) }, openFile: { [weak self] url, editable in
+        }, navigate: { [weak self] url in self?.active.navigateHistory(to: url.path) }, openFile: { [weak self] url, editable in
             _ = self?.openDocument(url, editable: editable)
         }, showTerminal: { [weak self] in self?.setTerminalVisible(true) }, togglePanels: { [weak self] in self?.toggleTerminal() }, refreshPanels: { [weak self] in self?.refresh() }, report: { [weak self] text in self?.status.stringValue = text })
+        shellWorkspace.navigateHistoryFolder = { [weak self] url, passiveSide, preserveOrder in
+            guard let self else { return }
+            let target = passiveSide ? self.passive : self.active!
+            target.navigateHistory(to: url.path, focus: !passiveSide, recordActivity: !preserveOrder)
+        }
         shellWorkspace.terminalView.isHidden = true
 
         let hints = horizontal([status, NSView(), label("Space  пометка    Tab  панель    ⌘L  путь    ⌘F  фильтр", size: 11, color: Palette.muted)])
@@ -201,6 +211,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if AppRuntime.isSmoke { Task { await runUISmoke() } }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, NSApp.keyWindow != nil else { return event }
+            if NSApp.modalWindow?.windowController is PanelListMenu || event.window?.windowController is PanelListMenu { return event }
+            if self.farMainMenu.isPresented, self.window.isKeyWindow {
+                self.farMainMenu.handleKey(event); return nil
+            }
             if CommandWorkspace.shared.handle(event) { return nil }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if self.window.isKeyWindow, self.terminalVisible, self.shellWorkspace.isRunning,
@@ -211,11 +225,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if event.keyCode == 122 && flags.intersection([.command, .control, .option, .shift]).isEmpty {
                 self.help(); return nil
             }
-            if event.keyCode == 118 && flags.intersection([.command, .control, .option, .shift]) == [.shift], NSApp.keyWindow?.attachedSheet == nil {
+            if event.keyCode == 118 && flags.intersection([.command, .control, .option, .shift]) == [.shift], NSApp.keyWindow?.attachedSheet == nil, self.window.isKeyWindow || NSApp.keyWindow?.windowController is TextFileWindow {
+                if self.window.isKeyWindow, self.active.isResource {
+                    _ = self.active.resourceFunction?(4, true); return nil
+                }
                 self.newEditor(nil); return nil
             }
             guard self.window.isKeyWindow, self.window.attachedSheet == nil else { return event }
             let modifiers = flags.intersection([.command, .control, .option, .shift])
+            if modifiers == [.shift], event.keyCode == 109 { self.showCommandMenu(restoringLast: true); return nil }
             if !self.terminalVisible, modifiers == [.control], [17, 37, 12].contains(event.keyCode) {
                 let mode: PanelContentMode = event.keyCode == 17 ? .tree : (event.keyCode == 37 ? .info : .quickView)
                 self.active.setContentMode(self.active.contentMode == mode ? .files : mode)
@@ -230,15 +248,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if modifiers == [.option], event.keyCode == 100 { self.shellWorkspace.showHistory(.command); return nil }
             if modifiers == [.option], event.keyCode == 103 { self.shellWorkspace.showHistory(.view); return nil }
             if modifiers == [.option], event.keyCode == 111 { self.shellWorkspace.showHistory(.folder); return nil }
+            if self.active.isResource, modifiers == [.control], event.keyCode == 15 { self.active.refresh(); return nil }
             if flags.contains(.command) || flags.contains(.control) { return event }
             let codes: [UInt16: Int] = [122: 1, 120: 2, 99: 3, 118: 4, 96: 5, 97: 6, 98: 7, 100: 8, 101: 9, 109: 10]
             if let function = codes[event.keyCode] {
                 if flags.intersection([.option, .shift]) == [.option] && (function == 1 || function == 2) {
-                    self.activate(function == 1 ? self.left : self.right)
-                    self.active.focus()
-                    self.showPanelMenu(named: "Тома")
+                    self.showResourceMenu(for: function == 1 ? self.left : self.right)
                 } else if flags.intersection([.option, .shift]) == [.option] && function == 7 {
                     self.openSearch()
+                } else if self.active.isResource, !flags.contains(.option) {
+                    if self.active.resourceFunction?(function, flags.contains(.shift)) == true { return nil }
+                    if ![1, 9, 10].contains(function) { return event }
+                    self.performFunction(function)
+                } else if flags.intersection([.option, .shift]) == [.shift] && function == 1 {
+                    self.createArchive()
                 } else if flags.intersection([.option, .shift]) == [.shift] && (function == 5 || function == 6) {
                     if !self.busy { self.transfer(move: function == 6, cursorOnly: true) }
                 } else if flags.intersection([.shift, .option]).isEmpty {
@@ -254,7 +277,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func newEditor(_ sender: Any?) {
         guard NSApp.keyWindow?.attachedSheet == nil else { return }
-        let editor = TextFileWindow(newIn: active.directory, onView: { [weak self] url, offset, encoding in
+        let current = NSApp.keyWindow?.windowController as? TextFileWindow
+        guard let request = TextFileWindow.openCreateRequest(in: current?.openCreateDirectory ?? active.directory) else { return }
+        if FileManager.default.fileExists(atPath: request.url.path) {
+            _ = openDocument(request.url, editable: true, encoding: request.encoding, useRememberedEncoding: request.useRememberedEncoding)
+            return
+        }
+        let editor = TextFileWindow(newAt: request.url, encoding: request.encoding, onView: { [weak self] url, offset, encoding in
             self?.openDocument(url, editable: false, byteOffset: offset, encoding: encoding) ?? false
         })
         editors.removeAll { $0.window?.isVisible == false && $0.retainedArchiveWorkspace == nil && $0.retainedRemoteWorkspace == nil }
@@ -439,7 +468,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     private func extractArchiveSelection(cursorOnly: Bool = false) {
         guard !busy, !toolMutationPending, let browser = active.archivePanel else { return }
-        guard !passive.isVirtual, !passive.isArchive, !passive.isRemote else { inform("Выберите обычную папку назначения", "Прямое извлечение в другой архив или сетевую панель пока не поддерживается."); return }
+        guard !passive.isResource, !passive.isVirtual, !passive.isArchive, !passive.isRemote else { inform("Выберите обычную папку назначения", "Прямое извлечение в другой архив или сетевую панель пока не поддерживается."); return }
         let selected = cursorOnly ? browser.cursorPath.map { [$0] } ?? [] : browser.selectedArchivePaths
         let paths = selected.filter { path in !selected.contains(where: { path.hasPrefix($0 + "/") }) }
         guard !paths.isEmpty else { inform("Выберите объекты архива", "Отметьте файлы или установите курсор на объект."); return }
@@ -525,6 +554,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let archive = active?.isArchive == true
         let readOnly = active?.archivePanel?.snapshot.isReadOnly == true
         let temporary = !archive && !remote && active?.isTemporary == true
+        archiveFunctionButtons[4]?.title = "F4  Правка"
+        archiveFunctionButtons[6]?.title = "F6  Перенос"
         archiveFunctionButtons[4]?.isEnabled = !readOnly
         archiveFunctionButtons[5]?.isEnabled = !(archive && (passive.isArchive || passive.isRemote)) && !(passive.isArchive && (remote || passive.archivePanel?.snapshot.isReadOnly == true))
         archiveFunctionButtons[5]?.title = archive ? "F5  Извлечь" : (passive.isArchive == true ? "F5  В архив" : "F5  Копия")
@@ -536,16 +567,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         folderFunctionButton?.isEnabled = !readOnly
         folderFunctionButton?.title = temporary ? "F7  Убрать" : "F7  Папка"
         folderFunctionButton?.toolTip = temporary ? "F7 — убрать ссылку из временной панели, сохранив файл." : "F7 — создать папку."
-        if passive.isVirtual { archiveFunctionButtons[5]?.isEnabled = !remote && !archive; archiveFunctionButtons[6]?.isEnabled = false }
+        if passive.isVirtual || passive.isTemporary { archiveFunctionButtons[5]?.isEnabled = !remote && !archive; archiveFunctionButtons[6]?.isEnabled = false }
         if active?.isVirtual == true {
             archiveFunctionButtons[4]?.isEnabled = active.cursorVirtualResult?.canEdit == true
-            archiveFunctionButtons[5]?.isEnabled = !passive.isArchive && !passive.isRemote && !passive.isVirtual && !passive.isTemporary
+            archiveFunctionButtons[5]?.isEnabled = !passive.isArchive && !passive.isRemote && !passive.isResource
             archiveFunctionButtons[5]?.title = "F5  Копия"
             archiveFunctionButtons[6]?.isEnabled = false
             archiveFunctionButtons[8]?.isEnabled = true
-            archiveFunctionButtons[8]?.title = "F8  Убрать"
-            archiveFunctionButtons[8]?.toolTip = "Убрать ссылки из панели. Исходные файлы сохраняются."
+            archiveFunctionButtons[8]?.title = "F8  Удалить"
+            archiveFunctionButtons[8]?.toolTip = "Удалить исходные объекты после подтверждения. F7 убирает только ссылки."
             folderFunctionButton?.isEnabled = true; folderFunctionButton?.title = "F7  Убрать"
+        }
+        if let kind = active?.resourceKind {
+            let titles: [Int: String]
+            switch kind {
+            case .connections: titles = [4: "F4  Правка", 5: "F5  Экспорт", 6: "F6", 8: "F8  Удалить"]
+            case .localNetwork: titles = [4: "F4  Вход", 5: "F5  Подключить", 6: "F6", 8: "F8  Отключить"]
+            case .processes: titles = [4: "F4", 5: "F5", 6: "F6", 8: "F8  Завершить"]
+            }
+            for (number, title) in titles { archiveFunctionButtons[number]?.title = title; archiveFunctionButtons[number]?.isEnabled = kind == .processes ? number == 8 : number != 6 }
+            folderFunctionButton?.isEnabled = kind == .connections
+            folderFunctionButton?.title = "F7  Папка"
         }
         for button in archiveFunctionButtons.values { button.title = L10n.text(button.title) }
         if let button = folderFunctionButton { button.title = L10n.text(button.title) }
@@ -577,7 +619,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         toolWindows.append(controller); controller.showWindow(nil)
     }
     private func compareDirectories() {
-        guard !left.isVirtual, !right.isVirtual, !left.isTemporary, !right.isTemporary, !left.isArchive, !right.isArchive, !left.isRemote, !right.isRemote else {
+        guard !left.isResource, !right.isResource, !left.isVirtual, !right.isVirtual, !left.isTemporary, !right.isTemporary, !left.isArchive, !right.isArchive, !left.isRemote, !right.isRemote else {
             inform("Сравнение каталогов", "Вернитесь из временной панели к папкам."); return
         }
         let leftURL = left.directory, rightURL = right.directory
@@ -594,13 +636,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         comparisonWindow?.showWindow(nil)
     }
-    private func addToTemporaryPanel() {
+    private func addToTemporaryPanel(cursorOnly: Bool = false) {
         guard !busy else { return }
         if active.isVirtual {
-            do { try passive.appendVirtualResults(active.selectedVirtualResults) } catch { showError(error) }
+            let matches = cursorOnly ? active.cursorVirtualResult.map { [$0] } ?? [] : active.selectedVirtualResults
+            guard !matches.isEmpty else { return }
+            do {
+                if passive.isTemporary {
+                    try passive.showVirtualResults(passive.temporaryResults.map(SearchMatch.local) + matches, focusPanel: false)
+                } else { try passive.appendVirtualResults(matches) }
+            } catch { showError(error) }
             return
         }
-        let items = active.selectedEntries
+        let items = cursorOnly ? active.cursorEntry.map { [$0] } ?? [] : active.selectedEntries
         guard !items.isEmpty else { return }
         let snapshots = active.capturedSearchResults(for: items)
         let target = passive, path = target.directory
@@ -735,7 +783,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func panelKey(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
         if modifiers == [.control], event.keyCode == 121, !active.isArchive, let entry = active.cursorEntry, !entry.isDirectory { openArchive(entry.url, in: active); return true }
-        if active.isVirtual || active.isArchive || active.isRemote { return false }
+        if active.isResource || active.isVirtual || active.isArchive || active.isRemote { return false }
         if modifiers == [.control], event.keyCode == 116, active.isTemporary { locateTemporaryItem(); return true }
         if modifiers == [.control] || modifiers == [.control, .shift] {
             let digitCodes: [UInt16: Int] = [29: 0, 18: 1, 19: 2, 20: 3, 21: 4, 23: 5, 22: 6, 26: 7, 28: 8, 25: 9]
@@ -775,14 +823,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func functionButton(_ sender: NSButton) { performFunction(sender.tag) }
     @objc func functionMenu(_ sender: NSMenuItem) { if sender.tag == 1 { help() } else { performFunction(sender.tag) } }
     private let filePanelCommands: Set<String> = ["mark", "markAll", "clearMarks", "invertMarks", "invertAll", "markMask", "unmarkMask", "restoreMarks", "sameExtension", "unmarkExtension", "sameName", "unmarkName", "invertFiles", "quickFind", "findNext", "findPrevious", "filter", "fileDescription", "rename", "copyCursor", "batchRename", "properties", "symbolicLink", "hardLink", "deletePermanently"]
-    private let virtualPanelCommands: Set<String> = ["temporarySlots", "temporaryRemove", "temporaryLocate", "temporaryLastMixed", "temporaryAdd", "copyCursor", "search", "mark", "markAll", "clearMarks", "invertMarks", "invertAll", "markMask", "unmarkMask", "restoreMarks", "sameExtension", "unmarkExtension", "sameName", "unmarkName", "invertFiles", "filter", "reverseSort", "refresh", "home", "parent", "back", "forward", "networkConnect", "networkCancel", "archiveCancel", "operationQueue", "help", "commandLine", "toggleTerminal"]
+    private let virtualPanelCommands: Set<String> = ["volumes", "processList", "localNetwork", "savedConnections", "temporarySlots", "temporaryRemove", "temporaryLocate", "temporaryLastMixed", "temporaryAdd", "copyCursor", "search", "mark", "markAll", "clearMarks", "invertMarks", "invertAll", "markMask", "unmarkMask", "restoreMarks", "sameExtension", "unmarkExtension", "sameName", "unmarkName", "invertFiles", "filter", "reverseSort", "refresh", "home", "parent", "back", "forward", "networkConnect", "networkCancel", "archiveCancel", "operationQueue", "help", "commandLine", "toggleTerminal"]
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.representedObject as? String == "descriptionPropagation" {
             menuItem.state = DescriptionPreferences.enabled ? .on : .off
         }
         if menuItem.action == #selector(showInterfacePreferences(_:)) { return NSApp.modalWindow == nil }
         if menuItem.action == #selector(functionMenu(_:)), menuItem.tag == 8 {
-            menuItem.title = active?.isVirtual == true ? "Убрать ссылки из панели" : active?.isRemote == true ? "Удалить с сервера…" : active?.isArchive == true ? "Удалить из архива…" : "В Корзину…"
+            menuItem.title = active?.isVirtual == true ? "Удалить исходные объекты…" : active?.isRemote == true ? "Удалить с сервера…" : active?.isArchive == true ? "Удалить из архива…" : "В Корзину…"
         }
         if menuItem.action == #selector(functionMenu(_:)), menuItem.tag == 5 {
             menuItem.title = active?.isArchive == true ? "Извлечь из архива…" : (passive.isArchive == true ? "Добавить в архив…" : "Копировать…")
@@ -795,11 +843,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             return NSApp.keyWindow?.attachedSheet == nil
         }
         guard window != nil && window.isKeyWindow && window.attachedSheet == nil && !busy else { return false }
+        if active.isResource {
+            if menuItem.action == #selector(functionMenu(_:)) { return [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].contains(menuItem.tag) }
+            if let id = menuItem.representedObject as? String {
+                return ["volumes", "processList", "localNetwork", "savedConnections", "networkConnect", "refresh", "parent", "home", "help", "toggleTerminal", "commandLine"].contains(id)
+            }
+        }
         if active.isVirtual {
             if menuItem.action == #selector(functionMenu(_:)) {
                 if [2, 6].contains(menuItem.tag) { return false }
                 if menuItem.tag == 4 { return active.cursorVirtualResult?.canEdit == true && !toolMutationPending }
-                if menuItem.tag == 5 { return !passive.isVirtual && !passive.isRemote && !passive.isArchive && !passive.isTemporary && !toolMutationPending }
+                if menuItem.tag == 5 { return !passive.isResource && !passive.isVirtual && !passive.isRemote && !passive.isArchive && !passive.isTemporary && !toolMutationPending }
             }
             if let id = menuItem.representedObject as? String, !virtualPanelCommands.contains(id) { return false }
         }
@@ -842,7 +896,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func configureAutomation() {
         let workspace = CommandWorkspace.shared
         workspace.panelState = { [weak self] in
-            guard let self, !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote, self.active.contentMode == .files,
+            guard let self, !self.active.isResource, !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote, self.active.contentMode == .files,
                   !self.active.loading, !self.terminalVisible else { return nil }
             return MacroEnvironment(context: .panel, fileName: self.active.cursorEntry?.name,
                 isDirectory: self.active.cursorEntry?.isDirectory, hasSelection: !self.active.markedEntries.isEmpty)
@@ -878,14 +932,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         for (id, title, delta) in [("panel.down", "Курсор вниз", 1), ("panel.up", "Курсор вверх", -1)] {
             workspace.register(id, title: title, contexts: [.panel], recordable: true) { [weak self] in
-                guard let self, !self.busy, !self.active.loading, !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote,
+                guard let self, !self.busy, !self.active.loading, !self.active.isResource, !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote,
                       self.active.contentMode == .files, !self.terminalVisible else { throw CommandRegistryError.contextMismatch }
                 self.active.automationMoveCursor(delta)
             }
         }
         workspace.panelKey = { [weak self] event in
             guard let self, !self.terminalVisible, self.window.firstResponder === self.active.table,
-                  !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote, self.active.contentMode == .files else { return nil }
+                  !self.active.isResource, !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote, self.active.contentMode == .files else { return nil }
             let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
             if flags == [.command], event.keyCode == 0 { return "panel.markAll" }
             if flags == [.control], event.keyCode == 46 { return "panel.restoreMarks" }
@@ -902,18 +956,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         ViewerWindow.registerAutomation(in: workspace)
         workspace.register("dialog.help", title: "Справка диалога", contexts: [.dialog]) { [weak self] in self?.help() }
         ExtensionWorkspace.shared.panelEntries = { [weak self] in
-            guard let self, !self.active.loading, !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote else { throw CommandRegistryError.contextMismatch }
+            guard let self, !self.active.loading, !self.active.isResource, !self.active.isVirtual, !self.active.isArchive, !self.active.isRemote else { throw CommandRegistryError.contextMismatch }
             return self.active.selectedEntries.map { ExtensionEntry(name: $0.name, isDirectory: $0.isDirectory, size: Int64($0.size)) }
         }
     }
 
     func performFunction(_ function: Int) {
+        if active.isResource {
+            if active.resourceFunction?(function, false) == true { return }
+            if ![1, 9, 10].contains(function) { NSSound.beep(); return }
+        }
         if CommandWorkspace.shared.dispatch("panel.f\(function)") { return }
         performFunctionDirect(function)
     }
     private func performFunctionDirect(_ function: Int) {
         guard !busy, window.attachedSheet == nil else { NSSound.beep(); return }
-        if terminalVisible && shellWorkspace.isRunning && ![1, 2, 9, 10].contains(function) { NSSound.beep(); return }
+        if active.isResource && ![1, 9, 10].contains(function) { _ = active.resourceFunction?(function, false); return }
+        if passive.isResource && [5, 6].contains(function) { transfer(move: function == 6); return }
+        if terminalVisible && shellWorkspace.isRunning && ![1, 9, 10].contains(function) { NSSound.beep(); return }
         if active.contentMode != .files && [3, 4, 5, 6, 7, 8].contains(function) {
             status.stringValue = "Для файловой операции переключитесь в режим «Файлы»."; NSSound.beep(); return
         }
@@ -922,7 +982,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             case 3, 4: if let match = active.cursorVirtualResult { openSearchMatch(match, editable: function == 4) }; return
             case 5: copyVirtualResults(); return
             case 2, 6: NSSound.beep(); return
-            case 7, 8: active.removeVirtualSelection(); return
+            case 7: active.removeVirtualSelection(); return
+            case 8: deleteVirtualResults(); return
             default: break
             }
         }
@@ -968,10 +1029,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         performPanelCommand(id)
     }
     private func performPanelCommand(_ id: String) {
+        if active.isResource, !["volumes", "processList", "localNetwork", "savedConnections", "networkConnect", "refresh", "parent", "home", "help", "toggleTerminal", "commandLine"].contains(id) { NSSound.beep(); return }
         if active.isVirtual, !virtualPanelCommands.contains(id) { NSSound.beep(); return }
         if active.isArchive || active.isRemote, (filePanelCommands.contains(id) && id != "copyCursor") || ["temporaryAdd", "temporaryRemove", "temporaryLocate", "temporaryImport", "temporaryExport", "alternateExecute", "alternateView", "alternateEdit", "saveSession", "panelSettings", "brief", "full", "custom", "reverseSort"].contains(id) { NSSound.beep(); return }
         if filePanelCommands.contains(id), active.contentMode != .files { NSSound.beep(); return }
         switch id {
+        case "processList": showProcesses(in: active)
+        case "localNetwork": showLocalNetwork(in: active)
+        case "savedConnections": showSavedConnections(in: active)
         case "networkConnect": network.connect(in: active)
         case "networkDisconnect": if let provider = active.remotePanel?.provider { network.disconnected(provider) }; active.leaveRemote()
         case "networkPath": network.goTo(active)
@@ -1054,19 +1119,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case "bookmark": addBookmark()
         case "unbookmark": removeBookmark()
         case "favorites": showPanelMenu(named: "Избранное")
-        case "syncToOther": passive.load(active.directory, preserveSelection: false)
-        case "syncFromOther": active.load(passive.directory, preserveSelection: false)
+        case "syncToOther": if !active.isResource && !passive.isResource { passive.load(active.directory, preserveSelection: false) }
+        case "syncFromOther": if !active.isResource && !passive.isResource { active.load(passive.directory, preserveSelection: false) }
         case "reverseSort": active.toggleSortDirection()
         case "brief": active.setDisplayMode(.brief)
         case "full": active.setDisplayMode(.full)
         case "custom": active.setDisplayMode(.custom)
         case "panelSettings": openPanelSettings()
         case "maskGroups": openMaskGroups()
-        case "home": active.load(FileManager.default.homeDirectoryForCurrentUser, preserveSelection: false)
-        case "volumes": showPanelMenu(named: "Тома")
+        case "home": active.navigateHistory(to: FileManager.default.homeDirectoryForCurrentUser.path)
+        case "volumes": showResourceMenu(for: active)
         case "path": if active.isRemote { network.goTo(active) } else { active.focusPath() }
         case "filter": active.focusFilter()
-        case "refresh": refresh()
+        case "refresh": if active.isResource { active.refresh() } else { refresh() }
         case "hidden":
             let value = !active.showHidden
             left.showHidden = value; right.showHidden = value
@@ -1160,20 +1225,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
     @discardableResult
-    private func openDocument(_ url: URL, editable: Bool, byteOffset: Int64? = nil, encoding: ViewerEncoding = .automatic, initialDisplayMode: ViewerDisplayMode? = nil, navigation: ViewerNavigation? = nil) -> Bool {
+    private func openDocument(_ url: URL, editable: Bool, byteOffset: Int64? = nil, encoding: ViewerEncoding = .automatic, initialDisplayMode: ViewerDisplayMode? = nil, navigation: ViewerNavigation? = nil, useRememberedEncoding: Bool = true) -> Bool {
         do {
             if editable {
                 if let existing = editors.first(where: {
                     $0.window?.isVisible == true && $0.window?.representedURL?.resolvingSymlinksInPath() == url.resolvingSymlinksInPath()
-                }) { existing.showWindow(nil); return true }
-                let editor = try TextFileWindow(url: url, editable: true, initialByteOffset: byteOffset, encoding: encoding,
-                    onView: { [weak self] url, offset, encoding in self?.openDocument(url, editable: false, byteOffset: offset, encoding: encoding) ?? false })
+                }) {
+                    if let byteOffset { _ = existing.moveToByteOffset(byteOffset) }
+                    existing.showWindow(nil); return true
+                }
+                let editor = try TextFileWindow(url: url, editable: true, initialByteOffset: byteOffset, encoding: encoding, useRememberedEncoding: useRememberedEncoding,
+                    onView: { [weak self] url, offset, encoding in self?.openDocument(url, editable: false, byteOffset: offset, encoding: encoding, navigation: navigation) ?? false })
                 editors.removeAll { $0.window?.isVisible == false && $0.retainedArchiveWorkspace == nil && $0.retainedRemoteWorkspace == nil }
                 editors.append(editor)
                 editor.showWindow(nil)
             } else {
                 let viewer = try ViewerWindow(url: url, initialByteOffset: byteOffset, initialEncoding: encoding, initialDisplayMode: initialDisplayMode, navigation: navigation,
-                    onEdit: { [weak self] url, offset, encoding in self?.openDocument(url, editable: true, byteOffset: offset, encoding: encoding) ?? false })
+                    onEdit: { [weak self] url, offset, encoding in
+                        let origin = NSApp.keyWindow?.windowController as? ViewerWindow
+                        return self?.openDocument(url, editable: true, byteOffset: offset, encoding: encoding, navigation: origin?.currentNavigation) ?? false
+                    })
                 viewers.removeAll { $0.window?.isVisible == false }
                 viewers.append(viewer)
                 viewer.showWindow(nil)
@@ -1192,7 +1263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func searchLocations(in panel: PanelView) -> [SearchLocation] {
         if let archive = panel.archivePanel { return [.archive(archive.snapshot, prefix: archive.currentDirectory)] }
         if let remote = panel.remotePanel { return [.remote(remote.provider, root: remote.currentPath)] }
-        if panel.isVirtual { return [] }
+        if panel.isResource || panel.isVirtual { return [] }
         return [.local(panel.directory)]
     }
     func openSearch() {
@@ -1298,9 +1369,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
+    private func deleteVirtualResults() {
+        guard !busy, !toolMutationPending, !operationQueue.hasPendingOperations,
+              let browser = active.virtualPanel, !browser.selectedResults.isEmpty else { return }
+        let panel = active!
+        restoreSavedMatches(browser.selectedResults) { [weak self, weak panel, weak browser] resolved in
+            guard let self, let panel, let browser, panel.virtualPanel === browser else { return }
+            self.virtualOperations.run(title: "Проверка исходных объектов", work: { token, _ in
+                try TemporaryResultDeletion.prepare(resolved, cancellation: token)
+            }) { [weak self, weak panel, weak browser] result in
+                guard let self, let panel, let browser, panel.virtualPanel === browser else { return }
+                switch result {
+                case .failure(let error): self.showError(error)
+                case .success(let plan):
+                    let alert = NSAlert(); alert.messageText = "Удалить исходные объекты?"
+                    alert.informativeText = "Выбрано: \(plan.count). Локальные объекты — в Корзину." + (plan.hasPermanentDeletions ? "\nБез Корзины: файлов \(plan.permanentFileCount), папок \(plan.permanentDirectoryCount), включая содержимое выбранных каталогов." : "")
+                    let paths = plan.reviewPaths
+                    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 620, height: 240))
+                    scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = true
+                    let listing = NSTextView(frame: scroll.bounds); listing.isEditable = false
+                    listing.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+                    listing.string = paths.prefix(1000).joined(separator: "\n") + (paths.count > 1000 ? "\n… Показаны первые 1000 из \(paths.count)." : "")
+                    listing.setAccessibilityLabel("Объекты для удаления"); scroll.documentView = listing; alert.accessoryView = scroll
+                    alert.alertStyle = .warning; alert.addButton(withTitle: "Удалить"); alert.addButton(withTitle: "Отмена")
+                    guard alert.runModal() == .alertFirstButtonReturn, panel.virtualPanel === browser else { return }
+                    self.virtualOperations.run(title: "Удаление исходных объектов", work: { token, progress in
+                        TemporaryResultDeletion.execute(plan, cancellation: token, progress: progress)
+                    }) { [weak self, weak panel, weak browser] result in
+                        guard let self else { return }
+                        switch result {
+                        case .failure(let error): self.showError(error)
+                        case .success(let outcome):
+                            if let panel, let browser, panel.virtualPanel === browser { browser.removeCompleted(ids: outcome.completedIDs) }
+                            outcome.updatedArchives.forEach { self.archiveUpdated($0) }
+                            self.refresh()
+                            if let failure = outcome.failure { self.showError(PanelSessionError("Удалено выбранных объектов: \(outcome.completedIDs.count).\n" + failure)) }
+                            else { self.status.stringValue = "Удалено: \(outcome.completedIDs.count)" }
+                        }
+                    }
+                }
+            }
+        }
+    }
     private func copyVirtualResults(cursorOnly: Bool = false) {
         guard !busy, !toolMutationPending, !operationQueue.hasPendingOperations,
-              !passive.isVirtual, !passive.isArchive, !passive.isRemote, !passive.isTemporary else { return }
+              !passive.isResource, !passive.isVirtual, !passive.isArchive, !passive.isRemote, !passive.isTemporary else { return }
         let matches = cursorOnly ? active.cursorVirtualResult.map { [$0] } ?? [] : active.selectedVirtualResults
         guard !matches.isEmpty, matches.count <= 100 else {
             inform("Копирование результатов", "Выберите от 1 до 100 объектов."); return
@@ -1413,6 +1526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         retainTool(FilePropertiesWindow(url: entry.url, canMutate: { [weak self] in self?.canUseFileTools() ?? false }, onComplete: { [weak self] in self?.refresh() }))
     }
     func createLink(symbolic: Bool) {
+        guard !active.isResource, !passive.isResource else { return }
         guard canUseFileTools(), let entry = requireCursor() else { return }
         do {
             let source = try FileTools.metadata(entry.url)
@@ -1450,8 +1564,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
     func transfer(move: Bool, cursorOnly: Bool = false) {
+        if active.isResource { _ = active.resourceFunction?(move ? 6 : 5, cursorOnly); return }
+        if passive.isResource {
+            if passive.resourceKind == .connections, !move {
+                let items = cursorOnly ? active.cursorEntry.map { [$0] } ?? [] : active.selectedEntries
+                savedConnectionsPanels[passive.locationKey]?.importProfiles(from: items.map(\.url))
+            }
+            return
+        }
+        if passive.isVirtual || passive.isTemporary { if !move { addToTemporaryPanel(cursorOnly: cursorOnly) }; return }
         if active.isVirtual { if !move { copyVirtualResults(cursorOnly: cursorOnly) }; return }
-        if passive.isVirtual { if !move { addToTemporaryPanel() }; return }
         if active.isRemote || passive.isRemote { network.transfer(from: active, to: passive, move: move, cursorOnly: cursorOnly); return }
         if active.isArchive || passive.isArchive {
             if move && active.isArchive { moveArchiveSelection(cursorOnly: cursorOnly); return }
@@ -1646,6 +1768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         viewers.forEach { $0.retainedArchiveWorkspace?.cleanup(); $0.retainedArchiveWorkspace = nil }
         left.persistSession(); right.persistSession()
         left.cancelInspection(); right.cancelInspection()
+        left.leaveResource(focus: false); right.leaveResource(focus: false)
         shellWorkspace?.stopForExit()
         return .terminateNow
     }
@@ -1707,7 +1830,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func refreshLocalPanelsIfIdle() {
         guard refreshAfterWake, !busy, !toolMutationPending, !operationQueue.hasPendingOperations else { return }
         refreshAfterWake = false
-        for panel in [left!, right!] where !panel.isVirtual && !panel.isArchive && !panel.isRemote {
+        for panel in [left!, right!] where !panel.isResource && !panel.isVirtual && !panel.isArchive && !panel.isRemote {
             if FileManager.default.isReadableFile(atPath: panel.directory.path) { panel.refresh() }
             else { panel.invalidateUnavailableVolume(panel.directory) }
         }
@@ -1807,6 +1930,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             try require(!left.loading && !right.loading && left.temporaryResults.isEmpty,
                         "Switching both former shared views and reopening the slot does not resurrect removed references")
             activate(left)
+            checks += try await runVolumeToolsMenuUISmokeChecks()
+            checks += try runFarMainMenuUISmokeChecks()
+            checks += try await runTemporaryDestinationUISmokeChecks()
             checks += try TemporaryPanelsWindow.runUISmokeChecks()
             checks += try PersistentTemporaryPanelsWindow.runUISmokeChecks()
             checks += try await SavedPanelRestoreController.runUISmokeChecks()
@@ -1839,6 +1965,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             shellWorkspace.stopForExit()
             AppRuntime.finishSmoke(checks: checks)
         } catch { shellWorkspace?.stopForExit(); AppRuntime.finishSmoke(checks: checks, error: error.localizedDescription) }
+    }
+
+    private func runTemporaryDestinationUISmokeChecks() async throws -> [String] {
+        let root = AppRuntime.smokeStateDirectory!.resolvingSymlinksInPath().appendingPathComponent("temporary-target-" + UUID().uuidString)
+        let source = root.appendingPathComponent("source"), destination = root.appendingPathComponent("target")
+        let oldLeft = left.directory, oldRight = right.directory, original = active!
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let file = source.appendingPathComponent("add-reference.txt"), seed = destination.appendingPathComponent("seed.txt")
+        try Data("source".utf8).write(to: file); try Data("seed".utf8).write(to: seed)
+        defer {
+            left.leaveVirtualResults(focus: false); right.leaveVirtualResults(focus: false)
+            left.leaveSearchResults(); right.leaveSearchResults()
+            left.navigateHistory(to: oldLeft.path, focus: false); right.navigateHistory(to: oldRight.path, focus: false)
+            activate(original); original.focus(); try? FileManager.default.removeItem(at: root)
+        }
+        left.leaveSearchResults(); right.leaveSearchResults()
+        left.load(source, preserveSelection: false, selectName: file.lastPathComponent)
+        right.load(destination, preserveSelection: false)
+        let deadline = Date().addingTimeInterval(5)
+        while (left.loading || right.loading) && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        guard left.cursorEntry?.url.resolvingSymlinksInPath() == file.resolvingSymlinksInPath() else { throw PanelSessionError("Temporary target fixture did not select source") }
+        right.showSearchResults([try SearchResult.capture(seed)], focusPanel: false)
+        activate(left); transfer(move: false)
+        while busy && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        guard !busy, right.temporaryResults.contains(where: { $0.url.resolvingSymlinksInPath() == file.resolvingSymlinksInPath() }),
+              !FileManager.default.fileExists(atPath: destination.appendingPathComponent(file.lastPathComponent).path),
+              try Data(contentsOf: file) == Data("source".utf8) else { throw PanelSessionError("F5 into temporary panel copied a file instead of adding its reference") }
+        right.showSearchResults([try SearchResult.capture(seed)], focusPanel: false)
+        try left.showVirtualResults([.local(try SearchResult.capture(file))], focusPanel: false)
+        let settleDeadline = Date().addingTimeInterval(5)
+        while (left.loading || right.loading) && Date() < settleDeadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        activate(left); transfer(move: false)
+        guard right.virtualResults.count == 2,
+              !FileManager.default.fileExists(atPath: destination.appendingPathComponent(file.lastPathComponent).path) else {
+            throw PanelSessionError("F5 from mixed results did not preserve the existing temporary references")
+        }
+        left.leaveVirtualResults(focus: false); right.leaveVirtualResults(focus: false)
+        return ["F5 into a local temporary panel adds a verified reference without copying into its hidden directory",
+                "F5 from mixed results into a temporary panel preserves both existing and incoming references"]
+    }
+
+    private func runVolumeToolsMenuUISmokeChecks() async throws -> [String] {
+        let original = active!, leftPath = left.directory, rightPath = right.directory
+        defer {
+            left.leaveResource(focus: false); right.leaveResource(focus: false)
+            activate(original); window.makeKeyAndOrderFront(nil); original.focus()
+        }
+        guard left.resourceButton.superview != nil, right.resourceButton.superview != nil,
+              left.resourceButton !== right.resourceButton else { throw PanelSessionError("Missing per-panel drive buttons") }
+        let menu = resourceMenu(for: right)
+        guard ["localNetwork", "savedConnections", "processList"].allSatisfy({ id in menu.items.contains { $0.identifier?.rawValue == id } }),
+              let processItem = menu.items.first(where: { $0.identifier?.rawValue == "processList" }) else { throw PanelSessionError("Resource menu does not separate Network, NetBox and ProcList") }
+        activate(left)
+        NSApp.sendAction(processItem.action!, to: processItem.target, from: processItem)
+        guard right.resourceKind == .processes, !left.isResource, active === right,
+              left.directory == leftPath, right.directory == rightPath,
+              right.cursorEntry == nil, right.selectedEntries.isEmpty else { throw PanelSessionError("Resource action lost its destination or exposed hidden files") }
+        let deadline = Date().addingTimeInterval(8)
+        while (right.resourceView as? ProcessPanelView)?.entries.contains(where: { $0.pid == ProcessInfo.processInfo.processIdentifier }) != true && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        guard (right.resourceView as? ProcessPanelView)?.entries.contains(where: { $0.pid == ProcessInfo.processInfo.processIdentifier }) == true else { throw PanelSessionError("Process panel did not load the running application") }
+        right.leaveResource(focus: false)
+        showSavedConnections(in: right)
+        guard right.resourceKind == .connections, !network.isWorking,
+              !NSApp.windows.contains(where: { $0.isVisible && $0.windowController is NetworkConnectionWindow }) else { throw PanelSessionError("NetBox list unexpectedly opened connection form or network") }
+        right.leaveResource(focus: false)
+        let dummy = NSView(); var refreshes = 0, stops = 0
+        right.showResource(dummy, kind: .localNetwork, caption: "fixture", focus: {}, refresh: { refreshes += 1 }, stop: { stops += 1 }, setActive: { _ in }, perform: { _, _ in false })
+        right.cancelInspection(); right.refresh()
+        guard refreshes == 1, stops == 0 else { throw PanelSessionError("Panel inspection cancelled the attached network browser") }
+        right.leaveResource(focus: false)
+        guard stops == 1, !right.isResource else { throw PanelSessionError("Resource shutdown did not happen once") }
+        guard archiveFunctionButtons[4]?.title == L10n.text("F4  Правка"),
+              archiveFunctionButtons[6]?.title == L10n.text("F6  Перенос") else {
+            throw PanelSessionError("Function labels retained network actions after leaving the resource")
+        }
+        return ["Each panel owns a drive selector with separate LAN, saved connections and processes", "Resource menu targets captured panel after focus changes and hides underlying file targets", "NetBox opens its panel without credentials or network I/O", "Refreshing a resource preserves its lifecycle; leaving stops it exactly once"]
     }
 
     private func runPersistentPanelsHostUISmokeChecks() async throws -> [String] {
@@ -1945,14 +2148,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let viewDeadline = Date().addingTimeInterval(5)
         while network.isWorking && Date() < viewDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
         guard provider.downloads > 0 else { throw PanelSessionError("Host F3 did not read captured remote result") }
-        window.makeKeyAndOrderFront(nil); left.focus(); left.markAll(); performFunctionDirect(8)
+        window.makeKeyAndOrderFront(nil); left.focus(); left.markAll(); performFunctionDirect(7)
         guard left.virtualResults.isEmpty, lastVirtualResults.isEmpty, FileManager.default.fileExists(atPath: file.path),
               try provider.stat(path: "/docs/alpha.txt", cancellation: TransferCancellation()) != nil else {
-            throw PanelSessionError("Host F8 changed source files or resurrected removed references")
+            throw PanelSessionError("Host F7 changed source files or resurrected removed references")
         }
         return ["Mixed host panel hides underlying local paths and disables move; session history retains typed references",
                 "Mixed host Enter and F3 restore and read the captured network provider",
-                "Mixed host F8 removes references and session history while preserving local and remote originals"]
+                "Mixed host F7 removes references and session history while preserving local and remote originals"]
     }
 
     private func runArchiveNavigationUISmokeChecks() async throws -> [String] {
@@ -2089,7 +2292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         // editors; FileTable's override supplies panel marking semantics.
         edit.addItem(withTitle: "Выделить всё", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         let commands = submenu("Команды")
-        for (title, id) in [("Командная строка — Cmd+Enter", "commandLine"), ("Панели / терминал — Ctrl+O", "toggleTerminal"), ("Интерактивный shell", "shell"), ("Настроить меню и ассоциации…", "userCommands"), ("История команд — Alt+F8", "commandHistory"), ("История просмотра — Alt+F11", "viewHistory"), ("История редактора", "editHistory"), ("История папок — Alt+F12", "folderHistory")] {
+        for (title, id) in [("Командная строка — Cmd+Enter", "commandLine"), ("Панели / терминал — Ctrl+O", "toggleTerminal"), ("Интерактивный shell", "shell"), ("Настроить меню и ассоциации…", "userCommands"), ("История команд — Alt+F8", "commandHistory"), ("История просмотра и правки — Alt+F11", "viewHistory"), ("История редактора", "editHistory"), ("История папок — Alt+F12", "folderHistory")] {
             let item = NSMenuItem(title: title, action: #selector(command(_:)), keyEquivalent: "")
             item.target = self; item.representedObject = id; commands.addItem(item)
         }

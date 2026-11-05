@@ -108,14 +108,8 @@ extension AppDelegate: NSMenuDelegate {
             menu.addItem(.separator())
             menu.addItem(menuCommand("Настройки активной панели…", "panelSettings", key: ","))
         case "Тома":
-            var paths = ["/", FileManager.default.homeDirectoryForCurrentUser.path]
-            paths += (FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeNameKey], options: [.skipHiddenVolumes]) ?? []).map(\.path)
-            var seen = Set<String>()
-            for path in paths where seen.insert(path).inserted {
-                let item = NSMenuItem(title: path, action: #selector(visitLocation(_:)), keyEquivalent: "")
-                item.target = self; item.representedObject = path; menu.addItem(item)
-            }
-            menu.addItem(.separator()); menu.addItem(menuCommand("Выбрать другую папку…", "choose"))
+            let resources = resourceMenu(for: active)
+            for item in resources.items { resources.removeItem(item); menu.addItem(item) }
         default: break
         }
     }
@@ -124,15 +118,8 @@ extension AppDelegate: NSMenuDelegate {
         menuNeedsUpdate(menu)
         menu.popUp(positioning: nil, at: NSPoint(x: 18, y: window.contentView!.bounds.height - 10), in: window.contentView)
     }
-    func showCommandMenu() {
-        let root = NSMenu(title: "Команды FarForMac")
-        for item in (NSApp.mainMenu?.items ?? []).dropFirst() {
-            guard let submenu = item.submenu, let copy = submenu.copy() as? NSMenu else { continue }
-            copy.delegate = self
-            let entry = NSMenuItem(title: item.title, action: nil, keyEquivalent: "")
-            entry.submenu = copy; root.addItem(entry)
-        }
-        root.popUp(positioning: nil, at: NSPoint(x: 18, y: window.contentView!.bounds.height - 10), in: window.contentView)
+    func showCommandMenu(restoringLast: Bool = false) {
+        presentFarMainMenu(restoringLast: restoringLast)
     }
     func openPanelSettings() {
         settingsWindow?.close()

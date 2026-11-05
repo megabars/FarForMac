@@ -42,9 +42,10 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     Tab / Shift Tab или Alt I / Alt U — отступ / убрать отступ.
     Прямоугольный блок задаётся кнопкой «Блок» (строки включительно, последний столбец не включён).
     F6 — просмотр; F4 / F10 / Esc — закрыть; Shift F10 — сохранить и закрыть.
-    ⌘Z / ⇧⌘Z — отменить / повторить. Shift F4 / ⌘N — новый файл.
+    ⌘Z / ⇧⌘Z — отменить / повторить. Shift F4 — открыть / создать файл, ⌘N — безымянный буфер.
+    F8 — переключить ANSI / OEM, Shift F8 — выбрать кодовую страницу.
     Предел текста — 8 МиБ; подсветка отключается после 256 КиБ.
-    Новый файл: UTF-8 без BOM; ввод Enter — LF. Исходные и вставленные окончания строк сохраняются;
+    Безымянный буфер: UTF-8 без BOM. Файл, названный при создании: CRLF и BOM для Unicode. Исходные и вставленные окончания строк сохраняются;
     преобразование всех окончаний выполняется только при явном выборе LF / CRLF / CR в «Сохранить как».
     """
 
@@ -63,6 +64,8 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     }
     var hasUnsavedChanges: Bool { isDirty }
     var workingFileURL: URL? { sourceURL }
+    var openCreateDirectory: URL { initialDirectory }
+    static func openCreateRequest(in directory: URL) -> EditorOpenCreateRequest? { TextDocumentDialogs.openCreate(in: directory) }
     func saveForArchiveCommit() -> Bool { save() }
     func closeArchiveWorkingCopyWithoutSaving() { pendingDiscard = true; window?.close() }
 
@@ -142,6 +145,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     private var externalCheckGeneration = 0
     private var lastQuery: EditorSearchQuery?
     private var lastReplacement = ""
+    private var lastSearchWasReplacement = false
     private var rectangle: EditorRectangle?
     private var bookmarks = EditorBookmarks()
     private var bookmarkText = ""
@@ -152,11 +156,11 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     private static let background = NSColor(calibratedRed: 0.035, green: 0.065, blue: 0.14, alpha: 1)
 
     init(url: URL, editable: Bool = true, initialByteOffset: Int64? = nil,
-         encoding: ViewerEncoding = .automatic,
+         encoding: ViewerEncoding = .automatic, useRememberedEncoding: Bool = true,
          onView: ((URL, Int64, ViewerEncoding) -> Bool)? = nil) throws {
         let history = Self.historyRecord(url)
         let loaded: EditorSnapshot
-        if encoding == .automatic, let rememberedEncoding = history?.encoding {
+        if encoding == .automatic, useRememberedEncoding, let rememberedEncoding = history?.encoding {
             do { loaded = try EditorDocument.load(url: url, encoding: rememberedEncoding) }
             catch { loaded = try EditorDocument.load(url: url, encoding: .automatic) }
         } else { loaded = try EditorDocument.load(url: url, encoding: encoding) }
@@ -172,9 +176,17 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         updateState(); scheduleHighlight()
     }
 
-    init(newIn directory: URL, onView: ((URL, Int64, ViewerEncoding) -> Bool)? = nil) {
-        sourceURL = nil; initialDirectory = directory; snapshot = nil
-        format = EditorFormat(); savedFormat = format; savedText = ""; recoveryID = UUID()
+    convenience init(newAt url: URL, encoding: ViewerEncoding, onView: ((URL, Int64, ViewerEncoding) -> Bool)? = nil) {
+        let codePage = encoding == .automatic ? TextDocumentDialogs.systemCodePages[0] : encoding
+        let unicode = codePage == .utf8 || codePage == .utf16LE || codePage == .utf16BE
+        self.init(newIn: url.deletingLastPathComponent(), named: url,
+                  format: EditorFormat(encoding: codePage, bom: unicode, lineEnding: .crlf), onView: onView)
+    }
+
+    init(newIn directory: URL, named url: URL? = nil, format: EditorFormat = EditorFormat(),
+         onView: ((URL, Int64, ViewerEncoding) -> Bool)? = nil) {
+        sourceURL = url; initialDirectory = directory; snapshot = nil
+        self.format = format; savedFormat = format; savedText = ""; recoveryID = UUID()
         editable = true; self.onView = onView
         super.init(window: Self.makeWindow())
         configureContent(""); updateState()
@@ -322,7 +334,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         switch format.encoding {
         case .utf8, .automatic: bytes = text.utf8.count
         case .utf16LE, .utf16BE: bytes = text.utf16.count * 2
-        case .windows1251, .windows1252, .latin1: bytes = text.unicodeScalars.count
+        case .windows1251, .windows1252, .latin1, .dos437, .dos866: bytes = text.unicodeScalars.count
         }
         return bytes + bom <= EditorDocument.maximumSize
     }
@@ -341,7 +353,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         pathLabel.stringValue = (displayName == workingCopyDisplayName ? workingCopyDisplayPath : nil) ?? sourceURL?.path ?? initialDirectory.path + "/ — новый файл"
         window?.title = name + (editable ? " — Редактор" : " — Просмотр")
         window?.representedURL = sourceURL; window?.isDocumentEdited = isDirty
-        saveButton.isEnabled = editable && (isDirty || sourceURL == nil)
+        saveButton.isEnabled = editable && (isDirty || snapshot == nil)
         let offset = textView.selectedRange().location
         let positionText: String
         if cachedPositionRevision == generation, cachedPositionOffset == offset { positionText = "\(cachedPosition.line):\(cachedPosition.column)" }
@@ -376,7 +388,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
-        case #selector(saveDocument(_:)): return editable && (isDirty || sourceURL == nil)
+        case #selector(saveDocument(_:)): return editable && (isDirty || snapshot == nil)
         case #selector(saveAsDocument(_:)): return editable
         default: return true
         }
@@ -384,8 +396,8 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     @objc func saveDocument(_ sender: Any?) { _ = save() }
     @discardableResult private func save() -> Bool {
         guard editable else { return true }
-        guard let sourceURL, let snapshot else { return saveAs() }
-        guard isDirty else { return true }
+        guard let sourceURL, snapshot != nil || !recoveredDraft else { return saveAs() }
+        guard isDirty || snapshot == nil else { return true }
         do {
             let result = try EditorDocument.save(text: textView.string, format: format, to: sourceURL, expected: snapshot)
             didSave(result); return true
@@ -555,7 +567,7 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
     }
     @objc private func switchToViewer(_ sender: Any?) {
         guard let onView = onWorkingCopyView ?? onView else { return }
-        if sourceURL == nil, !save() { return }
+        if snapshot == nil, !save() { return }
         guard confirmClose(), let sourceURL else { return }
         let displayed = isDirty ? savedText : textView.string
         do {
@@ -586,8 +598,58 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         }
     }
     func moveToByteOffset(_ offset: Int64) {
-        guard let snapshot else { return }
+        guard let snapshot, textView.string == snapshot.text else { return }
         select(NSRange(location: EditorDocument.utf16Offset(forByteOffset: offset, in: snapshot), length: 0))
+    }
+
+    private func selectCodePage() {
+        if let encoding = TextDocumentDialogs.codePage(current: format.encoding) { changeCodePage(encoding) }
+    }
+
+    private func changeCodePage(_ encoding: ViewerEncoding) {
+        guard encoding != format.encoding else { return }
+        let unicode16: [ViewerEncoding] = [.utf16LE, .utf16BE]
+        let selection = textView.selectedRange()
+        do {
+            if let sourceURL, let snapshot, !isDirty || encoding == .automatic || unicode16.contains(format.encoding) || unicode16.contains(encoding) {
+                let loaded = try EditorDocument.load(url: sourceURL, encoding: encoding)
+                if isDirty {
+                    let confirm = NSAlert()
+                    confirm.messageText = "Перечитать файл в другой кодовой странице?"
+                    confirm.informativeText = "Несохранённые правки будут отброшены."
+                    confirm.addButton(withTitle: "Перечитать")
+                    confirm.addButton(withTitle: "Отмена")
+                    guard confirm.runModal() == .alertFirstButtonReturn else { return }
+                }
+                let diskOffset = try EditorDocument.byteOffset(forUTF16Offset: selection.location, text: snapshot.text, format: snapshot.format)
+                self.snapshot = loaded; format = loaded.format; savedFormat = loaded.format; savedText = loaded.text
+                recoveredDraft = false; lastNotifiedIdentity = nil
+                let newSelection = NSRange(location: EditorDocument.utf16Offset(forByteOffset: diskOffset, in: loaded), length: 0)
+                installCodePageText(loaded.text, selection: newSelection)
+                clearRecovery()
+            } else if snapshot == nil {
+                let selected = encoding == .automatic ? TextDocumentDialogs.systemCodePages[0] : encoding
+                let hasBOM = unicode16.contains(selected) || selected == .utf8 && format.bom
+                let updated = EditorFormat(encoding: selected, bom: hasBOM, lineEnding: format.lineEnding)
+                _ = try EditorDocument.encode(text: textView.string, format: updated)
+                format = updated; scheduleRecovery()
+            } else {
+                let bytes = try EditorDocument.encode(text: textView.string, format: format)
+                let converted = try EditorDocument.decode(bytes, encoding: encoding)
+                format = converted.format
+                installCodePageText(converted.text, selection: selection)
+                scheduleRecovery()
+            }
+            operationStatus = "Кодовая страница: \(format.encoding.title)"; updateState()
+        } catch { showError("Кодовая страница не изменена", error) }
+    }
+
+    private func installCodePageText(_ text: String, selection: NSRange) {
+        if textView.string != text { bookmarks = EditorBookmarks() }
+        textView.string = text; bookmarkText = text; pendingBookmarkChanges = nil
+        textView.undoManager?.removeAllActions()
+        generation += 1; searchGeneration += 1; searchPending = false; lastFoundRange = nil
+        select(selection); scheduleHighlight()
     }
     func windowWillClose(_ notification: Notification) {
         finalizeClose(); closed = true
@@ -611,27 +673,40 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         caseSensitive.state = lastQuery?.caseSensitive == true ? .on : .off
         let words = NSButton(checkboxWithTitle: "Целые слова", target: nil, action: nil)
         words.state = lastQuery?.wholeWords == true ? .on : .off
-        let direction = NSPopUpButton(); direction.addItems(withTitles: ["Вперёд", "Назад"])
         var views: [NSView] = [row("Найти", pattern)]
         if replacing { views.append(row("Заменить", replacement)) }
-        views += [options.regex, options.fuzzy, options.style, caseSensitive, words, row("Направление", direction)]
+        views += [caseSensitive, words, options.fuzzy, options.regex]
+        if replacing { views.append(options.style) }
         let stack = NSStackView(views: views); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 9
-        stack.frame = NSRect(x: 0, y: 0, width: 480, height: replacing ? 275 : 235); alert.accessoryView = stack
-        alert.addButton(withTitle: replacing ? "Заменить" : "Найти")
-        alert.addButton(withTitle: replacing ? "Заменить всё" : "Все совпадения")
-        alert.addButton(withTitle: "Отмена")
+        stack.frame = NSRect(x: 0, y: 0, width: 480, height: replacing ? 222 : 152); alert.accessoryView = stack
+        alert.addButton(withTitle: replacing ? "Заменить далее" : "Найти далее")
+        alert.addButton(withTitle: replacing ? "Заменить назад" : "Найти назад")
+        if !replacing { alert.addButton(withTitle: "Все совпадения") }
+        alert.addButton(withTitle: "Отмена").keyEquivalent = "\u{1b}"
         alert.window.initialFirstResponder = pattern
         let answer = alert.runModal()
-        guard answer == .alertFirstButtonReturn || answer == .alertSecondButtonReturn else { return }
+        guard answer == .alertFirstButtonReturn || answer == .alertSecondButtonReturn || (!replacing && answer == .alertThirdButtonReturn) else { return }
         let query = EditorSearchQuery(pattern: pattern.stringValue, regex: options.regex.state == .on,
                                       caseSensitive: caseSensitive.state == .on, wholeWords: words.state == .on,
                                       fuzzy: options.fuzzy.state == .on, preserveStyle: options.style.state == .on)
-        lastQuery = query; lastReplacement = replacement.stringValue
+        lastQuery = query
+        lastSearchWasReplacement = replacing
+        let direction: ViewerSearchDirection = answer == .alertSecondButtonReturn ? .backward : .forward
         if replacing {
-            performReplacement(query: query, replacement: replacement.stringValue, all: answer == .alertSecondButtonReturn,
-                               direction: direction.indexOfSelectedItem == 1 ? .backward : .forward)
-        } else if answer == .alertSecondButtonReturn { findAll(query) }
-        else { find(query, direction: direction.indexOfSelectedItem == 1 ? .backward : .forward) }
+            lastReplacement = replacement.stringValue
+            performReplacement(query: query, replacement: lastReplacement, direction: direction)
+        } else if answer == .alertThirdButtonReturn { findAll(query) }
+        else { find(query, direction: direction) }
+    }
+
+    private func continueSearch(direction: ViewerSearchDirection) {
+        guard let lastQuery else { findDocument(nil); return }
+        if lastSearchWasReplacement, editable {
+            let selection = textView.selectedRange()
+            var start = direction == .forward ? NSMaxRange(selection) : selection.location
+            if direction == .forward, selection.length == 0, lastFoundRange == selection, lastFoundQuery == lastQuery { start += 1 }
+            performReplacement(query: lastQuery, replacement: lastReplacement, direction: direction, from: start)
+        } else { find(lastQuery, direction: direction) }
     }
 
     private func findAll(_ query: EditorSearchQuery) {
@@ -686,29 +761,91 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         }
     }
 
-    private func performReplacement(query: EditorSearchQuery, replacement: String, all: Bool, direction: ViewerSearchDirection) {
+    private func performReplacement(query: EditorSearchQuery, replacement: String, direction: ViewerSearchDirection,
+                                    from origin: Int? = nil, replaced: Int = 0) {
         let text = textView.string, selection = textView.selectedRange(), revision = generation
+        let start = origin ?? (direction == .forward ? selection.location : NSMaxRange(selection))
         searchGeneration += 1; let request = searchGeneration
         searchPending = true; operationStatus = "Замена… (Esc — отменить)"; updateState()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result: Result<EditorEdit?, Error> = Result {
-                if all { return try EditorEditing.replaceAll(in: text, query: query, replacement: replacement) }
-                // Include the current selection, so Find followed by Replace edits it.
-                let start = direction == .forward ? selection.location : NSMaxRange(selection)
+            let result: Result<(NSRange, EditorEdit)?, Error> = Result {
+                guard start <= text.utf16.count else { return nil }
                 guard let range = try EditorEditing.find(in: text, query: query, from: start, direction: direction) else { return nil }
                 let updated = try EditorEditing.replace(in: text, range: range, query: query, replacement: replacement)
                 let addedLength = updated.utf16.count - text.utf16.count + range.length
-                return EditorEdit(text: updated, selection: NSRange(location: range.location, length: addedLength), count: 1,
-                                  changes: [EditorTextChange(range: range, replacementUTF16Length: addedLength)])
+                return (range, EditorEdit(text: updated, selection: NSRange(location: range.location, length: addedLength), count: 1,
+                                          changes: [EditorTextChange(range: range, replacementUTF16Length: addedLength)]))
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.closed, self.generation == revision, self.searchGeneration == request else { return }
                 self.searchPending = false
                 switch result {
-                case .success(let edit):
-                    if let edit { self.apply(edit, action: all ? "Заменить всё" : "Заменить"); self.operationStatus = "Замен: \(edit.count)" }
-                    else { self.operationStatus = "Совпадений нет"; NSSound.beep() }
+                case .success(let match):
+                    if let (range, edit) = match {
+                        self.confirmReplacement(query: query, replacement: replacement, range: range, edit: edit,
+                                                direction: direction, replaced: replaced, revision: revision)
+                        return
+                    }
+                    self.operationStatus = replaced > 0 ? "Замен: \(replaced)" : "Совпадений больше нет"
                 case .failure(let error): self.showError("Замена не выполнена", error); self.operationStatus = "Замена остановлена"
+                }
+                self.updateState(); self.window?.makeFirstResponder(self.textView)
+            }
+        }
+    }
+
+    private func confirmReplacement(query: EditorSearchQuery, replacement: String, range: NSRange, edit: EditorEdit,
+                                    direction: ViewerSearchDirection, replaced: Int, revision: Int) {
+        select(range)
+        lastFoundRange = range; lastFoundQuery = query
+        let found = (textView.string as NSString).substring(with: range)
+        let inserted = (edit.text as NSString).substring(with: edit.selection)
+        let alert = NSAlert()
+        alert.messageText = "Подтвердить замену"
+        alert.informativeText = "«\(found.prefix(120))» → «\(inserted.prefix(120))»"
+        alert.addButton(withTitle: "Заменить")
+        alert.addButton(withTitle: "Заменить все оставшиеся")
+        alert.addButton(withTitle: "Пропустить")
+        alert.addButton(withTitle: "Отмена").keyEquivalent = "\u{1b}"
+        let answer = alert.runModal()
+        guard !closed, generation == revision else { return }
+        let forward = direction == .forward
+        switch answer {
+        case .alertFirstButtonReturn:
+            guard withinBufferLimit(edit.text) else { showError("Замена не выполнена", EditorError.tooLarge); return }
+            apply(edit, action: "Заменить")
+            let origin = forward ? NSMaxRange(edit.selection) + (range.length == 0 ? 1 : 0) : range.location
+            performReplacement(query: query, replacement: replacement, direction: direction, from: origin, replaced: replaced + 1)
+        case .alertSecondButtonReturn:
+            replaceRemaining(query: query, replacement: replacement, from: range.location + (forward ? 0 : 1),
+                             direction: direction, replaced: replaced)
+        case .alertThirdButtonReturn:
+            let origin = forward ? NSMaxRange(range) + (range.length == 0 ? 1 : 0) : range.location
+            performReplacement(query: query, replacement: replacement, direction: direction, from: origin, replaced: replaced)
+        default:
+            operationStatus = replaced > 0 ? "Замен: \(replaced)" : "Замена отменена"
+            updateState(); window?.makeFirstResponder(textView)
+        }
+    }
+
+    private func replaceRemaining(query: EditorSearchQuery, replacement: String, from: Int,
+                                  direction: ViewerSearchDirection, replaced: Int) {
+        let text = textView.string, revision = generation
+        searchGeneration += 1; let request = searchGeneration
+        searchPending = true; operationStatus = "Замена… (Esc — отменить)"; updateState()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try EditorEditing.replaceAll(in: text, query: query, replacement: replacement, from: from, direction: direction) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.closed, self.generation == revision, self.searchGeneration == request else { return }
+                self.searchPending = false
+                do {
+                    let edit = try result.get()
+                    guard self.withinBufferLimit(edit.text) else { throw EditorError.tooLarge }
+                    if edit.count > 0 { self.apply(edit, action: "Заменить все оставшиеся") }
+                    self.operationStatus = "Замен: \(replaced + edit.count)"
+                } catch {
+                    self.operationStatus = "Замена остановлена"
+                    self.showError("Замена не выполнена", error)
                 }
                 self.updateState(); self.window?.makeFirstResponder(self.textView)
             }
@@ -887,9 +1024,8 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
 
     private func handleKey(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
-        if flags == .control || flags == [.control, .shift],
-           let slot = [UInt16(29): 0, 18: 1, 19: 2, 20: 3, 21: 4, 23: 5, 22: 6, 26: 7, 28: 8, 25: 9][event.keyCode] {
-            if flags.contains(.shift) { setBookmark(slot) } else { gotoBookmark(slot) }
+        if let bookmark = TextDocumentDialogs.bookmarkShortcut(event, flags: flags) {
+            if bookmark.set { setBookmark(bookmark.slot) } else { gotoBookmark(bookmark.slot) }
             return true
         }
         if event.keyCode == 53, flags.isEmpty, searchPending {
@@ -935,9 +1071,11 @@ final class TextFileWindow: NSWindowController, NSWindowDelegate, NSTextViewDele
         case (120, .shift): saveAsDocument(nil)
         case (98, []): findDocument(nil) // F7
         case (98, .control): replaceDocument(nil)
-        case (98, .shift): if let lastQuery { find(lastQuery, direction: .forward) } else { findDocument(nil) }
-        case (98, .option): if let lastQuery { find(lastQuery, direction: .backward) } else { findDocument(nil) }
+        case (98, .shift): continueSearch(direction: .forward)
+        case (98, .option): continueSearch(direction: .backward)
         case (100, .option): gotoDocument(nil) // F8
+        case (100, []): changeCodePage(TextDocumentDialogs.nextCodePage(after: format.encoding))
+        case (100, .shift): selectCodePage()
         case (99, .control): toggleLineNumbers(nil) // F3
         case (97, []): switchToViewer(nil) // F6
         case (109, .shift): if save() { window?.performClose(nil) } // Shift F10
@@ -1045,6 +1183,15 @@ extension TextFileWindow {
         try require(editor.textView.string == "UserName USER_NAME user-name", "Styled replace all is one undo action")
         editor.textView.undoManager?.redo()
         try require(editor.textView.string == styleEdit.text, "Styled replace all supports redo")
-        return ["Editor numbered bookmark shortcuts", "Editor bookmark follows buffer edit", "Editor all-match positions", "Editor fuzzy and style options", "Editor fuzzy original-range highlight", "Editor styled replacement undo redo"] + (try EditorSearchResultsWindow.runUISmokeChecks())
+        let path = editor.initialDirectory.appendingPathComponent("editor-named-\(UUID().uuidString).txt")
+        let named = TextFileWindow(newAt: path, encoding: .utf8)
+        defer { named.window?.close(); try? FileManager.default.removeItem(at: path) }
+        try require(named.window?.representedURL == path && !FileManager.default.fileExists(atPath: path.path),
+                    "Named editor waits until F2 to create the file")
+        named.replaceBuffer("first\nsecond", selection: NSRange(location: 0, length: 0), action: "Smoke")
+        try require(named.save(), "F2 saves a named editor buffer without a second dialog")
+        let bytes = try Data(contentsOf: path)
+        try require(bytes == Data([0xEF, 0xBB, 0xBF] + Array("first\r\nsecond".utf8)), "Named Unicode editor writes BOM and CRLF")
+        return ["Editor numbered bookmark shortcuts", "Editor bookmark follows buffer edit", "Editor all-match positions", "Editor fuzzy and style options", "Editor fuzzy original-range highlight", "Editor styled replacement undo redo", "Editor named creation and first save"] + (try EditorSearchResultsWindow.runUISmokeChecks())
     }
 }

@@ -62,7 +62,7 @@ struct FarMenuImporterTests {
     }
 
     @Test func malformedMenusAndMultipleCommandLinesFailAsWholeImport() throws {
-        for source in ["", "}", "{", "A: Empty", "A: Commands\n  echo first\n  echo second", "  echo orphan", "A: Root\n{\nB: Leaf\n  true", "A: Root\n{\n}", "A: First\n  true\na: Duplicate\n  true", "F25: Invalid\n  true", "A: bad\n  true\n{\nB: Leaf\n  true\n}", "A: Bad\n  echo\0bad"] {
+        for source in ["", "}", "{", "A: Empty", "A: Commands\n  echo first\n  echo second", "  echo orphan", "A: Root\n{\nB: Leaf\n  true", "A: First\n  true\na: Duplicate\n  true", "F25: Invalid\n  true", "A: bad\n  true\n{\nB: Leaf\n  true\n}", "A: Bad\n  echo\0bad"] {
             #expect(throws: (any Error).self) { try FarMenuImporter.parse(Data(source.utf8)) }
         }
         let many = (0..<513).map { ": Entry\($0)\n  true" }.joined(separator: "\n")
@@ -70,6 +70,15 @@ struct FarMenuImporterTests {
         let deep = (0..<9).map { "A: Level\($0)\n{" }.joined(separator: "\n") + "\nZ: Leaf\n  true\n" + String(repeating: "}\n", count: 9)
         #expect(throws: (any Error).self) { try FarMenuImporter.parse(Data(deep.utf8)) }
         #expect(throws: (any Error).self) { try FarMenuImporter.parse(Data(repeating: 32, count: 262_145)) }
+    }
+
+    @Test func importsEmptySubmenuAndKeepsFollowingCommandsAtTheSameLevel() throws {
+        let source = "A: Root\n{\n}\nB: Next\n  true\n"
+        let imported = try FarMenuImporter.parse(Data(source.utf8))
+        #expect(imported.menu == [
+            UserMenuEntry(title: "Root", children: [], key: "A"),
+            UserMenuEntry(title: "Next", command: "true", key: "B")
+        ])
     }
 
     @Test func importOnlyReadsFileAndNeverExecutesItsCommandsOrOverwritesConfiguration() throws {

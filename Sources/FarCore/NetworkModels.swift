@@ -38,6 +38,7 @@ public struct SFTPJumpHost: Codable, Equatable, Sendable {
 public struct NetworkConnection: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var name: String
+    public var profileGroup: [String]
     public var kind: NetworkProtocol
     public var host: String
     public var port: Int
@@ -48,19 +49,21 @@ public struct NetworkConnection: Codable, Equatable, Identifiable, Sendable {
     public var sftpJumpHosts: [SFTPJumpHost]
     public var timeoutSeconds: Double
     public init(id: UUID = UUID(), name: String = "", kind: NetworkProtocol, host: String, port: Int? = nil,
-                username: String = "", rootPath: String = "/", privateKeyPath: String? = nil, timeoutSeconds: Double = 30, sftpAuthenticationMode: SFTPAuthenticationMode = .keyAgent, sftpJumpHosts: [SFTPJumpHost] = []) {
+                username: String = "", rootPath: String = "/", privateKeyPath: String? = nil, timeoutSeconds: Double = 30, sftpAuthenticationMode: SFTPAuthenticationMode = .keyAgent, sftpJumpHosts: [SFTPJumpHost] = [], profileGroup: [String] = []) {
         self.id = id; self.name = name; self.kind = kind; self.host = host; self.port = port ?? kind.defaultPort
+        self.profileGroup = profileGroup
         self.sftpAuthenticationMode = sftpAuthenticationMode
         self.sftpJumpHosts = sftpJumpHosts
         self.username = username; self.rootPath = rootPath; self.privateKeyPath = privateKeyPath; self.timeoutSeconds = timeoutSeconds
     }
     private enum CodingKeys: String, CodingKey {
-        case id, name, kind, host, port, username, rootPath, privateKeyPath, timeoutSeconds, sftpAuthenticationMode, sftpJumpHosts
+        case id, name, kind, host, port, username, rootPath, privateKeyPath, timeoutSeconds, sftpAuthenticationMode, sftpJumpHosts, profileGroup
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
         name = try values.decode(String.self, forKey: .name)
+        profileGroup = try values.decodeIfPresent([String].self, forKey: .profileGroup) ?? []
         kind = try values.decode(NetworkProtocol.self, forKey: .kind)
         host = try values.decode(String.self, forKey: .host)
         port = try values.decode(Int.self, forKey: .port)
@@ -72,6 +75,7 @@ public struct NetworkConnection: Codable, Equatable, Identifiable, Sendable {
         sftpJumpHosts = try values.decodeIfPresent([SFTPJumpHost].self, forKey: .sftpJumpHosts) ?? []
     }
     public func validate() throws {
+        try SavedNetworkProfiles.validateGroup(profileGroup)
         guard !host.isEmpty, host.utf8.count <= 253, !host.hasPrefix("-"),
               host.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:").contains($0) }),
               (1...65535).contains(port), timeoutSeconds.isFinite, (1...600).contains(timeoutSeconds),
@@ -177,6 +181,7 @@ public enum NetworkProfileStore {
         try profiles.forEach { try $0.validate() }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let data = try JSONEncoder().encode(profiles)
+        guard data.count <= 1024 * 1024 else { throw NetworkError.limitExceeded("Список подключений превышает 1 МиБ.") }
         try data.write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }

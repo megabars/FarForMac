@@ -218,3 +218,21 @@ private func mutationFailure<T>(_ work: () throws -> T) throws -> RemoteTreeOper
     do { _ = try work(); Issue.record("Expected mutation failure"); throw NetworkError.io("Expected failure") }
     catch let error as RemoteTreeOperationError { return error }
 }
+
+
+extension RemoteTreeOperationsTests {
+    @Test func temporaryDeletionCoalescesParentAndChildAndReviewsDescendants() throws {
+        let provider = TreeRemote(); provider.tree()
+        let items = ["/tree", "/tree/sub/b"].map { path in
+            SearchMatch.remote(ProviderSearchResult(archiveEntry: nil, remoteEntry: provider.entry(path),
+                archiveURL: nil, connectionID: provider.connection.id, snippet: nil, lineNumber: nil,
+                byteOffset: nil, archiveSnapshot: nil, capturedConnection: provider.connection), provider)
+        }
+        let plan = try TemporaryResultDeletion.prepare(items)
+        #expect(plan.count == 2 && plan.permanentFileCount == 2 && plan.permanentDirectoryCount == 2)
+        #expect(plan.reviewPaths.count == 4 && provider.removed.isEmpty)
+        let outcome = TemporaryResultDeletion.execute(plan)
+        #expect(outcome.failure == nil && outcome.completedIDs == Set(items.map(\.id)))
+        #expect(provider.removed.count == 4)
+    }
+}

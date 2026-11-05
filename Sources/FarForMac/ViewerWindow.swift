@@ -12,17 +12,17 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     static let helpText = """
     ПРОСМОТР — F3
 
-    F2 — перенос в тексте или выход из дампа; F4 — hex и обратно; Shift+F4 — выбор текста / hex / дампа; F6 — открыть редактор в текущей позиции; F7 или Cmd+F — поле поиска. Shift+F7 или пробел в тексте — следующее совпадение, Option+F7 — предыдущее. Option+F8 — поле перехода. Home / End — начало / конец файла, Page Up / Down — прокрутка с переходом к соседнему блоку на границе; F10 в тексте — закрыть окно. Кнопки «Назад» / «Далее» читают соседние блоки. «Предыдущий файл» / «Следующий файл» и цифровые − / + открывают соседний обычный файл из порядка панели, захваченного при F3, без обхода по кругу. Папки и специальные файлы пропускаются. Изменённый, удалённый или недоступный сосед выдаёт ошибку; текущий файл остаётся открыт. Для рабочих копий архива/сервера и отдельных источников перехода нет. Esc отменяет текущую операцию; повторный Esc закрывает окно.
+    F2 — перенос в тексте или выход из дампа, Shift+F2 — перенос по словам или символам. F4 — hex и обратно, Shift+F4 — выбор текста / hex / дампа. F6 — открыть редактор в текущей позиции. F7 или Cmd+F — диалог поиска, Shift+F7 или пробел — далее, Option+F7 — назад. F8 — ANSI / OEM, Shift+F8 — выбор кодовой страницы. Option+F8 — диалог перехода. Home / End — начало / конец файла, Page Up / Down — прокрутка с переходом к соседнему блоку на границе. F10 — закрыть окно. Кнопки «Назад» / «Далее» читают соседние блоки. «Предыдущий файл» / «Следующий файл» и цифровые − / + открывают соседний обычный файл в порядке панели. Esc отменяет текущую операцию или закрывает окно.
 
-    Просмотр читает блоки до 64 КиБ; выделение и копирование доступны только внутри показанного блока. Блок может начинаться или заканчиваться посреди строки. Hex показывает точные байты с адресами, текст показывает выбранную кодировку. Дамп показывает по одной позиции на байт (UTF-16 — на два байта), 80 позиций в строке; переводы строк и Tab показаны видимыми знаками и не управляют отображением. В UTF-8 продолжения показаны ›; в UTF-16 пара суррогатов показана символом и ›. BOM виден как �. Точное совпадение ширины символов с консольными ячейками FAR не заявлено. F4 возвращает последний основной режим: текст или дамп. Автоопределение кодировки приблизительное; BOM и действующая кодировка показаны рядом с выбором. Недопустимые последовательности заменяются символом �.
+    Просмотр читает блоки до 64 КиБ. Hex показывает точные байты, адрес и символы выбранной кодировки. Alt+←/→ меняет число байтов на строку по одному, Ctrl+Alt+←/→ — по сетке с шагом 16. Ctrl+←/→ сдвигает начало строки на байт в hex или на одну кодовую единицу в дампе. Дамп использует ширину видимой области. В UTF-8 байты продолжения показаны как ›. В UTF-16 пара суррогатов отображается символом и ›. Переводы строк и Tab показаны видимыми знаками. Ширина широких глифов зависит от шрифта AppKit. F4 возвращает последний основной режим: текст или дамп. BOM и действующая кодировка показаны рядом с выбором.
 
-    Переход: выберите байты, проценты или строку (с 1). Байты принимают десятичное число и 0xHEX; + / - задают смещение относительно текущей позиции. Суффикс % переключает на проценты; + / - также поддерживаются. Поиск строки и переход к строке выполняются в фоне; Esc или «Отменить» останавливает сканирование.
+    Переход принимает десятичные байты, 0xFF, $FF, FFh, проценты и относительные значения со знаком. В тексте без переноса можно задать первую видимую колонку после запятой или пробела. Пустая координата сохраняет позицию.
 
     Поиск: текст, регулярное выражение по отдельным строкам или hex-байты. Направление и регистр задаются явно. «Нестрогий поиск» в режиме «Текст» раскрывает лигатуры, совместимые формы и цифры Unicode и игнорирует неалфавитные диакритические знаки; регистр задаётся независимо. Границы и выделение остаются в исходном тексте, включая удаляемые комбинируемые знаки. Regex и Hex с этим флажком дают явный отказ. Настройки запоминаются, история хранит 20 запросов вместе с флажками. Контекст нестрогого поиска ограничен 262144 единицами UTF-16; слишком длинная цепочка комбинируемых знаков даёт явную ошибку неполного поиска. «Целые слова» учитывают буквы, цифры, подчёркивание и комбинируемые знаки Unicode; для hex этот флажок не применяется. «Искать по кругу» продолжает поиск с другой границы файла; без флажка поиск останавливается у границы. Регулярные выражения ограничены строкой до 1 МиБ и временем проверки; превышение ограничений выдаёт ошибку, а не «не найдено». Длинное совпадение выделяется только в пределах показанного блока. Пустое совпадение при повторном поиске продвигает позицию на один Unicode-символ.
 
-    «Следить за файлом» обновляет конец локального файла раз в секунду, включая усечение и замену файла. Читается свежий блок до 64 КиБ через новый проверяемый источник; постоянная запись может задержать обновление до следующего опроса. Поиск и явный переход останавливают слежение. Для внешнего источника эта команда недоступна.
+    End и «Следить за файлом» обновляют конец локального файла раз в секунду, включая усечение и замену файла. Поиск и переход в другую область останавливают слежение.
 
-    Последняя позиция, режим, кодировка и перенос сохраняются для 100 файлов; для каждого файла можно сохранить 20 закладок. Замена или изменение файла сбрасывает позиции и закладки. Просмотр не записывает содержимое файла. Запись доступна только в отдельном редакторе, возможности которого могут быть уже возможностей просмотра.
+    Ctrl+Shift+0…9 или правый Ctrl+0…9 — установить закладку, левый Ctrl+0…9 — перейти. Ctrl+Z или Option+Backspace восстанавливает прежнее положение. Позиция, режим, кодировка, перенос и закладки сохраняются для 100 файлов. Замена или изменение файла сбрасывает позиции и закладки.
     """
 
     private nonisolated static let pageSize = 65_536
@@ -38,7 +38,11 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         var cycle: Bool = false
         var backwards: Bool = false
     }
-    private struct Bookmark: Codable { var offset: Int64; var title: String }
+    private struct Bookmark: Codable, Equatable {
+        var offset: Int64
+        var title: String
+        var column: Int? = nil
+    }
     private struct History: Codable {
         var url: String
         var identity: String
@@ -48,14 +52,22 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         var dump: Bool? = nil
         var baseDump: Bool? = nil
         var wrap: Bool = true
+        var wordWrap: Bool? = nil
         var bookmarks: [Bookmark] = []
+        var numberedBookmarks: [Int: Bookmark]? = nil
         var accessed: Date = Date()
     }
+    private enum RenderLayout: Equatable, Sendable {
+        case text
+        case dump(columns: Int)
+        case hex(bytesPerRow: Int)
+    }
+
     private struct Loaded: Sendable {
         let document: ViewerDocument
+        let layout: RenderLayout
         let page: ViewerPage?
-        let data: Data?
-        let hexText: String?
+        let hexPage: ViewerHexPage?
         let logicalOffset: Int64
         let offset: Int64
         let selection: Range<Int64>?
@@ -63,6 +75,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
 
     private var sourceURL: URL
     private var navigation: ViewerNavigation?
+    var currentNavigation: ViewerNavigation? { navigation }
     private let suppliedSource: (any ViewerByteSource)?
     private let onEdit: (URL, Int64, ViewerEncoding) -> Bool
     private let initialOffset: Int64?
@@ -70,7 +83,9 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     private let initialDisplayMode: ViewerDisplayMode?
     private var viewerDocument: ViewerDocument?
     private var page: ViewerPage?
-    private var hexData = Data()
+    private var hexPage: ViewerHexPage?
+    private var hexBytesPerRow = ViewerHexLayout.defaultBytesPerRow
+    private var displayedLayout: RenderLayout?
     private var displayOffset: Int64 = 0
     private var displayEnd: Int64 = 0
     private(set) var currentByteOffset: Int64 = 0
@@ -79,12 +94,17 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     private var isDump = false
     private var baseMode: ViewerDisplayMode = .text
     private var wraps = true
+    private var wordWrap = true
+    private var gotoHex: Bool?
+    private var undoPosition: Bookmark?
+    private var sessionBookmarks: [Int: Bookmark] = [:]
     private var requestedEncoding: ViewerEncoding = .automatic
     private var generation = UUID()
     private var cancellation: ViewerCancellation?
     private var busyTitle = ""
     private var closed = false
     private var presenting = false
+    private var revealingEnd = false
     var retainedArchiveWorkspace: ArchiveWorkspace?
     func showWorkingCopyLocation(_ path: String) {
         guard retainedArchiveWorkspace != nil || retainedRemoteWorkspace != nil else { return }
@@ -113,8 +133,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     private let wrapButton = NSButton(checkboxWithTitle: "Перенос · F2", target: nil, action: nil)
     private let followButton = NSButton(checkboxWithTitle: "Следить за файлом", target: nil, action: nil)
     private let effectiveEncoding = NSTextField(labelWithString: "Открытие…")
-    private let position = NSTextField(string: "")
-    private let positionMode = NSPopUpButton()
+    private var searchAccessory: NSStackView?
     private let searchField = NSTextField(string: "")
     private let searchMode = NSPopUpButton()
     private let searchDirection = NSPopUpButton()
@@ -172,7 +191,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func showWindow(_ sender: Any?) {
-        followButton.isHidden = suppliedSource != nil || retainedArchiveWorkspace != nil || retainedRemoteWorkspace != nil
+        followButton.isHidden = !canFollow
         if followButton.isHidden { navigation = nil }
         refreshFileButtons()
         if let view = window?.contentView { UIAccessibility.apply(to: view) }
@@ -215,25 +234,19 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         effectiveEncoding.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         previousFileButton.target = self; previousFileButton.action = #selector(previousFileRequested)
         nextFileButton.target = self; nextFileButton.action = #selector(nextFileRequested)
-        let fileNavigation = row([previousFileButton, nextFileButton])
+        let fileNavigation = row([previousFileButton, nextFileButton, followButton])
         let formats = row([mode, encoding, wrapButton, effectiveEncoding,
                            button("Редактор · F6", #selector(editRequested))])
-        position.placeholderString = "Смещение / % / строка"
-        position.toolTip = "Байты: 123, 0xFF, +16, -16; проценты: 50%, +10%; строки с 1"
-        position.cell?.sendsActionOnEndEditing = false
-        position.target = self; position.action = #selector(goRequested)
-        position.widthAnchor.constraint(equalToConstant: 170).isActive = true
-        positionMode.addItems(withTitles: ["Байты", "%", "Строка"])
         cancelButton.target = self; cancelButton.action = #selector(cancelRequested)
         cancelButton.isEnabled = false
         let navigation = row([button("Начало", #selector(pageRequested), tag: -2),
                               button("Назад", #selector(pageRequested), tag: -1),
                               button("Далее", #selector(pageRequested), tag: 1),
-                              button("Конец", #selector(pageRequested), tag: 2), position, positionMode,
-                              button("Перейти", #selector(goRequested)), cancelButton])
-        searchField.placeholderString = "Поиск · F7 / Cmd+F"
+                              button("Конец", #selector(pageRequested), tag: 2),
+                              button("Перейти · Alt+F8", #selector(goRequested)), cancelButton])
+        searchField.placeholderString = "Текст или шестнадцатеричные байты"
         searchField.cell?.sendsActionOnEndEditing = false
-        searchField.target = self; searchField.action = #selector(searchRequested)
+        searchField.setAccessibilityLabel("Строка поиска")
         searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 190).isActive = true
         searchMode.addItems(withTitles: ["Текст", "Regex", "Hex"])
@@ -241,14 +254,13 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         searchHistoryMenu.addItem(withTitle: "История поиска")
         searchHistoryMenu.target = self; searchHistoryMenu.action = #selector(searchHistorySelected)
         searchHistoryMenu.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        let searching = row([searchField, searchMode,
-                             searchHistoryMenu, button("Найти", #selector(searchRequested)),
+        let searching = row([button("Поиск · F7", #selector(showSearchDialog)),
                              button("Следующее", #selector(nextRequested)), button("Предыдущее", #selector(previousRequested))])
-        let searchOptions = row([caseButton, wordsButton, fuzzyButton, cycleButton, searchDirection, followButton])
+        searchAccessory = TextDocumentDialogs.accessory([
+            row([searchField, searchMode]), searchHistoryMenu,
+            row([caseButton, wordsButton]), row([fuzzyButton, cycleButton])
+        ], height: 128, width: 465)
         fuzzyButton.toolTip = "Только текст: игнорировать диакритику, раскрывать лигатуры и совместимые Unicode-формы. Регистр задаётся отдельно."
-        for control in [caseButton, wordsButton, fuzzyButton, cycleButton, searchDirection, searchMode] {
-            control.target = self; control.action = #selector(searchSettingsChanged)
-        }
         if let data = AppPreferences.defaults.data(forKey: Self.searchSettingsKey),
            let settings = try? JSONDecoder().decode(SearchSettings.self, from: data) { applySearchSettings(settings) }
         refreshSearchHistory()
@@ -284,11 +296,11 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         message.textColor = .secondaryLabelColor
         message.maximumNumberOfLines = 2
         let footer = row([status, NSView(), button("Справка · F1", #selector(showViewerHelp)), button("Закрыть", #selector(closeRequested))])
-        let stack = NSStackView(views: [path, formats, fileNavigation, navigation, searching, searchOptions, bookmarks, scroll, message, footer])
+        let stack = NSStackView(views: [path, formats, fileNavigation, navigation, searching, bookmarks, scroll, message, footer])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 9
         stack.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(stack)
-        for view in [path, formats, fileNavigation, navigation, searching, searchOptions, bookmarks, scroll, message, footer] {
+        for view in [path, formats, fileNavigation, navigation, searching, bookmarks, scroll, message, footer] {
             view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         NSLayoutConstraint.activate([
@@ -299,7 +311,8 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
             scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 120)
         ])
         scroll.setContentHuggingPriority(.defaultLow, for: .vertical)
-        operationControls = [formats, navigation, searching, searchOptions, bookmarks].flatMap { $0.arrangedSubviews.compactMap { $0 as? NSControl } }.filter { $0 !== cancelButton && $0 !== wrapButton }
+        operationControls = [formats, navigation, searching, bookmarks].flatMap { $0.arrangedSubviews.compactMap { $0 as? NSControl } }.filter { $0 !== cancelButton && $0 !== wrapButton }
+        operationControls.append(followButton)
         operationControls.forEach { $0.isEnabled = false }
         updateWrap()
         refreshHistoryMenus()
@@ -313,10 +326,11 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         }) { [weak self] source in
             guard let self else { return }
             self.identity = source.identity
-            let saved = Self.readHistory().first { $0.url == self.sourceURL.absoluteString }
+            let saved = self.canFollow ? Self.readHistory().first { $0.url == self.sourceURL.absoluteString } : nil
             if let saved {
                 self.requestedEncoding = saved.encoding; self.isHex = saved.hex; self.isDump = saved.dump == true && !saved.hex
                 self.baseMode = (saved.baseDump ?? saved.dump) == true ? .dump : .text; self.wraps = saved.wrap
+                self.wordWrap = saved.wordWrap ?? true
             }
             if self.initialEncoding != .automatic { self.requestedEncoding = self.initialEncoding }
             if let mode = self.initialDisplayMode {
@@ -334,94 +348,149 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     }
 
     private func openDocument(source: any ViewerByteSource, offset: Int64) {
-        let requested = requestedEncoding, hex = isHex, dump = isDump
+        let requested = requestedEncoding, layout = renderLayout
         work("Чтение блока", operation: { token, _ in
             let document = try ViewerDocument(source: source, encoding: requested)
             if token.isCancelled { throw ViewerError.cancelled }
-            return try Self.load(document, at: offset, hex: hex, dump: dump)
+            return try Self.load(document, at: offset, layout: layout)
         }) { [weak self] loaded in self?.present(loaded) }
     }
 
-    private nonisolated static func load(_ document: ViewerDocument, at offset: Int64, hex: Bool, dump: Bool = false,
+    private nonisolated static func load(_ document: ViewerDocument, at offset: Int64, layout: RenderLayout,
                                          selection: Range<Int64>? = nil) throws -> Loaded {
         let bounded = min(max(0, offset), document.size)
-        if hex {
-            let start = bounded == document.size && bounded > 0 ? max(0, bounded - 1) / 16 * 16 : bounded / 16 * 16
-            let data = try document.source.read(offset: start, count: pageSize)
-            return Loaded(document: document, page: nil, data: data, hexText: hexString(data, at: start),
-                          logicalOffset: bounded, offset: start, selection: selection)
+        let budget = document.size - bounded > Int64(pageSize) ? fullBlockByteCount(layout, encoding: document.encoding) : pageSize
+        switch layout {
+        case .hex(let bytesPerRow):
+            let page = try document.hexPage(at: bounded, byteCount: budget, bytesPerRow: bytesPerRow)
+            return Loaded(document: document, layout: layout, page: nil, hexPage: page, logicalOffset: bounded, offset: page.startOffset, selection: selection)
+        case .dump(let columns):
+            let page = try document.dumpPage(at: bounded, byteCount: budget, columns: columns)
+            return Loaded(document: document, layout: layout, page: page, hexPage: nil, logicalOffset: page.startOffset, offset: page.startOffset, selection: selection)
+        case .text:
+            let page = try document.page(at: bounded)
+            return Loaded(document: document, layout: layout, page: page, hexPage: nil, logicalOffset: page.startOffset, offset: page.startOffset, selection: selection)
         }
-        let page = try dump ? document.dumpPage(at: bounded) : document.page(at: bounded)
-        return Loaded(document: document, page: page, data: nil, hexText: nil, logicalOffset: page.startOffset, offset: page.startOffset, selection: selection)
     }
 
-    private func loadPage(at offset: Int64, selection: Range<Int64>? = nil, scrollToEnd: Bool = false) {
+    private nonisolated static func fullBlockByteCount(_ layout: RenderLayout, encoding: ViewerEncoding) -> Int {
+        let rowBytes: Int
+        switch layout {
+        case .hex(let bytesPerRow): rowBytes = bytesPerRow
+        case .dump(let columns): rowBytes = columns * (encoding == .utf16LE || encoding == .utf16BE ? 2 : 1)
+        case .text: return pageSize
+        }
+        return pageSize / rowBytes * rowBytes
+    }
+
+    private func previousBlockOffset(in document: ViewerDocument) -> Int64 {
+        let budget = Self.fullBlockByteCount(displayedLayout ?? renderLayout, encoding: document.encoding)
+        return max(0, displayOffset - Int64(budget))
+    }
+
+    private func loadPage(at offset: Int64, selection: Range<Int64>? = nil, scrollToEnd: Bool = false,
+                          column: Int? = nil, followEnd: Bool = false, layout requestedLayout: RenderLayout? = nil,
+                          revealSelection: Bool = true) {
         guard let document = viewerDocument else { return }
-        let hex = isHex, dump = isDump
+        let layout = requestedLayout ?? renderLayout
         work("Чтение блока", operation: { token, _ in
             if token.isCancelled { throw ViewerError.cancelled }
-            return try Self.load(document, at: offset, hex: hex, dump: dump, selection: selection)
+            return try Self.load(document, at: offset, layout: layout, selection: selection)
         }) { [weak self] loaded in
             guard let self else { return }
-            self.present(loaded)
-            if scrollToEnd {
-                if let container = self.textView.textContainer { self.textView.layoutManager?.ensureLayout(for: container) }
-                let bottom = max(0, self.textView.bounds.height - self.scroll.contentView.bounds.height)
-                self.scroll.contentView.scroll(to: NSPoint(x: 0, y: bottom))
-                self.scroll.reflectScrolledClipView(self.scroll.contentView)
-                self.scrolled()
-            }
+            self.present(loaded, revealSelection: revealSelection)
+            if scrollToEnd { self.revealEnd() }
+            if let column { self.scrollToColumn(column) }
+            if followEnd && self.canFollow { self.startFollowing() }
         }
     }
 
-    private func present(_ loaded: Loaded) {
+    private var isAtEnd: Bool {
+        scroll.documentVisibleRect.maxY >= textView.bounds.maxY - 1
+    }
+
+    private func revealEnd() {
+        revealingEnd = true
+        defer { revealingEnd = false; scrolled() }
+        if let container = textView.textContainer { textView.layoutManager?.ensureLayout(for: container) }
+        textView.scrollRangeToVisible(NSRange(location: textView.string.utf16.count, length: 0))
+        moveViewport(to: NSPoint(x: 0, y: max(0, textView.bounds.height - scroll.contentView.bounds.height)))
+    }
+
+    private func moveViewport(to point: NSPoint) {
+        let clip = scroll.contentView
+        clip.scroll(to: clip.constrainBoundsRect(NSRect(origin: point, size: clip.bounds.size)).origin)
+        scroll.reflectScrolledClipView(clip)
+    }
+
+    private var columnWidth: CGFloat { (" " as NSString).size(withAttributes: [.font: textView.font ?? NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)]).width }
+    private var visibleColumn: Int { max(0, Int(scroll.documentVisibleRect.minX / columnWidth)) }
+
+    private var viewportColumns: Int {
+        let inset = textView.textContainerInset.width + (textView.textContainer?.lineFragmentPadding ?? 0)
+        let overlay = scroll.hasVerticalScroller && scroll.scrollerStyle == .overlay ? 1 : 0
+        return min(1_000, max(1, Int(max(0, scroll.contentSize.width - 2 * inset) / columnWidth) - overlay))
+    }
+
+    private var renderLayout: RenderLayout {
+        if isHex { return .hex(bytesPerRow: hexBytesPerRow) }
+        if isDump { return .dump(columns: viewportColumns) }
+        return .text
+    }
+
+    private func reflowDumpIfNeeded() {
+        guard !closed, cancellation == nil, isDump, case .dump? = displayedLayout, displayedLayout != renderLayout,
+              let document = viewerDocument else { return }
+        let anchored = followTimer != nil || displayEnd == document.size && isAtEnd && scroll.documentVisibleRect.minY > 1
+        let offset = anchored ? max(0, document.size - Int64(Self.pageSize - 16)) : visibleByteOffset()
+        loadPage(at: offset, selection: anchored ? nil : lastMatch, scrollToEnd: anchored,
+                 followEnd: followTimer != nil, revealSelection: false)
+    }
+
+    func windowDidResize(_ notification: Notification) { reflowDumpIfNeeded() }
+
+    private func scrollToColumn(_ column: Int) {
+        let clip = scroll.contentView
+        let maxX = max(0, textView.bounds.width - clip.bounds.width)
+        moveViewport(to: NSPoint(x: min(maxX, CGFloat(column) * columnWidth), y: clip.bounds.minY))
+    }
+
+    private func present(_ loaded: Loaded, revealSelection: Bool = true) {
         presenting = true
-        viewerDocument = loaded.document; operationControls.forEach { $0.isEnabled = true }; page = loaded.page; hexData = loaded.data ?? Data()
+        viewerDocument = loaded.document; operationControls.forEach { $0.isEnabled = true }
+        page = loaded.page; hexPage = loaded.hexPage; displayedLayout = loaded.layout
+        if let hexPage { hexBytesPerRow = hexPage.bytesPerRow }
         displayOffset = loaded.offset
-        displayEnd = loaded.page?.endOffset ?? (loaded.offset + Int64(hexData.count))
-        currentByteOffset = loaded.selection?.lowerBound ?? loaded.logicalOffset
-        textView.string = loaded.page?.text ?? loaded.hexText ?? ""
+        displayEnd = loaded.page?.endOffset ?? loaded.hexPage?.endOffset ?? loaded.offset
+        currentByteOffset = loaded.logicalOffset
+        textView.string = loaded.page?.text ?? loaded.hexPage?.text ?? ""
         textView.setSelectedRange(NSRange(location: 0, length: 0))
-        if let match = loaded.selection {
-            if let page = loaded.page {
-                let displayed = max(match.lowerBound, page.startOffset)..<min(max(match.upperBound, page.startOffset), page.endOffset)
-                if let range = page.utf16Range(forByteRange: displayed) { textView.setSelectedRange(range) }
-            } else {
-                let relative = Int(max(0, match.lowerBound - displayOffset))
-                let start = Self.hexCharacterOffset(relative)
-                let available = max(0, min(Int(match.upperBound - match.lowerBound), hexData.count - relative))
-                let end = available > 0 ? Self.hexCharacterOffset(relative + available - 1) + 2 : start
-                textView.setSelectedRange(NSRange(location: min(start, textView.string.utf16.count),
-                                                  length: max(0, min(end, textView.string.utf16.count) - start)))
+        scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        let match = loaded.selection.flatMap { match -> Range<Int64>? in
+            if match.isEmpty { return (displayOffset...displayEnd).contains(match.lowerBound) ? match : nil }
+            let lower = max(displayOffset, match.lowerBound)
+            let upper = min(displayEnd, match.upperBound)
+            return lower < upper ? lower..<upper : nil
+        }
+        if let match, let range = loaded.page?.utf16Range(forByteRange: match) ?? loaded.hexPage?.utf16Range(forByteRange: match) {
+            textView.setSelectedRange(range)
+            if revealSelection {
+                currentByteOffset = match.lowerBound
+                textView.scrollRangeToVisible(range)
             }
-            textView.scrollRangeToVisible(textView.selectedRange())
-        } else {
-            scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
         }
         effectiveEncoding.stringValue = "\(loaded.document.encoding.title) · BOM: \(loaded.document.bomLength) байт"
         message.stringValue = loaded.page?.invalidSequences == true ? "Недопустимые последовательности заменены на �. Можно выбрать другую кодировку или Hex." : ""
-        if let match = loaded.selection, match.upperBound > displayEnd {
-            message.stringValue = "Совпадение: \(match.lowerBound)..<\(match.upperBound). Выделена его часть в показанном блоке."
+        if let match, let selection = loaded.selection, match != selection {
+            message.stringValue = "Совпадение: \(selection.lowerBound)..<\(selection.upperBound). Выделена его часть в показанном блоке."
         }
         presenting = false
         window?.makeFirstResponder(textView)
         refreshStatus(); refreshHistoryMenus()
-    }
-
-    private nonisolated static func hexString(_ data: Data, at offset: Int64) -> String {
-        let bytes = Array(data)
-        var rows: [String] = []
-        rows.reserveCapacity((bytes.count + 15) / 16)
-        for start in stride(from: 0, to: bytes.count, by: 16) {
-            let line = Array(bytes[start..<min(start + 16, bytes.count)])
-            let hex = line.map { String(format: "%02X", $0) }.joined(separator: " ")
-            let ascii = String(line.map { (32...126).contains($0) ? Character(Unicode.Scalar($0)) : "." })
-            rows.append(String(format: "%016llX  ", offset + Int64(start)) + hex.padding(toLength: 47, withPad: " ", startingAt: 0) + "  |" + ascii.padding(toLength: 16, withPad: " ", startingAt: 0) + "|")
+        if isDump, loaded.layout != renderLayout {
+            DispatchQueue.main.async { [weak self] in self?.reflowDumpIfNeeded() }
         }
-        return rows.joined(separator: "\n")
     }
-
-    private nonisolated static func hexCharacterOffset(_ byte: Int) -> Int { byte / 16 * 86 + 18 + byte % 16 * 3 }
 
     private func work<T: Sendable>(_ title: String,
         operation: @escaping (ViewerCancellation, @escaping (Int64) -> Void) throws -> T,
@@ -466,7 +535,13 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     private func refreshStatus(progress: Int64? = nil) {
         let size = viewerDocument?.size ?? 0
         let percent = size == 0 ? 0 : Double(currentByteOffset) / Double(size) * 100
-        let base = "Байт \(currentByteOffset) / \(size) · \(String(format: "%.2f", percent))% · блок \(displayOffset)..<\(displayEnd)"
+        let width: String
+        switch displayedLayout {
+        case .hex(let bytesPerRow)?: width = " · \(bytesPerRow) байт/строка"
+        case .dump(let columns)?: width = " · \(columns) колонок"
+        default: width = ""
+        }
+        let base = "Байт \(currentByteOffset) / \(size) · \(String(format: "%.2f", percent))% · блок \(displayOffset)..<\(displayEnd)\(width)"
         status.stringValue = busyTitle.isEmpty ? base : "\(busyTitle)…\(progress.map { " \($0) байт" } ?? "") · Esc — отменить"
     }
 
@@ -477,52 +552,80 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     }
 
     private func offsetForCharacter(_ index: Int) -> Int64 {
-        if let page { return page.byteOffset(forUTF16: index) }
-        let line = index / 86, column = index % 86
-        let byte = column >= 68 ? column - 68 : max(0, (column - 18) / 3)
-        return min(displayEnd, displayOffset + Int64(line * 16 + min(byte, 15)))
+        page?.byteOffset(forUTF16: index) ?? hexPage?.byteOffset(forUTF16: index) ?? displayOffset
+    }
+
+    private func visibleByteOffset(bottom: Bool = false) -> Int64 {
+        guard !presenting, viewerDocument != nil, let container = textView.textContainer,
+              let layout = textView.layoutManager, layout.numberOfGlyphs > 0 else { return displayOffset }
+        if bottom && isAtEnd { return displayEnd }
+        if bottom {
+            let visible = scroll.documentVisibleRect
+            let rect = NSRect(x: 0, y: max(0, visible.minY - textView.textContainerInset.height),
+                              width: max(visible.width, textView.bounds.width), height: visible.height)
+            let end = NSMaxRange(layout.glyphRange(forBoundingRect: rect, in: container))
+            return end >= layout.numberOfGlyphs ? displayEnd : offsetForCharacter(layout.characterIndexForGlyph(at: end))
+        }
+        var point = scroll.contentView.bounds.origin
+        point.x = 0
+        point.y = max(0, point.y - textView.textContainerInset.height)
+        let glyph = layout.glyphIndex(for: point, in: container)
+        let character = layout.characterIndexForGlyph(at: min(glyph, max(0, layout.numberOfGlyphs - 1)))
+        return offsetForCharacter(character)
     }
 
     private func scrolled() {
-        guard !presenting, viewerDocument != nil, let container = textView.textContainer,
-              let layout = textView.layoutManager else { return }
-        var point = scroll.contentView.bounds.origin
-        point.x = max(0, point.x - textView.textContainerInset.width)
-        point.y = max(0, point.y - textView.textContainerInset.height)
-        guard layout.numberOfGlyphs > 0 else { currentByteOffset = displayOffset; refreshStatus(); return }
-        let glyph = layout.glyphIndex(for: point, in: container)
-        let character = layout.characterIndexForGlyph(at: min(glyph, max(0, layout.numberOfGlyphs - 1)))
-        currentByteOffset = offsetForCharacter(character); refreshStatus()
+        guard !presenting, viewerDocument != nil else { return }
+        if followButton.state == .on && !revealingEnd && !isAtEnd { stopFollowing() }
+        currentByteOffset = visibleByteOffset(); refreshStatus()
     }
 
     @objc private func pageRequested(_ sender: NSButton) {
         stopFollowing()
         guard let document = viewerDocument, cancellation == nil else { return }
+        rememberPosition()
         lastMatch = nil
         switch sender.tag {
         case -2: loadPage(at: 0)
-        case -1: loadPage(at: max(0, displayOffset - Int64(Self.pageSize)))
-        case 2: loadPage(at: max(0, document.size - Int64(Self.pageSize)))
+        case -1: loadPage(at: previousBlockOffset(in: document))
+        case 2: loadPage(at: max(0, document.size - Int64(Self.pageSize - 16)), scrollToEnd: true, followEnd: true)
         default: if displayEnd < document.size { loadPage(at: displayEnd) }
         }
     }
 
     @objc private func encodingChanged() {
-        requestedEncoding = ViewerEncoding.allCases[encoding.indexOfSelectedItem]
-        let selected = requestedEncoding
-        updateHistory { $0.encoding = selected }
+        changeEncoding(ViewerEncoding.allCases[encoding.indexOfSelectedItem])
+    }
+
+    private func changeEncoding(_ selected: ViewerEncoding) {
+        guard let source = viewerDocument?.source, cancellation == nil else { return }
+        stopFollowing()
+        let offset = currentByteOffset, layout = renderLayout
         lastMatch = nil
-        if let source = viewerDocument?.source { openDocument(source: source, offset: currentByteOffset) }
+        encoding.selectItem(at: ViewerEncoding.allCases.firstIndex(of: requestedEncoding) ?? 0)
+        work("Смена кодовой страницы", operation: { token, _ in
+            let document = try ViewerDocument(source: source, encoding: selected)
+            if token.isCancelled { throw ViewerError.cancelled }
+            return try Self.load(document, at: offset, layout: layout)
+        }) { [weak self] loaded in
+            guard let self else { return }
+            self.requestedEncoding = selected
+            self.encoding.selectItem(at: ViewerEncoding.allCases.firstIndex(of: selected) ?? 0)
+            self.updateHistory { $0.encoding = selected }
+            self.present(loaded)
+        }
     }
 
     @objc private func modeChanged() { applyMode(updateBase: true) }
 
     private func applyMode(updateBase: Bool) {
-        isHex = mode.indexOfSelectedItem == 1
-        isDump = mode.indexOfSelectedItem == 2
+        let hex = mode.indexOfSelectedItem == 1, dump = mode.indexOfSelectedItem == 2
+        guard hex != isHex || dump != isDump else { return }
+        stopFollowing()
+        isHex = hex; isDump = dump
         if updateBase && !isHex { baseMode = isDump ? .dump : .text }
-        let selected = isHex, dump = isDump, baseDump = baseMode == .dump
-        updateHistory { $0.hex = selected; $0.dump = dump; $0.baseDump = baseDump }
+        let baseDump = baseMode == .dump
+        updateHistory { $0.hex = hex; $0.dump = dump; $0.baseDump = baseDump }
         updateWrap(); loadPage(at: currentByteOffset)
     }
 
@@ -537,8 +640,16 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         else { mode.selectItem(at: isDump || baseMode == .dump ? 0 : 2); applyMode(updateBase: false) }
     }
 
+    private func toggleWrapType() {
+        guard !isHex, !isDump else { return }
+        wordWrap.toggle()
+        let selected = wordWrap
+        updateHistory { $0.wordWrap = selected }
+        updateWrap()
+    }
+
     private func refreshFileButtons() {
-        let available = suppliedSource == nil && retainedArchiveWorkspace == nil && retainedRemoteWorkspace == nil
+        let available = canFollow
         previousFileButton.isHidden = !available || navigation == nil
         nextFileButton.isHidden = previousFileButton.isHidden
         previousFileButton.isEnabled = available && cancellation == nil && navigation?.adjacentIndex(forward: false) != nil
@@ -549,18 +660,18 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     @objc private func nextFileRequested() { navigateFile(forward: true) }
 
     private func navigateFile(forward: Bool) {
-        guard cancellation == nil, suppliedSource == nil, retainedArchiveWorkspace == nil, retainedRemoteWorkspace == nil,
+        guard cancellation == nil, canFollow,
               let navigation, let index = navigation.adjacentIndex(forward: forward) else { return }
         stopFollowing()
         let target = navigation.urls[index]
         let saved = Self.readHistory().first { $0.url == target.absoluteString }
-        let requested = saved?.encoding ?? requestedEncoding, hex = isHex, dump = isDump
+        let requested = saved?.encoding ?? requestedEncoding, hex = isHex, dump = isDump, layout = renderLayout
         let baseDump = baseMode == .dump
         work("Открытие соседнего файла", operation: { token, _ in
             let source = try navigation.source(at: index, cancellation: token)
             let document = try ViewerDocument(source: source, encoding: requested)
             let offset = saved?.identity == source.identity ? saved?.offset ?? 0 : 0
-            let loaded = try Self.load(document, at: offset, hex: hex, dump: dump)
+            let loaded = try Self.load(document, at: offset, layout: layout)
             try source.verifyUnchanged()
             if token.isCancelled { throw ViewerError.cancelled }
             return loaded
@@ -574,6 +685,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
             self.pathLabel.stringValue = target.path
             self.window?.title = "\(target.lastPathComponent) — Просмотр"; self.window?.representedURL = target
             self.lastMatch = nil; self.lastSearchSignature = nil
+            self.undoPosition = nil; self.sessionBookmarks = [:]
             self.updateHistory(allowIdentityReset: true) { $0.accessed = Date(); $0.hex = hex; $0.dump = dump; $0.baseDump = baseDump }
             self.present(loaded); self.refreshFileButtons()
         }
@@ -590,6 +702,12 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         wrapButton.isEnabled = !isHex && !isDump
         wrapButton.toolTip = "F2: перенос в тексте; из дампа — текст; из hex — режим, противоположный основному"
         let wrap = wraps && !isHex && !isDump
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = wordWrap ? .byWordWrapping : .byCharWrapping
+        textView.defaultParagraphStyle = paragraph
+        if let storage = textView.textStorage {
+            storage.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: storage.length))
+        }
         textView.isHorizontallyResizable = !wrap
         textView.autoresizingMask = wrap ? [.width] : []
         textView.textContainer?.widthTracksTextView = wrap
@@ -599,54 +717,56 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     }
 
     @objc private func goRequested() {
-        stopFollowing()
-        guard let document = viewerDocument else { return }
-        let text = position.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        let relative = text.hasPrefix("+") || text.hasPrefix("-")
-        if positionMode.indexOfSelectedItem == 2, !text.hasSuffix("%") {
-            guard let line = Int64(text), line > 0, !relative else { message.stringValue = "Номер строки — целое число с 1."; return }
-            let hex = isHex, dump = isDump
-            work("Переход к строке \(line)", operation: { token, progress in
-                let offset = try document.offset(ofLine: line, cancellation: token, onProgress: progress)
-                return try Self.load(document, at: offset, hex: hex, dump: dump)
-            }) { [weak self] loaded in self?.lastMatch = nil; self?.present(loaded) }
-            return
+        guard cancellation == nil, let document = viewerDocument else { return }
+        let column = !wraps && !isDump && !isHex ? visibleColumn : nil
+        let value = NSTextField(string: "")
+        value.placeholderString = column == nil ? "Смещение" : "Смещение, колонка"
+        value.widthAnchor.constraint(equalToConstant: 375).isActive = true
+        value.setAccessibilityLabel("Смещение")
+        let hex = NSButton(checkboxWithTitle: "Шестнадцатеричные значения", target: nil, action: nil)
+        hex.state = (gotoHex ?? isHex) ? .on : .off
+        let alert = NSAlert()
+        alert.messageText = "Перейти к позиции"
+        alert.informativeText = "Например: $20, 20h, 32m, 50% или +16."
+        alert.accessoryView = TextDocumentDialogs.accessory([value, hex], height: 60)
+        alert.addButton(withTitle: "Перейти")
+        alert.addButton(withTitle: "Отмена").keyEquivalent = "\u{1b}"
+        alert.window.initialFirstResponder = value
+        while alert.runModal() == .alertFirstButtonReturn {
+            do {
+                let hexadecimal = hex.state == .on
+                let target = try ViewerGotoPosition(value.stringValue, hexadecimal: hexadecimal,
+                    offset: currentByteOffset, fileSize: document.size, visibleColumn: column)
+                gotoHex = hexadecimal
+                stopFollowing(); rememberPosition(); lastMatch = nil
+                if target.offset == document.size {
+                    loadPage(at: max(0, document.size - Int64(Self.pageSize - 16)), scrollToEnd: true,
+                             column: target.column ?? column, followEnd: true)
+                } else if target.offset == currentByteOffset {
+                    if let column = target.column { scrollToColumn(column) }
+                } else { loadPage(at: target.offset, column: target.column ?? column) }
+                return
+            } catch { alert.informativeText = error.localizedDescription }
         }
-        let percent = text.hasSuffix("%") || positionMode.indexOfSelectedItem == 1
-        var raw = text.hasSuffix("%") ? String(text.dropLast()) : text
-        var sign: Int64 = 1
-        if raw.hasPrefix("-") { sign = -1; raw.removeFirst() }
-        else if raw.hasPrefix("+") { raw.removeFirst() }
-        let offset: Int64
-        if percent {
-            guard let number = Double(raw), number.isFinite, number >= 0, number <= 100 else { message.stringValue = "Процент должен быть от 0 до 100."; return }
-            let delta = Double(document.size) * number / 100
-            let proposed = Double(relative ? currentByteOffset : 0) + Double(sign) * delta
-            if proposed >= Double(document.size) { offset = document.size }
-            else if proposed <= 0 { offset = 0 }
-            else { offset = Int64(proposed.rounded(.towardZero)) }
-        } else {
-            let value: Int64?
-            if raw.lowercased().hasPrefix("0x") { value = Int64(raw.dropFirst(2), radix: 16) }
-            else { value = Int64(raw) }
-            guard let value, value >= 0 else { message.stringValue = "Введите смещение в байтах: 123, 0xFF, +16 или -16."; return }
-            let (candidate, overflow) = (relative ? currentByteOffset : 0).addingReportingOverflow(sign * value)
-            guard !overflow, candidate >= 0, candidate <= document.size else { message.stringValue = "Смещение за пределами файла."; return }
-            offset = candidate
-        }
-        lastMatch = nil; loadPage(at: offset)
+    }
+
+    private var canFollow: Bool {
+        suppliedSource == nil && retainedArchiveWorkspace == nil && retainedRemoteWorkspace == nil && retainedRemoteLease == nil
     }
 
     @objc private func followChanged() {
-        if followButton.state != .on { stopFollowing(); return }
-        guard suppliedSource == nil, retainedArchiveWorkspace == nil, retainedRemoteWorkspace == nil else { stopFollowing(); return }
+        if followButton.state != .on || !canFollow { stopFollowing(); return }
+        startFollowing()
+        pollFollow(force: true)
+    }
+
+    private func startFollowing() {
+        followButton.state = .on
         followRevision = UUID()
         followTimer?.invalidate()
         followTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.pollFollow() }
         }
-        pollFollow(force: true)
     }
 
     private func stopFollowing() {
@@ -658,11 +778,11 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         followPending = true
         let revision = followRevision, operation = generation
         let url = sourceURL, previous = force ? nil : viewerDocument?.source.identity
-        let requested = requestedEncoding, hex = isHex, dump = isDump
+        let requested = requestedEncoding, layout = renderLayout
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let result: Result<Loaded?, Error> = Result {
                 guard let update = try ViewerTail.poll(url: url, previousIdentity: previous, encoding: requested) else { return nil }
-                return try Self.load(update.document, at: update.offset, hex: hex, dump: dump)
+                return try Self.load(update.document, at: update.offset, layout: layout)
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -679,7 +799,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
                     let responder = self.window?.firstResponder
                     self.lastMatch = nil; self.present(loaded)
                     if let responder { self.window?.makeFirstResponder(responder) }
-                    self.textView.scrollRangeToVisible(NSRange(location: self.textView.string.utf16.count, length: 0))
+                    self.revealEnd()
                     self.message.stringValue = "Слежение: конец файла обновляется раз в секунду. Поиск и переход останавливают слежение."
                 case .failure(let error):
                     // A busy writer can change between snapshot and page read. Retry
@@ -695,6 +815,28 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     @objc private func nextRequested() { search(direction: .forward, repeatSearch: true) }
     @objc private func previousRequested() { search(direction: .backward, repeatSearch: true) }
 
+    @objc private func showSearchDialog() {
+        guard cancellation == nil, viewerDocument != nil, let searchAccessory else { return }
+        let previous = searchSettings
+        let alert = NSAlert()
+        alert.messageText = "Поиск в файле"
+        alert.accessoryView = searchAccessory
+        defer { alert.accessoryView = nil }
+        alert.addButton(withTitle: "Найти далее")
+        alert.addButton(withTitle: "Найти назад")
+        alert.addButton(withTitle: "Отмена").keyEquivalent = "\u{1b}"
+        alert.window.initialFirstResponder = searchField
+        UIAccessibility.apply(to: searchAccessory)
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn || response == .alertSecondButtonReturn else {
+            let match = lastMatch, signature = lastSearchSignature
+            applySearchSettings(previous); lastMatch = match; lastSearchSignature = signature
+            return
+        }
+        searchDirection.selectItem(at: response == .alertSecondButtonReturn ? 1 : 0)
+        searchRequested()
+    }
+
     private func search(direction: ViewerSearchDirection, repeatSearch: Bool) {
         stopFollowing()
         guard let document = viewerDocument else { return }
@@ -706,31 +848,30 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         let cycle = cycleButton.state == .on
         let signature = "\(searchMode.indexOfSelectedItem):\(caseButton.state.rawValue):\(wordsButton.state.rawValue):\(fuzzyButton.state.rawValue):\(cycle):\(searchField.stringValue)"
         let previous = repeatSearch && signature == lastSearchSignature ? lastMatch : nil
-        let current = currentByteOffset, hex = isHex, dump = isDump
+        let current = visibleByteOffset(bottom: direction == .backward), layout = renderLayout
         lastSearchSignature = signature
         work("Поиск", operation: { token, progress in
             try ViewerSearch.validate(query)
             var from = current
             if let previous {
                 if direction == .backward { from = previous.lowerBound }
-                else if previous.isEmpty {
-                    if previous.lowerBound >= document.size {
-                        if !cycle { return Optional<Loaded>.none }
-                        from = 0
-                    } else {
-                        let page = try document.page(at: previous.lowerBound)
-                        let width = page.text.unicodeScalars.first.map { $0.value > 0xFFFF ? 2 : 1 } ?? 1
-                        from = page.byteOffset(forUTF16: width)
-                        if from <= previous.lowerBound { from = previous.lowerBound + 1 }
-                    }
-                } else { from = previous.upperBound }
+                else if previous.lowerBound >= document.size {
+                    if !cycle { return Optional<Loaded>.none }
+                    from = 0
+                } else if query.mode == .hex { from = previous.lowerBound + 1 }
+                else {
+                    let page = try document.page(at: previous.lowerBound, byteCount: 4)
+                    let width = page.text.unicodeScalars.first.map { $0.value > 0xFFFF ? 2 : 1 } ?? 1
+                    from = max(previous.lowerBound + 1, page.byteOffset(forUTF16: width))
+                }
             }
             guard let found = try ViewerSearch.find(document: document, query: query, from: from,
                                                     direction: direction, wrap: cycle, cancellation: token, onProgress: progress) else { return Optional<Loaded>.none }
-            return try Optional(Self.load(document, at: found.byteRange.lowerBound, hex: hex, dump: dump, selection: found.byteRange))
+            return try Optional(Self.load(document, at: found.byteRange.lowerBound, layout: layout, selection: found.byteRange))
         }) { [weak self] loaded in
             guard let self else { return }
             guard let loaded else { self.message.stringValue = cycle ? "Совпадений нет во всём файле." : "Совпадение не найдено до \(direction == .forward ? "конца" : "начала") файла. Поиск без перехода через границу."; return }
+            self.rememberPosition()
             self.lastMatch = loaded.selection; self.present(loaded)
         }
     }
@@ -793,11 +934,10 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         }
     }
 
-    @objc private func searchSettingsChanged() { lastMatch = nil; lastSearchSignature = nil; saveSearchSettings(recordHistory: false) }
     @objc private func searchHistorySelected() {
         guard let index = searchHistoryMenu.selectedItem?.representedObject as? Int else { return }
         let entries = Self.readSearchHistory(); guard entries.indices.contains(index) else { return }
-        applySearchSettings(entries[index]); saveSearchSettings(recordHistory: false); searchHistoryMenu.selectItem(at: 0)
+        applySearchSettings(entries[index]); searchHistoryMenu.selectItem(at: 0)
     }
     @objc private func closeRequested() { window?.performClose(nil) }
     @objc private func showViewerHelp() {
@@ -814,67 +954,106 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
                 guard let self, event.window === self.window, self.window?.isKeyWindow == true,
                       self.window?.attachedSheet == nil else { return false }
                 if CommandWorkspace.shared.handle(event) { return true }
-                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-                let key = event.keyCode
-                if flags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" {
-                    self.searchField.selectText(nil); return true
-                }
-                if key == 53 {
-                    if self.cancellation != nil { self.cancelRequested() } else { self.closeRequested() }
-                    return true
-                }
-                if key == 122 { self.showViewerHelp(); return true } // F1
-                if key == 99 { // F3 closes viewer, as in FAR.
-                    if self.cancellation != nil { self.cancelRequested() } else { self.closeRequested() }
-                    return true
-                }
-                if key == 120 { self.f2Requested(); return true }
-                if key == 118 {
-                    guard self.cancellation == nil else { return true }
-                    if flags.contains(.shift) { self.mode.performClick(nil) }
-                    else { self.toggleHex() }; return true
-                } // F4
-                if key == 97 { self.editRequested(); return true }
-                if key == 98 {
-                    if flags.contains(.option) { self.previousRequested() }
-                    else if flags.contains(.shift) { self.nextRequested() }
-                    else { self.searchField.selectText(nil) }
-                    return true
-                }
-                if key == 100, flags.contains(.option) {
-                    self.position.selectText(nil); return true
-                }
-                let isTextFocus = self.window?.firstResponder === self.textView
-                if isTextFocus && flags.intersection([.command, .option, .control, .shift]).isEmpty && (key == 69 || key == 78) {
-                    self.navigateFile(forward: key == 69); return true
-                }
-                if isTextFocus && key == 49 && flags.intersection([.command, .option, .control, .shift]).isEmpty {
-                    self.nextRequested(); return true
-                }
-                if isTextFocus && key == 109 { // F10
-                    if self.cancellation != nil { self.cancelRequested() } else { self.closeRequested() }
-                    return true
-                }
-                if isTextFocus && self.cancellation == nil && (key == 116 || key == 121), let document = self.viewerDocument {
-                    let visible = self.scroll.documentVisibleRect
-                    if key == 121 && visible.maxY >= self.textView.bounds.maxY - 1 && self.displayEnd < document.size {
-                        self.lastMatch = nil
-                        self.loadPage(at: self.displayEnd)
-                        return true
-                    }
-                    if key == 116 && visible.minY <= 1 && self.displayOffset > 0 {
-                        self.lastMatch = nil
-                        self.loadPage(at: max(0, self.displayOffset - Int64(Self.pageSize)), scrollToEnd: true)
-                        return true
-                    }
-                    // Let NSTextView scroll within the currently loaded block.
-                }
-                if isTextFocus && (key == 115 || key == 119) {
-                    self.pageRequested(NSButtonWithTag(key == 115 ? -2 : 2)); return true
-                }
-                return false
+                return self.handleKey(event)
             }
             return consumed ? nil : event
+        }
+    }
+
+    private func handleKey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if let bookmark = TextDocumentDialogs.bookmarkShortcut(event, flags: flags) {
+            if bookmark.set { setBookmark(bookmark.slot) }
+            else { gotoBookmark(bookmark.slot) }
+            return true
+        }
+        switch (event.keyCode, flags) {
+        case (3, .command), (98, []): showSearchDialog()
+        case (53, []), (99, []), (109, []), (87, []):
+            if cancellation != nil { cancelRequested() } else { closeRequested() }
+        case (122, []): showViewerHelp()
+        case (120, []): f2Requested()
+        case (120, .shift): if cancellation == nil { toggleWrapType() }
+        case (118, []): if cancellation == nil { toggleHex() }
+        case (118, .shift): if cancellation == nil { mode.performClick(nil) }
+        case (97, []): editRequested()
+        case (98, .shift), (49, []): if cancellation == nil { nextRequested() }
+        case (98, .option): if cancellation == nil { previousRequested() }
+        case (100, .option): goRequested()
+        case (100, []):
+            if let document = viewerDocument { changeEncoding(TextDocumentDialogs.nextCodePage(after: document.encoding)) }
+        case (100, .shift):
+            if cancellation == nil, let current = viewerDocument?.encoding, let selected = TextDocumentDialogs.codePage(current: current) {
+                changeEncoding(selected)
+            }
+        case (69, []), (78, []): navigateFile(forward: event.keyCode == 69)
+        case (115, []), (115, .control): pageRequested(NSButtonWithTag(-2))
+        case (119, []), (119, .control): pageRequested(NSButtonWithTag(2))
+        case (126, []), (125, []), (116, []), (121, []):
+            guard window?.firstResponder === textView else { return false }
+            let forward = event.keyCode == 125 || event.keyCode == 121
+            scrollVertically(forward: forward, byPage: event.keyCode == 116 || event.keyCode == 121)
+        case (123, .option), (124, .option), (123, [.control, .option]), (124, [.control, .option]):
+            guard isHex else { return false }
+            let step = flags.contains(.control) ? 16 : 1
+            changeHexRowWidth(event.keyCode == 124 ? step : -step)
+        case (123, .control) where isHex || isDump, (124, .control) where isHex || isDump:
+            rollContents(event.keyCode == 124 ? 1 : -1)
+        case (123, []), (124, []), (123, .control), (124, .control), (123, [.control, .shift]), (124, [.control, .shift]):
+            guard window?.firstResponder === textView, isHex || !wraps && !isDump else { return false }
+            let forward = event.keyCode == 124
+            let step = flags == .control ? 20 : 1
+            let target = flags.contains(.shift) ? (forward ? Int.max : 0) : max(0, visibleColumn + (forward ? step : -step))
+            scrollToColumn(target)
+        case (6, .control), (51, .option):
+            if let position = undoPosition { restorePosition(position, remember: false); undoPosition = nil }
+        case (8, .control), (114, .control): textView.copy(nil)
+        case (32, .control): textView.setSelectedRange(NSRange(location: textView.selectedRange().location, length: 0))
+        case (1, .control): scroll.hasVerticalScroller.toggle(); reflowDumpIfNeeded()
+        default: return false
+        }
+        return true
+    }
+
+    private func changeHexRowWidth(_ step: Int) {
+        guard cancellation == nil, let document = viewerDocument else { return }
+        let width = ViewerHexLayout.adjustedBytesPerRow(hexBytesPerRow, by: step, columns: viewportColumns, encoding: document.encoding)
+        guard width != hexBytesPerRow else { return }
+        let anchored = followTimer != nil
+        let offset = anchored ? max(0, document.size - Int64(Self.pageSize - 16)) : visibleByteOffset()
+        loadPage(at: offset, selection: anchored ? nil : lastMatch, scrollToEnd: anchored,
+                 column: visibleColumn, followEnd: anchored, layout: .hex(bytesPerRow: width), revealSelection: false)
+    }
+
+    private func rollContents(_ step: Int64) {
+        guard cancellation == nil, let document = viewerDocument, document.size > 0 else { return }
+        let unit: Int64 = isDump && (document.encoding == .utf16LE || document.encoding == .utf16BE) ? 2 : 1
+        let offset = visibleByteOffset()
+        let bounded = min(offset, document.size - 1)
+        let shifted = step > 0 ? bounded + min(unit, document.size - 1 - bounded) : max(0, bounded - unit)
+        let next = shifted / unit * unit
+        guard next != offset else { return }
+        stopFollowing(); rememberPosition(); lastMatch = nil
+        loadPage(at: next, column: isHex ? visibleColumn : nil)
+    }
+
+    private func scrollVertically(forward: Bool, byPage: Bool) {
+        guard cancellation == nil, let document = viewerDocument else { return }
+        let clip = scroll.contentView
+        let visible = scroll.documentVisibleRect
+        if forward && isAtEnd && displayEnd < document.size {
+            stopFollowing(); rememberPosition(); lastMatch = nil
+            loadPage(at: displayEnd)
+        } else if !forward && visible.minY <= 1 && displayOffset > 0 {
+            stopFollowing(); rememberPosition(); lastMatch = nil
+            loadPage(at: previousBlockOffset(in: document), scrollToEnd: true)
+        } else {
+            let lineHeight = textView.layoutManager?.defaultLineHeight(for: textView.font ?? .monospacedSystemFont(ofSize: 13, weight: .regular)) ?? 16
+            let distance = byPage ? max(lineHeight, clip.bounds.height - lineHeight) : lineHeight
+            if !forward { stopFollowing() }
+            if forward && !isAtEnd || !forward && visible.minY > 1 { rememberPosition() }
+            moveViewport(to: NSPoint(x: clip.bounds.minX, y: clip.bounds.minY + (forward ? distance : -distance)))
+            if forward && isAtEnd && displayEnd == document.size && canFollow && followTimer == nil { startFollowing() }
         }
     }
 
@@ -887,14 +1066,14 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
 
     /// Each write merges into the current store; another window's newer settings survive a close.
     private func updateHistory(allowIdentityReset: Bool = false, _ mutate: (inout History) -> Void) {
-        guard retainedArchiveWorkspace == nil, retainedRemoteWorkspace == nil else { return }
+        guard canFollow else { return }
         guard let identity else { return }
         var entries = Self.readHistory()
         let index = entries.firstIndex { $0.url == sourceURL.absoluteString }
         var entry = index.map { entries[$0] } ?? History(url: sourceURL.absoluteString, identity: identity)
         if entry.identity != identity {
             guard allowIdentityReset else { return }
-            entry.identity = identity; entry.offset = 0; entry.bookmarks = []
+            entry.identity = identity; entry.offset = 0; entry.bookmarks = []; entry.numberedBookmarks = nil
         }
         mutate(&entry)
         entry.bookmarks = Array(entry.bookmarks.prefix(20))
@@ -907,8 +1086,16 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     private func refreshHistoryMenus() {
         let entries = Self.readHistory()
         let saved = entries.first { $0.url == sourceURL.absoluteString && $0.identity == identity }
+        let selectedSlot = bookmarkMenu.selectedItem?.tag
         let selectedOffset = bookmarkMenu.selectedItem?.representedObject as? Int64
-        bookmarkMenu.removeAllItems(); bookmarkMenu.addItem(withTitle: "Закладки (\(saved?.bookmarks.count ?? 0)/20)")
+        let numbered = canFollow ? saved?.numberedBookmarks ?? [:] : sessionBookmarks
+        bookmarkMenu.removeAllItems(); bookmarkMenu.addItem(withTitle: "Закладки (\(numbered.count)/10)")
+        for slot in numbered.keys.sorted() {
+            guard let bookmark = numbered[slot] else { continue }
+            bookmarkMenu.addItem(withTitle: "\(slot) — \(bookmark.title)")
+            bookmarkMenu.lastItem?.tag = slot + 1
+            if selectedSlot == slot + 1 { bookmarkMenu.select(bookmarkMenu.lastItem) }
+        }
         for bookmark in saved?.bookmarks ?? [] {
             bookmarkMenu.addItem(withTitle: bookmark.title)
             bookmarkMenu.lastItem?.representedObject = bookmark.offset
@@ -923,24 +1110,64 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     }
 
     @objc private func addBookmark() {
-        guard viewerDocument != nil else { return }
-        let offset = currentByteOffset
-        updateHistory { entry in
-            guard !entry.bookmarks.contains(where: { $0.offset == offset }) else { return }
-            if entry.bookmarks.count == 20 { entry.bookmarks.removeFirst() }
-            entry.bookmarks.append(Bookmark(offset: offset, title: "Байт \(offset)"))
+        guard let slot = (0...9).first(where: { numberedBookmarks[$0] == nil }) else {
+            message.stringValue = "Все десять закладок заняты. Ctrl+Shift+цифра обновляет выбранную закладку."
+            return
         }
+        setBookmark(slot)
     }
 
     @objc private func removeBookmark() {
+        if let slot = bookmarkMenu.selectedItem?.tag, slot > 0 {
+            if canFollow { updateHistory { $0.numberedBookmarks?[slot - 1] = nil } }
+            else { sessionBookmarks.removeValue(forKey: slot - 1); refreshHistoryMenus() }
+            return
+        }
         guard let offset = bookmarkMenu.selectedItem?.representedObject as? Int64 else { message.stringValue = "Выберите закладку для удаления."; return }
         updateHistory { $0.bookmarks.removeAll { $0.offset == offset } }
     }
 
     @objc private func bookmarkSelected() {
-        stopFollowing()
+        if let slot = bookmarkMenu.selectedItem?.tag, slot > 0 { gotoBookmark(slot - 1); return }
         guard let offset = bookmarkMenu.selectedItem?.representedObject as? Int64 else { return }
-        lastMatch = nil; loadPage(at: offset)
+        restorePosition(Bookmark(offset: offset, title: "Байт \(offset)"))
+    }
+
+    private var numberedBookmarks: [Int: Bookmark] {
+        if !canFollow { return sessionBookmarks }
+        return Self.readHistory().first { $0.url == sourceURL.absoluteString && $0.identity == identity }?.numberedBookmarks ?? [:]
+    }
+
+    private func setBookmark(_ slot: Int) {
+        guard viewerDocument != nil, cancellation == nil else { return }
+        let position = currentPosition
+        if canFollow {
+            updateHistory { entry in
+                var bookmarks = entry.numberedBookmarks ?? [:]
+                bookmarks[slot] = position
+                entry.numberedBookmarks = bookmarks
+            }
+        } else { sessionBookmarks[slot] = position; refreshHistoryMenus() }
+        message.stringValue = "Закладка \(slot) установлена."
+    }
+
+    private func gotoBookmark(_ slot: Int) {
+        if let bookmark = numberedBookmarks[slot] { restorePosition(bookmark) }
+        else { NSSound.beep() }
+    }
+
+    private var currentPosition: Bookmark {
+        let offset = visibleByteOffset()
+        return Bookmark(offset: offset, title: "Байт \(offset)", column: isHex || !wraps && !isDump ? visibleColumn : nil)
+    }
+
+    private func rememberPosition() { undoPosition = currentPosition }
+
+    private func restorePosition(_ position: Bookmark, remember: Bool = true) {
+        guard viewerDocument != nil, cancellation == nil else { return }
+        stopFollowing()
+        if remember { rememberPosition() }
+        lastMatch = nil; loadPage(at: position.offset, column: position.column)
     }
 
     @objc private func historySelected() {
@@ -1050,39 +1277,70 @@ extension ViewerWindow {
         defer { restored.window?.close() }
         restored.showWindow(nil); try await settle(restored)
         try require(restored.fuzzyButton.state == .on && restored.wordsButton.state == .on && restored.cycleButton.state == .on, "Fuzzy controls persist into another window")
-        try require(restored.isHex && !restored.isDump && restored.currentByteOffset == 10 && restored.textView.string.hasPrefix("0000000000000000"), "Explicit hex byte position overrides saved viewer text mode")
+        try require(restored.isHex && !restored.isDump && restored.currentByteOffset == 10 && restored.textView.string.hasPrefix("000000000A: "), "Explicit hex byte position overrides saved viewer text mode")
         restored.fuzzyButton.state = .off; restored.searchField.stringValue = "changed"
         restored.searchHistoryMenu.selectItem(at: 1); restored.searchHistorySelected()
         try require(restored.fuzzyButton.state == .on && restored.searchField.stringValue == "cafe", "Search history restores fuzzy and pattern together")
         let oldMatch = viewer.lastMatch
         viewer.searchMode.selectItem(at: 1); viewer.searchRequested()
         try require(viewer.cancellation == nil && viewer.lastMatch == oldMatch && viewer.message.stringValue.contains("только"), "Fuzzy plus regex reports unsupported mode without changing selection")
-        return ["Viewer fuzzy original byte highlights", "Viewer fuzzy next and wrap", "Viewer fuzzy settings and search history", "Viewer fuzzy rejects regex", "Viewer initial hex mode and byte offset override history"]
+        let leaseURL = directory.appendingPathComponent("viewer-lease-\(UUID().uuidString).txt")
+        try Data("temporary snapshot".utf8).write(to: leaseURL)
+        let temporary = try ViewerWindow(url: leaseURL, onEdit: { _, _, _ in false })
+        defer { temporary.window?.close(); try? FileManager.default.removeItem(at: leaseURL) }
+        temporary.retainedRemoteLease = NSObject()
+        temporary.showWindow(nil); try await settle(temporary)
+        try require(temporary.followButton.isHidden && temporary.numberedBookmarks.isEmpty, "Temporary snapshot uses no local-file follow or saved bookmarks")
+        temporary.window?.close()
+        try require(!Self.readHistory().contains { $0.url == leaseURL.absoluteString }, "Temporary snapshot does not write the local viewer history")
+        return ["Viewer fuzzy original byte highlights", "Viewer fuzzy next and wrap", "Viewer fuzzy settings and search history", "Viewer fuzzy rejects regex", "Viewer initial hex mode and byte offset override history", "Viewer temporary lease skips history"]
     }
 
     static func runViewerUISmokeChecks() async throws -> [String] {
         let directory = AppRuntime.smokeDirectory ?? FileManager.default.temporaryDirectory
         let url = directory.appendingPathComponent("viewer-options-smoke.txt")
-        try Data("cats cat\n".utf8).write(to: url)
+        try Data(("cats cat\n" + String(repeating: "plain row\n", count: 500)).utf8).write(to: url)
         var editedURL: URL?
         let viewer = try ViewerWindow(url: url, onEdit: { url, _, _ in editedURL = url; return false })
         defer { viewer.window?.close(); try? FileManager.default.removeItem(at: url) }
         func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
             if !condition() { throw NSError(domain: "ViewerSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
         }
-        func settle() async throws {
+        func settle(_ controller: ViewerWindow? = nil) async throws {
+            let target = controller ?? viewer
             let deadline = Date().addingTimeInterval(5)
-            while (viewer.cancellation != nil || viewer.followPending) && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
-            try require(viewer.cancellation == nil && !viewer.followPending, "Viewer worker completes")
+            while (target.cancellation != nil || target.followPending) && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+            try require(target.cancellation == nil && !target.followPending, "Viewer worker completes")
+        }
+        func press(_ code: UInt16, _ modifiers: NSEvent.ModifierFlags = []) throws {
+            let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0,
+                windowNumber: viewer.window?.windowNumber ?? 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code)!
+            try require(viewer.handleKey(event), "Viewer handles keyboard shortcut \(code)")
         }
         viewer.showWindow(nil); try await settle()
+        let originalWrap = viewer.wordWrap
+        try press(120, .shift)
+        try require(viewer.wraps && viewer.wordWrap != originalWrap, "Shift F2 changes wrap type without turning wrapping off")
+        try press(120, .shift)
+        try press(18, [.control, .shift])
+        try require(viewer.numberedBookmarks[1]?.offset == 0, "Ctrl Shift digit records a numbered viewer bookmark")
+        try press(100); try await settle()
+        try require(viewer.viewerDocument?.encoding == TextDocumentDialogs.systemCodePages[0], "F8 changes the viewer to ANSI")
+        try press(100); try await settle()
+        try require(viewer.viewerDocument?.encoding == TextDocumentDialogs.systemCodePages[1], "F8 cycles the viewer from ANSI to OEM")
+        viewer.changeEncoding(.automatic); try await settle()
         viewer.applySearchSettings(SearchSettings(pattern: "cat", wholeWords: true))
         viewer.searchRequested(); try await settle()
         try require(viewer.lastMatch == 5..<8, "Viewer whole words select exact result")
         viewer.cycleButton.state = .on; viewer.nextRequested(); try await settle()
         viewer.nextRequested(); try await settle()
         try require(viewer.lastMatch == 5..<8, "Viewer cyclic search repeats after boundary")
-        viewer.followButton.state = .on; viewer.followChanged(); try await settle()
+        try press(119); try await settle()
+        try require(viewer.isAtEnd && viewer.currentByteOffset > 0 && viewer.followTimer != nil,
+                    "End scrolls a short file to the last viewport and arms tail follow")
+        try press(18, .control); try await settle()
+        try require(viewer.currentByteOffset == 0 && viewer.followTimer == nil, "Ctrl digit jumps back and stops tail follow")
+        try press(119); try await settle()
         let handle = try FileHandle(forWritingTo: url); try handle.seekToEnd(); try handle.write(contentsOf: Data("appended🙂\n".utf8)); try handle.close()
         viewer.pollFollow(); try await settle()
         try require(viewer.textView.string.hasSuffix("appended🙂\n"), "Viewer follows growing local file")
@@ -1090,13 +1348,37 @@ extension ViewerWindow {
         try require(viewer.followButton.state == .off && viewer.followTimer == nil, "Search stops viewer follow")
         viewer.mode.selectItem(at: 2); viewer.modeChanged(); try await settle()
         try require(viewer.isDump && viewer.textView.string.contains("␊") && viewer.textView.string.contains("›"), "Dump renders code units without interpreting source newlines")
+        guard let window = viewer.window, case .dump(let oldColumns)? = viewer.displayedLayout else {
+            throw NSError(domain: "ViewerSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: "Viewer dump must have a viewport layout"])
+        }
+        let frame = window.contentLayoutRect
+        window.setContentSize(NSSize(width: frame.width + 120, height: frame.height))
+        window.contentView?.layoutSubtreeIfNeeded()
+        viewer.reflowDumpIfNeeded(); try await settle()
+        try require(viewer.displayedLayout == .dump(columns: viewer.viewportColumns) && viewer.viewportColumns > oldColumns,
+                    "Wider window shows more dump cells on each row")
         viewer.toggleHex(); try await settle()
-        try require(viewer.isHex && viewer.textView.string.hasPrefix("0000000000000000"), "F4 switches dump to hex")
+        try require(viewer.isHex && viewer.textView.string.hasPrefix(String(format: "%010llX: ", viewer.displayOffset)), "F4 switches dump to hex")
+        try require(viewer.textView.string.contains("🙂") && viewer.textView.string.contains("›"), "Hex side column decodes Unicode and preserves continuation bytes")
+        let hexOffset = viewer.displayOffset
+        try press(124, .control); try await settle()
+        try require(viewer.displayOffset == hexOffset + 1, "Ctrl Right rolls hex rows by one byte")
+        try press(123, .control); try await settle()
+        try require(viewer.displayOffset == hexOffset, "Ctrl Left rolls hex rows back")
+        try press(124, .option); try await settle()
+        try require(viewer.hexPage?.bytesPerRow == 17 && viewer.displayOffset == hexOffset, "Alt Right widens hex rows while keeping byte position")
+        try press(123, [.control, .option]); try await settle()
+        try require(viewer.hexPage?.bytesPerRow == 16, "Ctrl Alt Left returns to the previous 16-byte grid point")
         viewer.toggleHex(); try await settle()
         try require(viewer.isDump && !viewer.isHex, "F4 returns to dump base mode")
         viewer.f2Requested(); try await settle()
-        try require(!viewer.isHex && !viewer.isDump, "F2 switches dump to text")
+        try require(!viewer.isHex && !viewer.isDump && viewer.baseMode == .dump, "F2 switches dump to text while keeping dump as the base")
+        viewer.mode.selectItem(at: 0); viewer.modeChanged()
+        try require(viewer.baseMode == .dump, "Selecting the active mode leaves the base unchanged")
+        viewer.toggleHex(); try await settle(); viewer.toggleHex(); try await settle()
+        try require(viewer.isDump && !viewer.isHex, "F4 still returns to dump after reselecting active text mode")
         viewer.mode.selectItem(at: 0); viewer.modeChanged(); try await settle()
+        try require(!viewer.isHex && !viewer.isDump && viewer.baseMode == .text, "Selecting a different text mode makes it the base")
         viewer.toggleHex(); try await settle()
         viewer.f2Requested(); try await settle()
         try require(viewer.isDump && viewer.baseMode == .text, "F2 from hex selects mode opposite menu base without changing base")
@@ -1122,6 +1404,24 @@ extension ViewerWindow {
         let previousText = viewer.textView.string
         viewer.nextFileRequested(); try await settle()
         try require(viewer.sourceURL == url && viewer.textView.string == previousText && viewer.navigation?.currentIndex == 0 && !viewer.message.stringValue.isEmpty, "Stale neighbor fails without switching document")
-        return ["Viewer whole-word search controls", "Viewer cyclic search controls", "Viewer follows growing file", "Viewer search stops follow", "Viewer dump and F2/F4 modes", "Viewer captured panel neighbors", "Viewer cancelled navigation preserves file", "Viewer stale neighbor preserves file"]
+
+        let largeURL = directory.appendingPathComponent("viewer-formatted-block-\(UUID().uuidString).bin")
+        try Data(repeating: 0x41, count: 140_000).write(to: largeURL)
+        let large = try ViewerWindow(url: largeURL, initialDisplayMode: .hex, onEdit: { _, _, _ in false })
+        defer { large.window?.close(); try? FileManager.default.removeItem(at: largeURL) }
+        large.showWindow(nil); try await settle(large)
+        large.changeHexRowWidth(1); try await settle(large)
+        try require(large.hexPage?.bytesPerRow == 17 && large.displayEnd == 65_535, "Hex forward blocks end on complete rows")
+        large.pageRequested(NSButtonWithTag(1)); try await settle(large)
+        let secondOffset = large.displayOffset
+        large.pageRequested(NSButtonWithTag(1)); try await settle(large)
+        try require(large.displayOffset == 131_070, "Third hex block starts on the same 17-byte grid")
+        large.pageRequested(NSButtonWithTag(-1)); try await settle(large)
+        try require(large.displayOffset == secondOffset, "Moving backward restores the exact start of the previous formatted block")
+        large.lastMatch = 10..<11
+        large.changeHexRowWidth(1); try await settle(large)
+        try require(large.displayOffset == secondOffset && large.currentByteOffset == secondOffset && large.textView.selectedRange().length == 0,
+                    "Hex width change keeps its viewport and ignores a match outside the displayed block")
+        return ["Viewer whole-word search controls", "Viewer cyclic search controls", "Viewer End anchors growing file", "Viewer numbered bookmark keyboard shortcuts", "Viewer Shift F2 wrap type", "Viewer F8 code-page cycling", "Viewer search stops follow", "Viewer dump resize and F2/F4 modes", "Viewer hex code page and width shortcuts", "Viewer captured panel neighbors", "Viewer cancelled navigation preserves file", "Viewer stale neighbor preserves file", "Viewer hex page grid round trip and selection bounds"]
     }
 }

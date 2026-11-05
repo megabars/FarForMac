@@ -34,6 +34,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 <key>CFBundleVersion</key><string>$APP_BUILD</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>NSLocalNetworkUsageDescription</key><string>FarForMac discovers SMB servers and opens shared folders when you choose Local Network.</string>
+<key>NSBonjourServices</key><array><string>_smb._tcp</string></array>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Ivan Mezentsev. All rights reserved.</string>

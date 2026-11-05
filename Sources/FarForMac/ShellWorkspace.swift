@@ -14,6 +14,8 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     private(set) var terminalView: NSView!
     var context: () -> UserCommandContext
     var navigate: (URL) -> Void
+    /// URL, passive side, preserve the original history position.
+    var navigateHistoryFolder: ((URL, Bool, Bool) -> Void)?
     var openFile: (URL, Bool) -> Void
     var showTerminal: () -> Void
     var togglePanels: () -> Void
@@ -39,6 +41,8 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     private var history = CommandHistory()
     private var historyPosition = -1
     private var historyDraft = ""
+    private var suppressFileHistoryPath: String?
+    private var separateTerminals: [SeparateCommandTerminal] = []
     private var previousDirectory: URL?
     private var lastDirectory: URL?
     private var configWindow: UserCommandsWindow?
@@ -55,12 +59,15 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     init(context: @escaping () -> UserCommandContext, navigate: @escaping (URL) -> Void,
          openFile: @escaping (URL, Bool) -> Void, showTerminal: @escaping () -> Void,
          togglePanels: @escaping () -> Void, refreshPanels: @escaping () -> Void,
-         report: @escaping (String) -> Void) {
+         report: @escaping (String) -> Void, loadHistory: Bool = true) {
         self.context = context; self.navigate = navigate; self.openFile = openFile
         self.showTerminal = showTerminal; self.togglePanels = togglePanels
         self.refreshPanels = refreshPanels; self.report = report
         super.init()
-        do { history = try CommandHistory.load(from: AppRuntime.historyURL) } catch { historyWritable = false; report("История не загружена; исходный файл сохранён: \(error.localizedDescription)") }
+        if loadHistory {
+            do { history = try CommandHistory.load(from: AppRuntime.historyURL) }
+            catch { historyWritable = false; report("История не загружена; исходный файл сохранён: \(error.localizedDescription)") }
+        } else { historyWritable = false }
         input.placeholderString = "Команда в активной папке · Enter — выполнить · Tab — путь"
         input.setAccessibilityLabel("Командная строка")
         input.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
@@ -108,6 +115,7 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         if record { recordActivity(.folder, value: url.path) }
     }
     func recordActivity(_ kind: ActivityHistoryKind, value: String, directory: String? = nil) {
+        guard (kind != .view && kind != .edit) || suppressFileHistoryPath != value else { return }
         do { try history.record(kind: kind, value: value, directory: directory); saveHistory() }
         catch { report("История: \(error.localizedDescription)") }
     }
@@ -318,10 +326,16 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         } catch { report(error.localizedDescription) }
     }
     @objc private func stop() { session?.stop() }
-    func stopForExit() { configWindow?.finalizeClose(); session?.forceStop(); integration?.cleanup(); pendingCommand = nil; preparedRunning?.cleanup(); preparedRunning = nil; preparedDraft?.cleanup(); preparedDraft = nil; historyQueue.sync {} }
+    func stopForExit() {
+        configWindow?.finalizeClose()
+        for terminal in separateTerminals { terminal.workspace?.stopForExit() }
+        session?.forceStop(); integration?.cleanup(); pendingCommand = nil
+        preparedRunning?.cleanup(); preparedRunning = nil; preparedDraft?.cleanup(); preparedDraft = nil
+        historyQueue.sync {}
+    }
     func confirmTermination() -> Bool {
         guard configWindow?.confirmClose() ?? true else { return false }
-        guard isRunning else { return true }
+        guard isRunning || separateTerminals.contains(where: { $0.workspace?.isRunning == true }) else { return true }
         let alert = NSAlert(); alert.messageText = "Завершить работающую PTY-сессию?"
         alert.informativeText = "Команда или интерактивный shell будут остановлены при выходе."
         alert.addButton(withTitle: "Отмена"); alert.addButton(withTitle: "Завершить и выйти")
@@ -368,28 +382,130 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         }
     }
     @objc private func commandHistory() { showHistory(.command) }
-    func showHistory(_ kind: ActivityHistoryKind) {
-        let entries = history.filtered(kind: kind)
-        guard !entries.isEmpty else { report("История пуста."); return }
-        let titles: [ActivityHistoryKind: String] = [.command: "команды", .view: "просмотр", .edit: "редактор", .folder: "папки"]
-        let alert = NSAlert(); alert.messageText = "История: \(titles[kind] ?? kind.rawValue)"
-        alert.informativeText = kind == .command ? "Команда будет вставлена без выполнения; запуск — Enter в командной строке." : "Открыть выбранный объект или удалить записи истории."
-        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 570, height: 26))
-        popup.addItems(withTitles: entries.map { String($0.value.prefix(160)) }); alert.accessoryView = popup
-        alert.addButton(withTitle: kind == .command ? "Вставить" : "Открыть")
-        alert.addButton(withTitle: "Удалить запись"); alert.addButton(withTitle: "Очистить эту историю"); alert.addButton(withTitle: "Отмена")
-        let response = alert.runModal(); let entry = entries[max(0, popup.indexOfSelectedItem)]
-        switch response {
-        case .alertFirstButtonReturn:
-            switch kind {
-            case .command: setCommand(entry.value)
-            case .folder: navigate(URL(fileURLWithPath: entry.value))
-            case .view, .edit: openFile(URL(fileURLWithPath: entry.value), kind == .edit)
-            }
-        case .alertSecondButtonReturn: history.remove(id: entry.id); historyPosition = -1; saveHistory()
-        case .alertThirdButtonReturn: history.clear(kind: kind); historyPosition = -1; saveHistory()
-        default: break
+    private enum HistoryAction: Equatable { case open, shiftedOpen, insert, passiveFolder, view, edit }
+    func showHistory(_ kind: ActivityHistoryKind, smokeKey: PanelListMenu.SmokeKey? = nil) {
+        let title: String
+        let kinds: Set<ActivityHistoryKind>
+        let enterHint: String
+        switch kind {
+        case .command:
+            title = "История команд"; kinds = [.command]
+            enterHint = "Enter — выполнить · Shift+Enter — отдельно · Ctrl+Enter — вставить · F3 — папка запуска"
+        case .folder:
+            title = "История папок"; kinds = [.folder]
+            enterHint = "Enter — перейти · Ctrl+Shift+Enter — пассивная панель · Ctrl+Enter — вставить · Ctrl+R — обновить"
+        case .view, .edit:
+            title = "История просмотра и правки"; kinds = [.view, .edit]
+            enterHint = "Enter — открыть · F3 — просмотр · F4 — правка · Ctrl+Enter — вставить · Ctrl+R — обновить"
         }
+
+        let menu = PanelListMenu(title: L10n.text(title), hint: enterHint +
+            "\nIns — защита · Shift+Del — удалить запись · Del — очистить историю · Ctrl+C — копировать")
+        var rows: [ActivityHistoryEntry] = []
+        var selected: (ActivityHistoryEntry, HistoryAction)?
+        func redraw(_ index: Int = 0) {
+            rows = history.entries.filter { kinds.contains($0.kind) }
+            menu.replaceRows(rows.map { entry in
+                let mode: String
+                switch entry.kind { case .view: mode = "F3  "; case .edit: mode = "F4  "; default: mode = "" }
+                let text = entry.value.replacingOccurrences(of: "\r", with: "↵").replacingOccurrences(of: "\n", with: "↵")
+                return .init(title: (entry.isLocked ? "◆  " : "   ") + mode + String(text.prefix(512)))
+            }, selection: index)
+        }
+        func choose(_ entry: ActivityHistoryEntry, _ action: HistoryAction) {
+            selected = (entry, action)
+            menu.dismiss()
+        }
+        redraw()
+        menu.onActivate = { index in choose(rows[index], .open) }
+        menu.onKey = { [weak self] event in
+            guard let self else { return false }
+            let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+            guard let index = menu.selection, rows.indices.contains(index) else { return false }
+            let entry = rows[index]
+            switch event.keyCode {
+            case 36, 76:
+                if modifiers == .control { choose(entry, .insert) }
+                else if modifiers == .shift { choose(entry, .shiftedOpen) }
+                else if kind == .folder && modifiers == [.control, .shift] { choose(entry, .passiveFolder) }
+                else { return false }
+            case 99, 87:
+                guard modifiers.isEmpty else { return false }
+                if kinds.contains(.view) { choose(entry, .view) }
+                else if kind == .command && event.keyCode == 99 {
+                    let alert = NSAlert(); alert.messageText = "Каталог запуска команды"
+                    alert.informativeText = entry.directory ?? "Каталог не записан."
+                    alert.runModal()
+                } else { return false }
+            case 118:
+                guard modifiers.isEmpty, kinds.contains(.edit) else { return false }
+                choose(entry, .edit)
+            case 114, 82:
+                if modifiers.isEmpty {
+                    self.history.toggleLock(id: entry.id); self.saveHistory(); redraw(index)
+                } else if modifiers == .control {
+                    NSPasteboard.general.clearContents(); NSPasteboard.general.setString(entry.value, forType: .string)
+                } else { return false }
+            case 117, 65:
+                if modifiers == .shift {
+                    self.history.remove(id: entry.id)
+                } else if modifiers.isEmpty {
+                    let alert = NSAlert(); alert.messageText = "Очистить незащищённые записи истории?"
+                    alert.addButton(withTitle: "Очистить"); alert.addButton(withTitle: "Отмена")
+                    guard alert.runModal() == .alertFirstButtonReturn else { return true }
+                    for target in kinds { self.history.clear(kind: target) }
+                } else { return false }
+                self.historyPosition = -1; self.saveHistory(); redraw(index)
+            case 15:
+                guard modifiers == .control, kind != .command else { return false }
+                self.history.removeMissing(kinds: kinds); self.saveHistory(); redraw(index)
+            case 8:
+                guard modifiers == .control || modifiers == .command else { return false }
+                NSPasteboard.general.clearContents(); NSPasteboard.general.setString(entry.value, forType: .string)
+            default: return false
+            }
+            return true
+        }
+        menu.run(relativeTo: input.window, smokeKey: smokeKey)
+        menu.onActivate = nil; menu.onKey = nil
+        if let (entry, action) = selected { applyHistoryAction(action, entry: entry) }
+    }
+
+    private func applyHistoryAction(_ action: HistoryAction, entry: ActivityHistoryEntry) {
+        if action == .insert { setCommand(entry.value); return }
+        switch entry.kind {
+        case .command:
+            setCommand(entry.value)
+            if action == .shiftedOpen { runSeparateHistoryCommand(entry.value) }
+            else { runInput() }
+        case .folder:
+            let url = URL(fileURLWithPath: entry.value)
+            if let navigateHistoryFolder { navigateHistoryFolder(url, action == .passiveFolder, action == .shiftedOpen) }
+            else if action != .passiveFolder { navigate(url) }
+        case .view, .edit:
+            let editable = action == .edit || (action != .view && entry.kind == .edit)
+            if action == .shiftedOpen { suppressFileHistoryPath = entry.value }
+            defer { suppressFileHistoryPath = nil }
+            openFile(URL(fileURLWithPath: entry.value), editable)
+        }
+    }
+
+    private func runSeparateHistoryCommand(_ command: String) {
+        let current = context(), directory = current.activeDirectory
+        let terminal = SeparateCommandTerminal()
+        let shell = ShellWorkspace(context: { current }, navigate: { _ in }, openFile: { _, _ in },
+            showTerminal: { [weak terminal] in terminal?.showWindow(nil) },
+            togglePanels: { [weak self] in self?.input.window?.makeKeyAndOrderFront(nil) },
+            refreshPanels: refreshPanels, report: report, loadHistory: false)
+        terminal.workspace = shell
+        terminal.window?.contentView = shell.terminalView
+        terminal.onClose = { [weak self, weak terminal] in self?.separateTerminals.removeAll { $0 === terminal } }
+        do {
+            try shell.start(command: command, directory: directory)
+            separateTerminals.append(terminal)
+            recordActivity(.command, value: command, directory: directory.path)
+            input.stringValue = ""; historyPosition = -1
+        } catch { report(error.localizedDescription) }
     }
     private func saveHistory() {
         guard historyWritable else { return }
@@ -407,48 +523,33 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         }
         input.stringValue = value; historyPosition = -1; focusCommand()
     }
-    func showUserMenu() {
+    func showUserMenu(store: UserCommandStore? = nil, smokeKey: PanelListMenu.SmokeKey? = nil) {
         do {
-            let loaded = try AppRuntime.commandStore.loadMenu(in: context().activeDirectory)
-            let menu = NSMenu(title: "Пользовательское меню")
-            menu.addItem(withTitle: loaded.isLocal ? "Локальное: \(loaded.source.path)" : "Общее меню", action: nil, keyEquivalent: "")
-            func append(_ entries: [UserMenuEntry], to menu: NSMenu) {
-                for entry in entries {
-                    if entry.separator == true { menu.addItem(.separator()); continue }
-                    let item = NSMenuItem(title: entry.title, action: nil, keyEquivalent: "")
-                    if let children = entry.children { let nested = NSMenu(title: entry.title); append(children, to: nested); item.submenu = nested }
-                    else if let command = entry.command {
-                        item.target = self; item.action = #selector(menuCommand(_:)); item.representedObject = [command, loaded.source.path]
-                    }
-                    if let key = entry.key {
-                        if key.uppercased().hasPrefix("F"), let number = Int(key.dropFirst()), (1...24).contains(number),
-                           let scalar = UnicodeScalar(Int(NSF1FunctionKey) + number - 1) {
-                            item.keyEquivalent = String(scalar)
-                        } else { item.keyEquivalent = key }
-                        item.keyEquivalentModifierMask = []
-                    }
-                    menu.addItem(item)
-                }
+            let ctx = context()
+            let menu = try UserMenuOverlay(store: store ?? AppRuntime.commandStore, directory: ctx.activeDirectory)
+            switch menu.run(relativeTo: input.window, smokeKey: smokeKey) {
+            case .command(let template, let title):
+                guard let prepared = try prepareUserCommand(template, title: title, context: ctx) else { return }
+                executePrepared(prepared, directory: ctx.activeDirectory)
+            case .editFile(let url):
+                showCommandConfiguration(UserCommandStore(globalURL: url))
+            case nil: break
             }
-            append(loaded.entries, to: menu); menu.addItem(.separator())
-            let configure = NSMenuItem(title: "Настроить общее меню и ассоциации…", action: #selector(configureCommands), keyEquivalent: ""); configure.target = self; menu.addItem(configure)
-            menu.popUp(positioning: nil, at: NSPoint(x: 16, y: commandBar.bounds.height), in: commandBar)
-        } catch { report(error.localizedDescription); configureCommands() }
+        } catch { report(error.localizedDescription) }
     }
-    @objc private func menuCommand(_ sender: NSMenuItem) {
-        guard let values = sender.representedObject as? [String], values.count == 2 else { return }
-        previewCommand(values[0], title: sender.title, source: values[1])
+    private func prepareUserCommand(_ template: String, title: String, context ctx: UserCommandContext) throws -> PreparedUserCommand? {
+        guard persistentMode.state != .on || !isRunning || shellDirectory?.standardizedFileURL == ctx.activeDirectory.standardizedFileURL else {
+            report(L10n.text("Для меню и ассоциаций сначала нажмите «Папка панели → shell»: команды относятся к файлам активной панели."))
+            return nil
+        }
+        let parameters = try UserCommandExpander.inputs(in: template)
+        guard let values = UserCommandParameterForm.collect(parameters, title: title) else { return nil }
+        return try UserCommandExpander.prepare(template, context: ctx, inputValues: values)
     }
     private func previewCommand(_ template: String, title: String, source: String, overrideContext: UserCommandContext? = nil) {
         do {
             let ctx = overrideContext ?? context()
-            guard persistentMode.state != .on || !isRunning || shellDirectory?.standardizedFileURL == ctx.activeDirectory.standardizedFileURL else {
-                report(L10n.text("Для меню и ассоциаций сначала нажмите «Папка панели → shell»: команды относятся к файлам активной панели."))
-                return
-            }
-            let parameters = try UserCommandExpander.inputs(in: template)
-            guard let values = UserCommandParameterForm.collect(parameters, title: title) else { return }
-            let prepared = try UserCommandExpander.prepare(template, context: ctx, inputValues: values)
+            guard let prepared = try prepareUserCommand(template, title: title, context: ctx) else { return }
             let expanded = prepared.command
             let runDirectory = ctx.activeDirectory
             let alert = NSAlert(); alert.messageText = title
@@ -462,9 +563,10 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
             }
         } catch { report(error.localizedDescription) }
     }
-    @objc func configureCommands() {
+    @objc func configureCommands() { showCommandConfiguration(AppRuntime.commandStore) }
+    private func showCommandConfiguration(_ store: UserCommandStore) {
         if let configWindow, configWindow.window?.isVisible == true { configWindow.showWindow(nil); return }
-        configWindow = UserCommandsWindow(store: AppRuntime.commandStore); configWindow?.showWindow(nil)
+        configWindow = UserCommandsWindow(store: store); configWindow?.showWindow(nil)
     }
     /// Exercises the same asynchronous prompt/state path as the command bar.
     static func runUISmokeChecks() async throws -> [String] {
@@ -545,7 +647,93 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         guard FileManager.default.fileExists(atPath: draftURL.path) else { throw NetworkError.io("Inserted list command lost its resources") }
         workspace.setCommand("printf replacement")
         guard !FileManager.default.fileExists(atPath: draftURL.path) else { throw NetworkError.io("Replacing an inserted command must clean unused list files") }
-        return ["List files survive managed shell execution and are removed at prompt; replacing a draft releases its files", "Managed shell command bar preserves state without implicit panel navigation", "Shell directory sync is explicit and menu commands reject directory mismatch", "Partial terminal input blocks command bar and Ctrl+C restores prompt", "Shell exit clears cwd and a new session starts without old variables"]
+        return ["List files survive managed shell execution and are removed at prompt; replacing a draft releases its files", "Managed shell command bar preserves state without implicit panel navigation", "Shell directory sync is explicit and menu commands reject directory mismatch", "Partial terminal input blocks command bar and Ctrl+C restores prompt", "Shell exit clears cwd and a new session starts without old variables"] + (try await runMenuSmoke(in: root))
+    }
+
+    private static func runMenuSmoke(in root: URL) async throws -> [String] {
+        let directory = root.appendingPathComponent("history-menu-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let previousWindow = NSApp.keyWindow
+        let owner = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 100),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        owner.isReleasedWhenClosed = false
+        owner.title = "History menu fixture"
+        owner.center()
+        var opened: [(URL, Bool)] = []
+        var folders: [(URL, Bool, Bool)] = []
+        let workspace = ShellWorkspace(context: {
+            UserCommandContext(currentFile: nil, markedFiles: [], activeDirectory: directory, passiveDirectory: directory)
+        }, navigate: { _ in }, openFile: { opened.append(($0, $1)) }, showTerminal: {},
+            togglePanels: {}, refreshPanels: {}, report: { _ in }, loadHistory: false)
+        workspace.navigateHistoryFolder = { folders.append(($0, $1, $2)) }
+        owner.contentView = workspace.commandBar
+        owner.makeKeyAndOrderFront(nil)
+        defer {
+            for terminal in workspace.separateTerminals { terminal.close() }
+            workspace.stopForExit()
+            owner.close()
+            previousWindow?.makeKeyAndOrderFront(nil)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        func waitForOutput(_ condition: () -> Bool) async throws {
+            let deadline = Date().addingTimeInterval(5)
+            while !condition() {
+                guard Date() < deadline else { throw NetworkError.io("Menu command did not produce fixture output") }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+        }
+        let command = "printf 'HISTORY_%s' ENTER"
+        try workspace.history.record(kind: .command, value: command, directory: "/")
+        workspace.showHistory(.command, smokeKey: .init(code: 36, modifiers: .control))
+        guard workspace.input.stringValue == command, !workspace.isRunning, owner.isKeyWindow else {
+            throw NetworkError.io("Alt+F8 Ctrl+Enter must insert without launching and return focus")
+        }
+        workspace.showHistory(.command, smokeKey: .init(code: 36))
+        try await waitForOutput { workspace.screen.plainText.contains("HISTORY_ENTER") && !workspace.isRunning }
+
+        try workspace.history.record(kind: .command, value: "printf 'HISTORY_%s' SEPARATE")
+        workspace.showHistory(.command, smokeKey: .init(code: 36, modifiers: .shift))
+        guard let separate = workspace.separateTerminals.last, separate.window?.isVisible == true else {
+            throw NetworkError.io("Alt+F8 Shift+Enter must open a separate terminal")
+        }
+        try await waitForOutput { separate.workspace?.screen.plainText.contains("HISTORY_SEPARATE") == true }
+        guard !workspace.screen.plainText.contains("HISTORY_SEPARATE") else {
+            throw NetworkError.io("The separate command changed the original terminal")
+        }
+        separate.close()
+        owner.makeKeyAndOrderFront(nil)
+
+        let file = directory.appendingPathComponent("fixture.txt")
+        try Data("Fixture".utf8).write(to: file)
+        try workspace.history.record(kind: .edit, value: file.path)
+        workspace.showHistory(.view, smokeKey: .init(code: 36))
+        let expectedFile = file.resolvingSymlinksInPath().path
+        func openedDetails() -> String {
+            opened.map { "\($0.0.path) (editable=\($0.1))" }.joined(separator: ", ")
+        }
+        guard opened.count == 1, opened[0].0.resolvingSymlinksInPath().path == expectedFile, opened[0].1 else {
+            throw NetworkError.io("Alt+F11 Enter expected the edit entry \(expectedFile); received [\(openedDetails())]")
+        }
+        workspace.showHistory(.view, smokeKey: .init(code: 99, characters: String(UnicodeScalar(Int(NSF3FunctionKey))!), modifiers: .function))
+        guard opened.count == 2, opened[1].0.resolvingSymlinksInPath().path == expectedFile, !opened[1].1 else {
+            throw NetworkError.io("Alt+F11 F3 expected to reopen \(expectedFile) for viewing; received [\(openedDetails())]")
+        }
+        try workspace.history.record(kind: .folder, value: directory.path)
+        workspace.showHistory(.folder, smokeKey: .init(code: 36, modifiers: [.control, .shift]))
+        let expectedFolder = directory.resolvingSymlinksInPath().path
+        guard folders.count == 1, folders[0].0.resolvingSymlinksInPath().path == expectedFolder, folders[0].1, !folders[0].2 else {
+            let actual = folders.map { "\($0.0.path) (passive=\($0.1), preserveOrder=\($0.2))" }.joined(separator: ", ")
+            throw NetworkError.io("Alt+F12 Ctrl+Shift+Enter expected passive navigation to \(expectedFolder); received [\(actual)]")
+        }
+
+        let store = UserCommandStore(globalURL: directory.appendingPathComponent("commands.json"))
+        let configuration = UserCommandConfiguration(menu: [.init(title: "F2 fixture", command: "printf 'F2_%s' EXECUTED")])
+        try store.saveGlobalText(String(decoding: JSONEncoder().encode(configuration), as: UTF8.self))
+        workspace.showUserMenu(store: store, smokeKey: .init(code: 36))
+        try await waitForOutput { workspace.screen.plainText.contains("F2_EXECUTED") && !workspace.isRunning }
+        return ["History menu delivers Enter, Ctrl+Enter and Shift+Enter to the correct command modes",
+                "Combined view/edit history and passive folder navigation receive menu keyboard actions",
+                "F2 command runs after Enter without an intermediate preview"]
     }
     func alternativeAssociation(action: UserCommandAction) {
         guard let file = context().currentFile else { report(L10n.text("Выберите файл для альтернативной ассоциации.")); return }
@@ -614,5 +802,27 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
             // Escape cannot terminate a bracketed paste and inject a second command.
             let clean = value.replacingOccurrences(of: "\u{1b}", with: "")
             onInput?(Data((bracketedPasteEnabled ? "\u{1b}[200~" + clean + "\u{1b}[201~" : clean).utf8))
+    }
+}
+
+@MainActor private final class SeparateCommandTerminal: NSWindowController, NSWindowDelegate {
+    var workspace: ShellWorkspace?
+    var onClose: (() -> Void)?
+
+    init() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 480),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        super.init(window: window)
+        window.title = "Терминал команды"
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.center()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func windowWillClose(_ notification: Notification) {
+        workspace?.stopForExit()
+        onClose?()
     }
 }

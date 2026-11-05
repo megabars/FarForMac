@@ -102,6 +102,20 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     let table = FileTable()
     private let fileScroll = NSScrollView()
     private let archiveContainer = NSView()
+    enum ResourceKind { case localNetwork, connections, processes }
+    private(set) var resourceKind: ResourceKind?
+    private(set) var resourceView: NSView?
+    private var resourceFocus: (() -> Void)?
+    private var resourceRefresh: (() -> Void)?
+    private var resourceStop: (() -> Void)?
+    private var resourceActivate: ((Bool) -> Void)?
+    var resourceParent: (() -> Void)?
+    var resourceFunction: ((Int, Bool) -> Bool)?
+    var isResource: Bool { resourceView != nil }
+    var onChooseResource: ((PanelView, NSView) -> Void)?
+    var onRemoteReturn: ((PanelView) -> Void)?
+    let resourceButton = NSButton(title: "Диск ▾", target: nil, action: nil)
+
     private(set) var archivePanel: ArchivePanelView?
     private(set) var archiveFrame: ArchiveNavigationFrame?
     var onRemoteDisconnect: ((any RemoteProvider) -> Void)?
@@ -117,6 +131,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     var onVirtualLibrarySnapshot: ((Int, [SearchMatch]) -> Void)?
     private var synchronizingVirtualLibrary = false
     var onVirtualReveal: ((PanelView, SearchMatch) -> Void)?
+    var onVirtualDelete: ((PanelView) -> Void)?
     var onVirtualOpen: ((PanelView, SearchMatch) -> Void)?
     private(set) var remotePanel: RemotePanelView?
     var isRemote: Bool { remotePanel != nil }
@@ -170,6 +185,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     private(set) var colorizeFiles = true
     var maskGroups: [String: String] = [:]
     var onDirectoryChange: ((PanelView) -> Void)?
+    private(set) var recordDirectoryActivity = true
     private var navigation: PanelNavigation
     private enum HistoryAction: Equatable { case visit, back, forward, restore }
     private struct DirectorySnapshot {
@@ -316,7 +332,11 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
             if event.keyCode == 48 { return self.onKey?(event) ?? false }
             return false
         }
-        let header = inset(vertical([horizontal([title, modePicker]), returnButton, path, filterField, quickFindField], spacing: 10), color: Palette.raised)
+        resourceButton.target = self; resourceButton.action = #selector(chooseResource)
+        resourceButton.bezelStyle = .recessed
+        resourceButton.setAccessibilityLabel("Выбор диска и ресурса \(key == "left" ? "левой" : "правой") панели")
+        resourceButton.toolTip = key == "left" ? "Сменить диск — Alt+F1" : "Сменить диск — Alt+F2"
+        let header = inset(vertical([horizontal([resourceButton, title, modePicker]), returnButton, path, filterField, quickFindField], spacing: 10), color: Palette.raised)
         archiveContainer.isHidden = true
         archiveContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 150).isActive = true
         let body = vertical([header, scroll, auxiliary, archiveContainer, inset(summary, y: 9)])
@@ -419,6 +439,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         browser.onClose = { [weak self] in self?.leaveVirtualResults() }
         browser.onSwitchPanel = { [weak self] in self?.onArchiveSwitchPanel?() }
         browser.onReveal = { [weak self] result in guard let self else { return }; self.onVirtualReveal?(self, result) }
+        browser.onDelete = { [weak self] in guard let self else { return }; self.onVirtualDelete?(self) }
         browser.onAction = { [weak self] event in guard let self else { return false }; return self.handleQuickFindKey(event) || (self.onKey?(event) ?? false) }
         browser.onChange = { [weak self] in guard let self else { return }; self.onSelectionChange?(self) }
         browser.onResultsChange = { [weak self] in self?.notifyVirtualResultsChange($0) }
@@ -454,7 +475,47 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         if focus { self.focus() }
     }
 
+    @objc private func chooseResource() { onChooseResource?(self, resourceButton) }
+    func closeRemote() {
+        leaveRemote(focus: false)
+        if let onRemoteReturn { onRemoteReturn(self) } else { focus() }
+    }
+    func showResource(_ view: NSView, kind: ResourceKind, caption: String,
+                      focus: @escaping () -> Void, refresh: @escaping () -> Void,
+                      stop: @escaping () -> Void, setActive: @escaping (Bool) -> Void,
+                      perform: @escaping (Int, Bool) -> Bool) {
+        leaveResource(focus: false)
+        if isVirtual { leaveVirtualResults(focus: false) }
+        if isRemote { leaveRemote(focus: false) }
+        if isArchive { leaveArchive(focus: false) }
+        setContentMode(.files)
+        endQuickFind(focusTable: false); metadataTask?.cancel(); generation += 1; loading = false
+        resourceView = view; resourceKind = kind; resourceFocus = focus; resourceRefresh = refresh
+        resourceStop = stop; resourceActivate = setActive; resourceFunction = perform
+        view.translatesAutoresizingMaskIntoConstraints = false; archiveContainer.addSubview(view)
+        NSLayoutConstraint.activate([view.leadingAnchor.constraint(equalTo: archiveContainer.leadingAnchor), view.trailingAnchor.constraint(equalTo: archiveContainer.trailingAnchor), view.topAnchor.constraint(equalTo: archiveContainer.topAnchor), view.bottomAnchor.constraint(equalTo: archiveContainer.bottomAnchor)])
+        fileScroll.isHidden = true; auxiliary.isHidden = true; archiveContainer.isHidden = false
+        filterField.isHidden = true; quickFindField.isHidden = true; modePicker.isHidden = true
+        returnButton.isHidden = false; returnButton.title = "Вернуться к папке"
+        pathField.isEditable = false; pathField.stringValue = caption; summary.stringValue = caption
+        updateActive(); onSelectionChange?(self); focus()
+    }
+    func updateResourceCaption(_ caption: String) {
+        guard isResource else { return }; pathField.stringValue = caption
+    }
+    func leaveResource(focus: Bool = true) {
+        guard let view = resourceView else { return }
+        resourceStop?(); view.removeFromSuperview()
+        resourceParent = nil; resourceView = nil; resourceKind = nil; resourceFunction = nil; resourceFocus = nil
+        resourceRefresh = nil; resourceStop = nil; resourceActivate = nil; generation += 1
+        archiveContainer.isHidden = true; fileScroll.isHidden = false; modePicker.isHidden = false
+        filterField.isHidden = false; pathField.isEditable = true; pathField.stringValue = directory.path
+        returnButton.isHidden = !isTemporary; updateActive(); updateSummary(); onSelectionChange?(self)
+        if focus { self.focus() }
+    }
+
     func showRemote(_ browser: RemotePanelView) {
+        if isResource { leaveResource(focus: false) }
         if isVirtual { leaveVirtualResults(focus: false) }
         if isArchive { leaveArchive(focus: false) }
         if let previous = remotePanel {
@@ -467,7 +528,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         endQuickFind(focusTable: false); metadataTask?.cancel(); generation += 1; loading = false
         remotePanel = browser; browser.setActive(active)
         browser.onFocus = { [weak self] in guard let self else { return }; self.onFocus?(self) }
-        browser.onClose = { [weak self] in self?.leaveRemote() }
+        browser.onClose = { [weak self] in self?.closeRemote() }
         browser.onSwitchPanel = { [weak self] in self?.onArchiveSwitchPanel?() }
         browser.onChange = { [weak self] in self?.updateRemoteCaption() }
         browser.translatesAutoresizingMaskIntoConstraints = false; archiveContainer.addSubview(browser)
@@ -514,6 +575,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         showArchive(frame: ArchiveNavigationFrame(snapshot: snapshot))
     }
     func showArchive(frame: ArchiveNavigationFrame) {
+        if isResource { leaveResource(focus: false) }
         if isVirtual { leaveVirtualResults(focus: false) }
         let snapshot = frame.snapshot
         if isRemote { leaveRemote(focus: false) }
@@ -594,6 +656,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         setContentMode(PanelContentMode.allCases[index]); focus()
     }
     func setContentMode(_ mode: PanelContentMode) {
+        if isResource { leaveResource(focus: false) }
         if isVirtual { leaveVirtualResults(focus: false) }
         if isRemote { leaveRemote(focus: false) }
         if isArchive { leaveArchive(focus: false) }
@@ -682,7 +745,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
 
     private var columnLayoutKey: String { "panel.\(locationKey).columnLayout.v1" }
     func tableViewColumnDidMove(_ notification: Notification) {
-        if auxiliaryColumnLayout == nil && !isTemporary && !isArchive && !isRemote && !isVirtual { updateColumnAutoresizing() }
+        if auxiliaryColumnLayout == nil && !isTemporary && !isArchive && !isRemote && !isVirtual && !isResource { updateColumnAutoresizing() }
         persistColumnLayout()
     }
     private func updateColumnAutoresizing() {
@@ -692,7 +755,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
     func tableViewColumnDidResize(_ notification: Notification) { persistColumnLayout() }
     private func persistColumnLayout() {
-        guard !restoringColumnLayout, !isTemporary, !isArchive, !isRemote, !isVirtual,
+        guard !restoringColumnLayout, !isTemporary, !isArchive, !isRemote, !isVirtual, !isResource,
               contentMode == .files, auxiliaryColumnLayout == nil else { return }
         let columns = table.tableColumns
         guard let layout = try? PanelColumnLayout(order: columns.map { $0.identifier.rawValue },
@@ -738,7 +801,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         table.reloadData()
     }
     func invalidateUnavailableVolume(_ volume: URL) {
-        guard !isArchive, !isRemote, !isTemporary, !isVirtual else { return }
+        guard !isArchive, !isRemote, !isTemporary, !isVirtual, !isResource else { return }
         let path = directory.standardizedFileURL.path, root = volume.standardizedFileURL.path
         guard path == root || path.hasPrefix(root + "/") else { return }
         generation += 1; loading = false; cancelInspection()
@@ -748,7 +811,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
     func cancelInspection() { auxiliary.cancel() }
     func persistSession() {
-        guard !isVirtual else { return }
+        guard !isVirtual, !isResource else { return }
         persistColumnLayout()
         guard !loading else { return }
         let saved = PanelSession(directory: directory.path, mode: contentMode,
@@ -788,7 +851,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         if let slot = temporaryLibrarySlot { onTemporaryLibrarySnapshot?(slot, temporaryResults) }
     }
     func markPaths(_ urls: [URL]) {
-        guard !isArchive && !isRemote && !isVirtual, contentMode == .files, !loading else { return }
+        guard !isArchive && !isRemote && !isVirtual && !isResource, contentMode == .files, !loading else { return }
         selection.saveMarks(); selection.clearMarks()
         let paths = Set(urls.map { $0.standardizedFileURL.path })
         selection.setMarked(visible.filter { paths.contains($0.url.standardizedFileURL.path) }.map(\.id), marked: true)
@@ -851,7 +914,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         focus()
     }
 
-    @objc private func returnToDirectory() { if isVirtual { leaveVirtualResults() } else if isRemote { leaveRemote() } else if isArchive { closeArchiveLevel() } else { leaveSearchResults() } }
+    @objc private func returnToDirectory() { if isResource { leaveResource() } else if isVirtual { leaveVirtualResults() } else if isRemote { closeRemote() } else if isArchive { closeArchiveLevel() } else { leaveSearchResults() } }
 
     @discardableResult
     private func restoreDirectorySnapshot() -> Bool {
@@ -896,6 +959,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
 
     func refresh() {
+        if isResource { resourceRefresh?(); return }
         if isVirtual { return }
         if isRemote { onRemoteRefresh?(self); return }; if isArchive { onArchiveRefresh?(self); return }
         guard isTemporary else { load(); return }
@@ -961,8 +1025,8 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         )
     }
 
-    private func load(_ url: URL?, preserveSelection: Bool, selectName: String? = nil, historyAction: HistoryAction) {
-        guard !isVirtual else { return }
+    private func load(_ url: URL?, preserveSelection: Bool, selectName: String? = nil, historyAction: HistoryAction, recordActivity: Bool = true) {
+        guard !isVirtual, !isResource else { return }
         restoreDirectorySnapshot()
         let target = (url ?? directory).standardizedFileURL
         generation += 1
@@ -1006,7 +1070,9 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
                 loading = false
                 applyFilter(resetSelection: resetSelection, selectName: selectName)
                 restorePendingSession()
+                recordDirectoryActivity = recordActivity
                 onDirectoryChange?(self)
+                recordDirectoryActivity = true
             } catch {
                 guard token == generation else { return }
                 loading = false
@@ -1018,18 +1084,18 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
 
     var cursorEntry: FileEntry? {
-        guard !isArchive && !isRemote && !isVirtual, contentMode == .files, !loading, let entry = entry(at: table.selectedRow), validateResults([entry]) else { return nil }
+        guard !isArchive && !isRemote && !isVirtual && !isResource, contentMode == .files, !loading, let entry = entry(at: table.selectedRow), validateResults([entry]) else { return nil }
         return entry
     }
     var selectedEntries: [FileEntry] {
-        guard !isArchive && !isRemote && !isVirtual, contentMode == .files, !loading else { return [] }
+        guard !isArchive && !isRemote && !isVirtual && !isResource, contentMode == .files, !loading else { return [] }
         let ids = Set(selection.operationIDs(orderedIDs: visible.map(\.id)))
         let selected = visible.filter { ids.contains($0.id) }
         // Reject the entire requested batch if any source is stale; never fall back to the cursor.
         return validateResults(selected) ? selected : []
     }
     var markedEntries: [FileEntry] {
-        guard !isArchive && !isRemote && !isVirtual, contentMode == .files, !loading else { return [] }
+        guard !isArchive && !isRemote && !isVirtual && !isResource, contentMode == .files, !loading else { return [] }
         let marked = visible.filter { selection.markedIDs.contains($0.id) }
         return validateResults(marked) ? marked : []
     }
@@ -1243,25 +1309,26 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         updateSummary()
     }
     func entry(at row: Int) -> FileEntry? {
-        guard !isVirtual else { return nil }
+        guard !isVirtual, !isResource else { return nil }
         let index = row - offset
         return visible.indices.contains(index) ? visible[index] : nil
     }
-    func focus() { if let virtualPanel { virtualPanel.focus() } else if let remotePanel { remotePanel.focus() } else if let archivePanel { archivePanel.focus() } else if contentMode == .files { window?.makeFirstResponder(table) } else { auxiliary.focus() } }
-    func focusPath() { guard !isVirtual else { return }; onFocus?(self); window?.makeFirstResponder(pathField); pathField.selectText(nil) }
+    func focus() { if isResource { resourceFocus?() } else if let virtualPanel { virtualPanel.focus() } else if let remotePanel { remotePanel.focus() } else if let archivePanel { archivePanel.focus() } else if contentMode == .files { window?.makeFirstResponder(table) } else { auxiliary.focus() } }
+    func focusPath() { guard !isVirtual, !isResource else { return }; onFocus?(self); window?.makeFirstResponder(pathField); pathField.selectText(nil) }
     func focusFilter() { onFocus?(self); window?.makeFirstResponder(filterField) }
     func clearFilter() { filterField.stringValue = ""; applyFilter(); focus() }
 
     @objc func parent() {
         onFocus?(self)
+        if isResource { if let resourceParent { resourceParent() } else { leaveResource() }; return }
         if isVirtual { leaveVirtualResults(); return }
-        if isRemote { leaveRemote(); return }; if isArchive { closeArchiveLevel(); return }
+        if isRemote { closeRemote(); return }; if isArchive { closeArchiveLevel(); return }
         if isTemporary { leaveSearchResults(); return }
         guard directory.path != "/" else { return }
         load(directory.deletingLastPathComponent(), preserveSelection: false, selectName: directory.lastPathComponent)
     }
     @objc func goToPath() {
-        guard !isVirtual else { return }
+        guard !isVirtual, !isResource else { return }
         onFocus?(self)
         let path = (pathField.stringValue as NSString).expandingTildeInPath
         let url = path.hasPrefix("/") ? URL(fileURLWithPath: path) : directory.appendingPathComponent(path)
@@ -1278,21 +1345,24 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
     func goBack() {
         if isVirtual { leaveVirtualResults(); return }
-        if isRemote { leaveRemote(); return }; if isArchive { closeArchiveLevel(); return }
+        if isRemote { closeRemote(); return }; if isArchive { closeArchiveLevel(); return }
         if isTemporary { leaveSearchResults(); return }
         guard let path = navigation.backPath, !loading else { return }
         load(URL(fileURLWithPath: path), preserveSelection: false, historyAction: .back)
     }
     func goForward() {
         if isVirtual { leaveVirtualResults(); return }
-        if isRemote { leaveRemote(); return }; if isArchive { closeArchiveLevel(); return }
+        if isRemote { closeRemote(); return }; if isArchive { closeArchiveLevel(); return }
         if isTemporary { leaveSearchResults(); return }
         guard let path = navigation.forwardPath, !loading else { return }
         load(URL(fileURLWithPath: path), preserveSelection: false, historyAction: .forward)
     }
-    func navigateHistory(to path: String) {
-        load(URL(fileURLWithPath: path), preserveSelection: false)
-        focus()
+    func navigateHistory(to path: String, focus shouldFocus: Bool = true, recordActivity: Bool = true) {
+        leaveResource(focus: false)
+        if isVirtual { leaveVirtualResults(focus: false) }
+        if isRemote { leaveRemote(focus: false) }; if isArchive { leaveArchive(focus: false) }
+        load(URL(fileURLWithPath: path), preserveSelection: false, historyAction: .visit, recordActivity: recordActivity)
+        if shouldFocus { focus() }
     }
     private func persistNavigation() {
         if let data = try? JSONEncoder().encode(navigation) {
@@ -1432,7 +1502,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         } catch { return (sorted, "Группы сортировки: " + error.localizedDescription) }
     }
     private func resortKeepingCursor() {
-        guard !isVirtual else { return }
+        guard !isVirtual, !isResource else { return }
         let gesture = shiftMarking
         entries = sortedEntries(entries)
         applyFilter()
@@ -1440,26 +1510,26 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
 
     func setDisplayMode(_ mode: PanelDisplayMode) {
-        guard !isVirtual else { return }
+        guard !isVirtual, !isResource else { return }
         displayMode = mode
         if !isTemporary { AppPreferences.defaults.set(mode.rawValue, forKey: "panel.\(locationKey).display") }
         updateColumns()
     }
     func resetColumnWidths() {
-        guard !isVirtual else { return }
+        guard !isVirtual, !isResource else { return }
         let widths = Dictionary(uniqueKeysWithValues: Self.columnDefinitions.map { ($0.id, $0.width) })
         if let saved = auxiliaryColumnLayout { auxiliaryColumnLayout = (widths, saved.autosave) }
         restoreColumnWidths(widths)
     }
     func setVisibleColumns(_ ids: Set<String>) {
-        guard !isVirtual else { return }
+        guard !isVirtual, !isResource else { return }
         customColumnIDs = ids.intersection(Set(Self.columnDefinitions.map(\.id))).union(["name"])
         customColumnIDs.remove("origin")
         if !isTemporary { AppPreferences.defaults.set(customColumnIDs.sorted(), forKey: "panel.\(locationKey).columns") }
         setDisplayMode(.custom)
     }
     func setColorizeFiles(_ enabled: Bool) {
-        guard !isVirtual else { return }
+        guard !isVirtual, !isResource else { return }
         colorizeFiles = enabled
         if !isTemporary { AppPreferences.defaults.set(enabled, forKey: "panel.\(locationKey).colorize") }
         table.reloadData()
@@ -1523,6 +1593,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         if isArchive { title.stringValue += "  /  АРХИВ" }
         if isRemote { title.stringValue += "  /  СЕТЬ" }
         if isVirtual { title.stringValue += "  /  ВРЕМЕННЫЕ РЕЗУЛЬТАТЫ" }
+        resourceActivate?(active)
         archivePanel?.setActive(active); remotePanel?.setActive(active); virtualPanel?.setActive(active)
         if let temporaryTitle { title.stringValue += "  /  " + temporaryTitle }
         if contentMode != .files { title.stringValue += "  /  " + contentMode.title }
@@ -1530,7 +1601,8 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         table.enumerateAvailableRowViews { row, _ in (row as? FileRow)?.active = self.active; row.needsDisplay = true }
     }
     private func updateSummary() {
-        if isVirtual { summary.stringValue = "Ссылки действуют только в текущем сеансе · исходные файлы сохраняются"; return }
+        if isResource { return }
+        if isVirtual { summary.stringValue = "F7 — убрать ссылки · F8 — удалить исходные объекты"; return }
         let marked = visible.filter { selection.markedIDs.contains($0.id) }
         let count = visible.filter(\.isDirectory).count
         let total = "Папки: \(count)  ·  Файлы: \(visible.count - count)"

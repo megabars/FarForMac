@@ -2,7 +2,7 @@ import Foundation
 import Darwin
 
 public enum ViewerEncoding: String, CaseIterable, Codable, Sendable {
-    case automatic, utf8, utf16LE, utf16BE, windows1251, windows1252, latin1
+    case automatic, utf8, utf16LE, utf16BE, windows1251, windows1252, latin1, dos437, dos866
     public var title: String {
         switch self {
         case .automatic: return "Автоматически"
@@ -12,6 +12,8 @@ public enum ViewerEncoding: String, CaseIterable, Codable, Sendable {
         case .windows1251: return "Windows-1251"
         case .windows1252: return "Windows-1252"
         case .latin1: return "ISO-8859-1"
+        case .dos437: return "DOS-437"
+        case .dos866: return "DOS-866"
         }
     }
 }
@@ -285,44 +287,96 @@ public struct ViewerDocument: Sendable {
         while index < Int(end - contextStart) {
             let position = contextStart + Int64(index)
             if cells > 0, cells % columns == 0 { append(10, bytes: position..<position) }
-            var value: UInt32
-            if unitSize == 2 {
-                if index + 1 < bytes.count {
-                    let unit = Self.word(bytes, index, encoding)
-                    if (0xD800...0xDBFF).contains(unit), index + 3 < bytes.count,
-                       (0xDC00...0xDFFF).contains(Self.word(bytes, index + 2, encoding)) {
-                        value = Self.decode(bytes, at: index, encoding: encoding).value
-                    } else if (0xDC00...0xDFFF).contains(unit), index >= 2,
-                              (0xD800...0xDBFF).contains(Self.word(bytes, index - 2, encoding)) {
-                        value = 0x203A
-                    } else if (0xD800...0xDFFF).contains(unit) { value = 0xFFFD; invalid = true }
-                    else { value = unit }
-                } else { value = 0xFFFD; invalid = true }
-            } else if encoding == .utf8 {
-                let continuation = (max(0, index - 3)..<index).contains { candidate in
-                    let scalar = Self.decode(bytes, at: candidate, encoding: .utf8)
-                    return scalar.valid && candidate + scalar.length > index
-                }
-                if continuation { value = 0x203A }
-                else {
-                    let scalar = Self.decode(bytes, at: index, encoding: encoding)
-                    value = scalar.value; invalid = invalid || !scalar.valid
-                }
-            } else {
-                let scalar = Self.decode(bytes, at: index, encoding: encoding)
-                value = scalar.value; invalid = invalid || !scalar.valid
-            }
-            if value < 32 { value += 0x2400 }
-            else if value == 127 { value = 0x2421 }
-            else if (0x80...0x9F).contains(value) || value == 0x2028 || value == 0x2029 ||
-                        Unicode.Scalar(value)!.properties.generalCategory == .format {
-                value = 0xFFFD
-            }
+            let cell = dumpCell(bytes, at: index, utf16Bounds: 0..<bytes.count)
+            let value = cell.value
+            invalid = invalid || !cell.valid
             append(value, bytes: position..<(position + min(end - position, Int64(unitSize))))
             index += unitSize; cells += 1
         }
         try source.verifyUnchanged()
         return ViewerPage(text: String(output), startOffset: start, endOffset: end, invalidSequences: invalid, spans: spans)
+    }
+
+    /// FAR hex uses byte-addressed rows and shows the active code page beside
+    /// the exact raw bytes. UTF-8 cells can span rows; UTF-16 pairs restart per row.
+    public func hexPage(at offset: Int64, byteCount: Int = 65_536, bytesPerRow: Int = ViewerHexLayout.defaultBytesPerRow) throws -> ViewerHexPage {
+        guard offset >= 0, offset <= size, byteCount > 0,
+              (ViewerHexLayout.bytesPerStripe...ViewerHexLayout.maximumBytesPerRow).contains(bytesPerRow) else { throw ViewerError.invalidRange }
+        try source.verifyUnchanged()
+        let count = min(Int64(min(byteCount, Self.maximumPageByteCount)), size - offset)
+        let end = offset + count, contextStart = max(0, offset - 3)
+        let bytes = Array(try source.read(offset: contextStart, count: Int(min(size, end + min(3, size - end)) - contextStart)))
+        let unitSize = encoding == .utf16LE || encoding == .utf16BE ? 2 : 1
+        let digits = Array("0123456789ABCDEF".unicodeScalars)
+        let first = Int(offset - contextStart), last = Int(end - contextStart)
+        var output = String.UnicodeScalarView(), rows: [ViewerHexPage.Row] = [], textLength = 0
+        rows.reserveCapacity((Int(count) + bytesPerRow - 1) / bytesPerRow)
+        for start in stride(from: first, to: last, by: bytesPerRow) {
+            if start != first { output.append("\n"); textLength += 1 }
+            let rowEnd = min(start + bytesPerRow, last)
+            let rowStart = textLength
+            let address = String(format: "%010llX: ", contextStart + Int64(start))
+            output.append(contentsOf: address.unicodeScalars)
+            let hexStart = rowStart + address.utf16.count
+            for column in 0..<bytesPerRow {
+                if column > 0, column.isMultiple(of: ViewerHexLayout.bytesPerStripe) {
+                    output.append("│"); output.append(" ")
+                }
+                if start + column < rowEnd {
+                    let byte = Int(bytes[start + column])
+                    output.append(digits[byte >> 4]); output.append(digits[byte & 0xF]); output.append(" ")
+                } else { output.append(" "); output.append(" "); output.append(" ") }
+            }
+            output.append(" ")
+            let decodedStart = hexStart + ViewerHexLayout.byteColumn(bytesPerRow - 1) + 4
+            var cellEnds: [Int] = [], width = 0
+            let cells = (bytesPerRow + unitSize - 1) / unitSize
+            cellEnds.reserveCapacity(cells)
+            for column in 0..<cells {
+                let byte = start + column * unitSize
+                let value = byte < rowEnd ? dumpCell(bytes, at: byte, utf16Bounds: start..<rowEnd).value : 32
+                output.append(Unicode.Scalar(value)!)
+                width += value > 0xFFFF ? 2 : 1
+                cellEnds.append(width)
+            }
+            textLength = decodedStart + width
+            rows.append(.init(start: rowStart, hexStart: hexStart, decodedStart: decodedStart, cellEnds: cellEnds))
+        }
+        try source.verifyUnchanged()
+        return ViewerHexPage(text: String(output), startOffset: offset, endOffset: end, bytesPerRow: bytesPerRow,
+                             textLength: textLength, unitSize: unitSize, rows: rows)
+    }
+
+    private func dumpCell(_ bytes: [UInt8], at index: Int, utf16Bounds: Range<Int>) -> (value: UInt32, valid: Bool) {
+        var value: UInt32
+        var valid = true
+        if encoding == .utf16LE || encoding == .utf16BE {
+            if index + 1 < utf16Bounds.upperBound {
+                let unit = Self.word(bytes, index, encoding)
+                if (0xD800...0xDBFF).contains(unit), index + 3 < utf16Bounds.upperBound,
+                   (0xDC00...0xDFFF).contains(Self.word(bytes, index + 2, encoding)) {
+                    value = Self.decode(bytes, at: index, encoding: encoding).value
+                } else if (0xDC00...0xDFFF).contains(unit), index - 2 >= utf16Bounds.lowerBound,
+                          (0xD800...0xDBFF).contains(Self.word(bytes, index - 2, encoding)) {
+                    value = 0x203A
+                } else if (0xD800...0xDFFF).contains(unit) { value = 0xFFFD; valid = false }
+                else { value = unit }
+            } else { value = 0xFFFD; valid = false }
+        } else if encoding == .utf8, (max(0, index - 3)..<index).contains(where: { candidate in
+            let scalar = Self.decode(bytes, at: candidate, encoding: .utf8)
+            return scalar.valid && candidate + scalar.length > index
+        }) { value = 0x203A }
+        else {
+            let scalar = Self.decode(bytes, at: index, encoding: encoding)
+            value = scalar.value; valid = scalar.valid
+        }
+        if value < 32 { value += 0x2400 }
+        else if value == 127 { value = 0x2421 }
+        else if (0x80...0x9F).contains(value) || value == 0x2028 || value == 0x2029 ||
+                    Unicode.Scalar(value)!.properties.generalCategory == .format {
+            value = 0xFFFD
+        }
+        return (value, valid)
     }
 
     /// Linear, bounded-memory scan. Lines are one-based; CRLF is one separator.
@@ -411,10 +465,12 @@ public struct ViewerDocument: Sendable {
             return Scalar(value: (0xDC00...0xDFFF).contains(value) ? 0xFFFD : value, length: 2, valid: !(0xDC00...0xDFFF).contains(value))
         }
         if encoding == .latin1 { return Scalar(value: UInt32(first), length: 1, valid: true) }
-        if encoding == .windows1251 || encoding == .windows1252 {
+        if encoding == .windows1251 || encoding == .windows1252 || encoding == .dos437 || encoding == .dos866 {
             let value: UInt32
             if first < 0x80 { value = UInt32(first) }
             else if encoding == .windows1251 { value = cp1251[Int(first) - 128] }
+            else if encoding == .dos437 { value = cp437[Int(first) - 128] }
+            else if encoding == .dos866 { value = cp866[Int(first) - 128] }
             else if first < 0xA0 { value = cp1252[Int(first) - 128] }
             else { value = UInt32(first) }
             return Scalar(value: value, length: 1, valid: value != 0xFFFD)
@@ -437,6 +493,26 @@ public struct ViewerDocument: Sendable {
         return Scalar(value: value, length: length, valid: true)
     }
 
+    private static let cp866: [UInt32] = [
+        0x0410, 0x0411, 0x0412, 0x0413, 0x0414, 0x0415, 0x0416, 0x0417, 0x0418, 0x0419, 0x041A, 0x041B, 0x041C, 0x041D, 0x041E, 0x041F,
+        0x0420, 0x0421, 0x0422, 0x0423, 0x0424, 0x0425, 0x0426, 0x0427, 0x0428, 0x0429, 0x042A, 0x042B, 0x042C, 0x042D, 0x042E, 0x042F,
+        0x0430, 0x0431, 0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437, 0x0438, 0x0439, 0x043A, 0x043B, 0x043C, 0x043D, 0x043E, 0x043F,
+        0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556, 0x2555, 0x2563, 0x2551, 0x2557, 0x255D, 0x255C, 0x255B, 0x2510,
+        0x2514, 0x2534, 0x252C, 0x251C, 0x2500, 0x253C, 0x255E, 0x255F, 0x255A, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256C, 0x2567,
+        0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256B, 0x256A, 0x2518, 0x250C, 0x2588, 0x2584, 0x258C, 0x2590, 0x2580,
+        0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446, 0x0447, 0x0448, 0x0449, 0x044A, 0x044B, 0x044C, 0x044D, 0x044E, 0x044F,
+        0x0401, 0x0451, 0x0404, 0x0454, 0x0407, 0x0457, 0x040E, 0x045E, 0x00B0, 0x2219, 0x00B7, 0x221A, 0x2116, 0x00A4, 0x25A0, 0x00A0
+    ]
+    private static let cp437: [UInt32] = [
+        0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7, 0x00EA, 0x00EB, 0x00E8, 0x00EF, 0x00EE, 0x00EC, 0x00C4, 0x00C5,
+        0x00C9, 0x00E6, 0x00C6, 0x00F4, 0x00F6, 0x00F2, 0x00FB, 0x00F9, 0x00FF, 0x00D6, 0x00DC, 0x00A2, 0x00A3, 0x00A5, 0x20A7, 0x0192,
+        0x00E1, 0x00ED, 0x00F3, 0x00FA, 0x00F1, 0x00D1, 0x00AA, 0x00BA, 0x00BF, 0x2310, 0x00AC, 0x00BD, 0x00BC, 0x00A1, 0x00AB, 0x00BB,
+        0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556, 0x2555, 0x2563, 0x2551, 0x2557, 0x255D, 0x255C, 0x255B, 0x2510,
+        0x2514, 0x2534, 0x252C, 0x251C, 0x2500, 0x253C, 0x255E, 0x255F, 0x255A, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256C, 0x2567,
+        0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256B, 0x256A, 0x2518, 0x250C, 0x2588, 0x2584, 0x258C, 0x2590, 0x2580,
+        0x03B1, 0x00DF, 0x0393, 0x03C0, 0x03A3, 0x03C3, 0x00B5, 0x03C4, 0x03A6, 0x0398, 0x03A9, 0x03B4, 0x221E, 0x03C6, 0x03B5, 0x2229,
+        0x2261, 0x00B1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00F7, 0x2248, 0x00B0, 0x2219, 0x00B7, 0x221A, 0x207F, 0x00B2, 0x25A0, 0x00A0
+    ]
     private static let cp1252: [UInt32] = [
         0x20AC,0xFFFD,0x201A,0x0192,0x201E,0x2026,0x2020,0x2021,0x02C6,0x2030,0x0160,0x2039,0x0152,0xFFFD,0x017D,0xFFFD,
         0xFFFD,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,0x02DC,0x2122,0x0161,0x203A,0x0153,0xFFFD,0x017E,0x0178

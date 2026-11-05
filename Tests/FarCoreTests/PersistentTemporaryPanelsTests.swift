@@ -35,6 +35,7 @@ import Testing
         let fixture = try ArchiveSearchTests()
         let snapshot = try ArchiveReader.open(fixture.archive("outer.zip", [("a.txt", Data("archive".utf8))]))
         let provider = SavedReferenceRemote()
+        provider.connection.profileGroup = ["Work", "Storage"]
         let matches = [try local(), try archived(snapshot, "a.txt"), try remote(provider)]
         let references = try matches.map(SavedSearchReference.init(capturing:))
         var library = PersistentTemporaryPanels(); try library.replace(matches + matches, in: 7)

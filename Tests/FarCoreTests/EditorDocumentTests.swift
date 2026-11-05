@@ -14,6 +14,8 @@ struct EditorDocumentTests {
             case .windows1251: text = "Привет Ёё\r\na\nb\rc\r\n"
             case .windows1252: text = "€ “café”\r\na\nb\rc\r\n"
             case .latin1: text = "café\u{80}\r\na\nb\rc\r\n"
+            case .dos437: text = "café ╔═╗\r\na\nb\rc\r\n"
+            case .dos866: text = "Привет Ёё ╔═╗\r\na\nb\rc\r\n"
             default: text = "🙂Жcafé\r\na\nb\rc\r\n"
             }
             let unicode = [ViewerEncoding.utf8, .utf16LE, .utf16BE].contains(encoding)
@@ -36,7 +38,7 @@ struct EditorDocumentTests {
     @Test
     func everyDefinedSingleByteCodePageValueIsReversible() throws {
         let tree = try EditorTemporaryTree()
-        for encoding in [ViewerEncoding.windows1251, .windows1252, .latin1] {
+        for encoding in [ViewerEncoding.windows1251, .windows1252, .latin1, .dos437, .dos866] {
             let undefined: Set<Int> = encoding == .windows1251 ? [0x98] : (encoding == .windows1252 ? [0x81, 0x8D, 0x8F, 0x90, 0x9D] : [])
             let original = Data((0...255).filter { !undefined.contains($0) }.map(UInt8.init))
             let url = tree.root.appendingPathComponent(encoding.rawValue)
@@ -63,7 +65,7 @@ struct EditorDocumentTests {
             #expect(throws: EditorError.invalidEncoding) { try EditorDocument.load(url: url, encoding: encoding) }
             #expect(try Data(contentsOf: url) == data)
         }
-        for encoding in [ViewerEncoding.windows1251, .windows1252, .latin1] {
+        for encoding in [ViewerEncoding.windows1251, .windows1252, .latin1, .dos437, .dos866] {
             #expect(throws: EditorError.unrepresentable) {
                 try EditorDocument.encode(text: "🙂", format: EditorFormat(encoding: encoding))
             }

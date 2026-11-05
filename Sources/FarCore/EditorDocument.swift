@@ -64,18 +64,23 @@ public enum EditorDocument {
                 let chunk = try source.read(offset: offset, count: Int(min(Int64(LocalViewerSource.maximumReadCount), source.size - offset)))
                 data.append(chunk); offset += Int64(chunk.count)
             }
-            let document = try ViewerDocument(source: EditorMemorySource(data), encoding: encoding)
-            let text = try strictText(document)
-            let format = EditorFormat(encoding: document.encoding, bom: document.bomLength > 0)
-            // This also guards against code-page aliases or decoder behavior
-            // that cannot reproduce the original bytes exactly.
-            guard try encode(text: text, format: format) == data else { throw EditorError.invalidEncoding }
+            let (text, format) = try decode(data, encoding: encoding)
             try source.verifyUnchanged()
             return EditorSnapshot(url: source.url, originalURL: url.standardizedFileURL,
                                   identity: source.identity, data: data, text: text, format: format)
         } catch let error as ViewerError {
             throw translate(error)
         }
+    }
+
+    public static func decode(_ data: Data, encoding: ViewerEncoding) throws -> (text: String, format: EditorFormat) {
+        guard data.count <= maximumSize else { throw EditorError.tooLarge }
+        let document = try ViewerDocument(source: EditorMemorySource(data), encoding: encoding)
+        let text = try strictText(document)
+        let format = EditorFormat(encoding: document.encoding, bom: document.bomLength > 0)
+        // Round-trip guards against aliases or decoders that cannot reproduce the source bytes.
+        guard try encode(text: text, format: format) == data else { throw EditorError.invalidEncoding }
+        return (text, format)
     }
 
     public static func encode(text: String, format: EditorFormat) throws -> Data {
@@ -91,8 +96,8 @@ public enum EditorDocument {
                 data.append(contentsOf: format.encoding == .utf16LE ? [low, high] : [high, low])
                 guard data.count <= maximumSize else { throw EditorError.tooLarge }
             }
-        case .windows1251, .windows1252, .latin1:
-            let map = format.encoding == .windows1251 ? cp1251 : (format.encoding == .windows1252 ? cp1252 : latin1)
+        case .windows1251, .windows1252, .latin1, .dos437, .dos866:
+            let map = legacyCodePages[format.encoding] ?? [:]
             for scalar in normalized.unicodeScalars {
                 guard let byte = map[scalar.value] else { throw EditorError.unrepresentable }
                 data.append(byte)
@@ -245,9 +250,8 @@ public enum EditorDocument {
         }
         return map
     }
-    private static let cp1251 = codePage(.windows1251)
-    private static let cp1252 = codePage(.windows1252)
-    private static let latin1 = codePage(.latin1)
+    private static let legacyCodePages = Dictionary(uniqueKeysWithValues:
+        [ViewerEncoding.windows1251, .windows1252, .latin1, .dos437, .dos866].map { ($0, codePage($0)) })
     private static func ioError() -> EditorError { .io(String(cString: strerror(errno))) }
     private static func translate(_ error: ViewerError) -> EditorError {
         switch error {

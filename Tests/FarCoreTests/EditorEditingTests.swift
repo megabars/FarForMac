@@ -5,6 +5,23 @@ import Testing
 @Suite
 struct EditorEditingTests {
     @Test
+    func replacesRemainingMatchesInTheChosenDirection() throws {
+        let input = "cat cat cat"
+        let literal = EditorSearchQuery(pattern: "cat")
+        let forward = try EditorEditing.replaceAll(in: input, query: literal, replacement: "dog", from: 4)
+        #expect(forward.text == "cat dog dog")
+        #expect(forward.count == 2 && forward.selection == NSRange(location: 8, length: 3))
+
+        let regex = EditorSearchQuery(pattern: "c(at)", regex: true)
+        let backward = try EditorEditing.replaceAll(in: input, query: regex, replacement: "$1", from: 5, direction: .backward)
+        #expect(backward.text == "at at cat")
+        #expect(backward.count == 2 && backward.selection == NSRange(location: 0, length: 2))
+
+        let overlapping = try EditorEditing.replaceAll(in: "aaa", query: .init(pattern: "aa"), replacement: "X", from: 3, direction: .backward)
+        #expect(overlapping.text == "aX")
+    }
+
+    @Test
     func fuzzySearchAndReplacementUseOriginalUnicodeRanges() throws {
         let text = "🙂résumé RÉSUMÉ resumeX _resume resume"
         let query = EditorSearchQuery(pattern: "resume", wholeWords: true, fuzzy: true)

@@ -24,6 +24,8 @@ public struct SearchOptions: Codable, Sendable {
     public var modifiedBefore: Date?
     public var maximumResults: Int = 10_000
     public var maximumContentBytes: Int = 16 * 1_024 * 1_024
+    /// Deliberate search range. The safety limit still bounds the bytes we may scan.
+    public var firstContentBytes: Int?
     /// Missing in saved v1 options means UTF-8, preserving older searches.
     public var contentEncoding: ViewerEncoding?
     /// Missing in earlier saved searches preserves local-only traversal.
@@ -264,6 +266,9 @@ private struct SearchPlan {
         guard (1...maximum).contains(value.maximumContentBytes) else {
             throw SearchProblem("Предел чтения: до 4096 МиБ для подстроки и HEX, до 64 МиБ для Regex.")
         }
+        if let first = value.firstContentBytes, !(1...maximum).contains(first) {
+            throw SearchProblem("Неверный диапазон поиска в начале файла.")
+        }
         guard value.minSize.map({ $0 >= 0 }) ?? true, value.maxSize.map({ $0 >= 0 }) ?? true,
               value.minSize == nil || value.maxSize == nil || value.minSize! <= value.maxSize! else {
             throw SearchProblem("Неверные границы размера файла.")
@@ -495,7 +500,8 @@ private final class SearchWorker {
     func searchContent(_ url: URL, parent: Int32, name: String, expected: SearchStamp,
                        follow: Bool) throws -> SearchContentMatch? {
         if cancellation.isCancelled { throw SearchStopped() }
-        guard expected.size <= Int64(plan.options.maximumContentBytes) else {
+        let searchSize = min(expected.size, Int64(plan.options.firstContentBytes ?? Int.max))
+        guard searchSize <= Int64(plan.options.maximumContentBytes) else {
             throw SearchProblem("Содержимое пропущено: размер превышает предел \(plan.options.maximumContentBytes) байт.")
         }
         let descriptor = openat(parent, name, O_RDONLY | O_NONBLOCK | O_CLOEXEC | (follow ? 0 : O_NOFOLLOW))
@@ -508,9 +514,11 @@ private final class SearchWorker {
         let source = SearchByteSource(descriptor: descriptor, expected: expected, cancellation: cancellation)
         let match: SearchContentMatch?
         if let bytes = plan.bytes {
-            match = try SearchContentScanner.scanBytes(source: source, query: bytes, cancellation: cancellation)
+            match = try SearchContentScanner.scanBytes(source: SearchContentScanner.prefix(source, firstBytes: plan.options.firstContentBytes),
+                query: bytes, cancellation: cancellation)
         } else if let expression = plan.content {
-            let document = try ViewerDocument(source: source, encoding: plan.options.contentEncoding ?? .utf8)
+            let document = try SearchContentScanner.document(source, encoding: plan.options.contentEncoding ?? .utf8,
+                firstBytes: plan.options.firstContentBytes)
             match = try SearchContentScanner.scan(document: document, expression: expression,
                 literal: plan.options.contentMode == .literal, queryLength: plan.options.contentQuery.utf16.count,
                 cancellation: cancellation)

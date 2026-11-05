@@ -57,7 +57,16 @@ struct EditorGotoCoordinate {
         value = parsed
     }
 
-    func resolve(current: Int, extent: Int, maximum: Int) throws -> Int {
+    static func pair(_ expression: String, hexadecimal: Bool) throws -> (Self, Self) {
+        guard expression.utf16.count <= 4096 else { throw EditorEditingError.invalidPosition }
+        let parts = expression.components(separatedBy: CharacterSet(charactersIn: ",.;:"))
+        let values = parts.count > 1 ? parts : expression.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard values.count <= 2 else { throw EditorEditingError.invalidPosition }
+        return (try Self(values.first ?? "", hexadecimal: hexadecimal),
+                try Self(values.count > 1 ? values[1] : "", hexadecimal: hexadecimal))
+    }
+
+    func resolve(current: Int, extent: Int, maximum: Int, oneBased: Bool = true) throws -> Int {
         guard let value else { return min(maximum, max(0, current)) }
         let coordinate: Int
         if percent {
@@ -66,7 +75,7 @@ struct EditorGotoCoordinate {
             else { coordinate = extent / 100 * Int(value) + (extent % 100) * Int(value) / 100 }
         } else { coordinate = Int(value) }
         let target: Int
-        if relative == 0 { target = percent ? coordinate : max(0, coordinate - 1) }
+        if relative == 0 { target = percent || !oneBased ? coordinate : max(0, coordinate - 1) }
         else {
             let (sum, overflow) = current.addingReportingOverflow(relative * coordinate)
             target = overflow ? (relative > 0 ? maximum : 0) : sum

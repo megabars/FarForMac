@@ -13,6 +13,67 @@ enum SearchContentScanner {
         let errorDescription: String?
         init(_ message: String) { errorDescription = message }
     }
+
+    private struct PrefixSource: ViewerByteSource {
+        let source: any ViewerByteSource
+        let size: Int64
+        var identity: String { source.identity }
+        func verifyUnchanged() throws { try source.verifyUnchanged() }
+        func read(offset: Int64, count: Int) throws -> Data {
+            guard offset >= 0, offset <= size, count >= 0 else { throw ViewerError.invalidRange }
+            return try source.read(offset: offset, count: Int(min(Int64(count), size - offset)))
+        }
+    }
+
+    static func prefix(_ source: any ViewerByteSource, firstBytes: Int?) -> any ViewerByteSource {
+        guard let firstBytes, Int64(firstBytes) < source.size else { return source }
+        return PrefixSource(source: source, size: Int64(firstBytes))
+    }
+
+    static func document(_ source: any ViewerByteSource, encoding: ViewerEncoding,
+                         firstBytes: Int?) throws -> ViewerDocument {
+        let bounded = prefix(source, firstBytes: firstBytes)
+        let document = try ViewerDocument(source: bounded, encoding: encoding)
+        guard bounded.size < source.size else { return document }
+        // A byte boundary can truncate one Unicode scalar. Discard just that
+        // tail, while still reporting invalid sequences earlier in the prefix.
+        let count = Int(min(4, bounded.size))
+        let tail = Array(try bounded.read(offset: bounded.size - Int64(count), count: count))
+        let candidateEncoding = encoding == .automatic && document.encoding == .windows1252 ? .utf8 : document.encoding
+        let incomplete: Int
+        switch candidateEncoding {
+        case .utf8: incomplete = incompleteUTF8Suffix(tail)
+        case .utf16LE, .utf16BE:
+            let odd = Int(bounded.size % 2)
+            let end = tail.count - odd
+            if end >= 2 {
+                let highByte = tail[candidateEncoding == .utf16LE ? end - 1 : end - 2]
+                incomplete = odd + ((0xD8...0xDB).contains(highByte) ? 2 : 0)
+            } else { incomplete = odd }
+        default: incomplete = 0
+        }
+        guard incomplete > 0 else { return document }
+        return try ViewerDocument(source: PrefixSource(source: source, size: bounded.size - Int64(incomplete)), encoding: encoding)
+    }
+
+    private static func incompleteUTF8Suffix(_ bytes: [UInt8]) -> Int {
+        guard let start = bytes.lastIndex(where: { !(0x80...0xBF).contains($0) }) else { return 0 }
+        let lead = bytes[start], count = bytes.count - start
+        let width: Int
+        switch lead {
+        case 0xC2...0xDF: width = 2
+        case 0xE0...0xEF: width = 3
+        case 0xF0...0xF4: width = 4
+        default: return 0
+        }
+        guard count < width else { return 0 }
+        if count > 1 {
+            let second = bytes[start + 1]
+            if (lead == 0xE0 && second < 0xA0) || (lead == 0xED && second >= 0xA0) ||
+                (lead == 0xF0 && second < 0x90) || (lead == 0xF4 && second >= 0x90) { return 0 }
+        }
+        return count
+    }
     /// FAR's masked field is HH HH ... HH. Free-form input accepts whitespace
     /// between complete pairs; compact runs of pairs also work. No odd-nibble correction or wildcard bytes.
     static func hexBytes(_ text: String) throws -> [UInt8] {

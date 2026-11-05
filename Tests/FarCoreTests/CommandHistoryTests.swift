@@ -50,6 +50,27 @@ struct CommandHistoryTests {
         #expect(try CommandHistory.load(from: url).entries.isEmpty)
     }
 
+    @Test func protectedEntriesSurviveClearingMissingPathsAndCapacityPressure() throws {
+        let missing = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        var history = CommandHistory(capacity: 2)
+        try history.record(kind: .view, value: missing.path)
+        let protected = try #require(history.entries.first?.id)
+        history.toggleLock(id: protected)
+        try history.record(kind: .view, value: missing.path)
+        try history.record(kind: .edit, value: missing.appendingPathComponent("file").path)
+        try history.record(kind: .command, value: "echo test")
+        #expect(history.entries.map(\.id).contains(protected))
+        let encoded = try JSONEncoder().encode(history)
+        history = try JSONDecoder().decode(CommandHistory.self, from: encoded)
+        history.remove(id: protected)
+        history.clear(kind: .view)
+        history.removeMissing(kinds: [.view, .edit])
+        #expect(history.entries.first(where: { $0.id == protected })?.isLocked == true)
+        history.toggleLock(id: protected)
+        history.removeMissing(kinds: [.view, .edit])
+        #expect(history.entries.allSatisfy { $0.kind == .command })
+    }
+
     @Test
     func decodeSanitizesInvalidStateAndBoundsEntries() throws {
         var history = CommandHistory(capacity: 10)

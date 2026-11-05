@@ -20,13 +20,13 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
 
     В общем поиске отметьте источники: локальные папки или файлы, архивы и сетевые папки. Можно добавить папку, архив или текущие источники файловых панелей, изменить путь и убрать источник. Источники панелей фиксируются в момент добавления; дальнейшая навигация панелей не меняет поиск. Маска имени поддерживает те же выражения и группы, что файловые панели. Режим содержимого: без проверки, буквальная подстрока, регулярное выражение или HEX (байты). HEX: пары 00…FF через пробел, например 00 FF 41; регистр букв HEX не важен. Слитные пары тоже допустимы: 00FF4142. Нечётные цифры, 0x и шаблоны отклоняются до запуска. HEX ищет сырые байты независимо от кодировки и показывает смещение от начала файла (с нуля), без номера строки. Кодировка выбирается явно: UTF-8, UTF-16 LE/BE, Windows-1251/1252, Latin-1 или автоматическое определение; недоступные, двоичные, слишком большие и неподдерживаемые объекты отмечаются в замечаниях.
 
-    Даты вводятся как ГГГГ-ММ-ДД, по местному времени: «с» включает начало дня, «по» — весь указанный день. Пустые поля даты и размера снимают соответствующее ограничение. Размер задаётся в байтах. Ограничение чтения одного файла — от 1 до 4096 МиБ для подстроки и HEX и до 64 МиБ для Regex; подстрока ищется по частям с ограниченной памятью; результатов — от 1 до 10000. Поиск прекращается при достижении лимита результатов.
+    Даты вводятся как ГГГГ-ММ-ДД, по местному времени: «с» включает начало дня, «по» — весь указанный день. Пустые поля даты и размера снимают соответствующее ограничение. Размер задаётся в байтах. «Искать в первых» ограничивает поиск началом файла: например, 100, 1K или 2M. Заглавные суффиксы используют 1024, строчные — 1000. Пустое поле означает проверку всего файла в пределах лимита чтения. Ограничение чтения одного файла — от 1 до 4096 МиБ для подстроки и HEX и до 64 МиБ для Regex. Для архивов и сети остаётся предел полной рабочей копии. Поиск прекращается при достижении лимита результатов.
 
     Скрытые объекты и переход по символическим ссылкам включаются отдельно. Типы определяют, какие объекты могут стать результатами; папки обходятся также при поиске только файлов. Циклы ссылок и специальные файлы не должны задерживать поиск.
 
     Cmd+Enter запускает поиск из любого поля. Результаты появляются по мере поиска. «Отменить» сохраняет уже найденные строки. Счётчики учитывают все замечания, внизу показаны первые 200. Параметры сохраняются без списка источников, подключений и паролей; поиск после открытия окна не запускается автоматически.
 
-    Выберите результат: Enter или двойной щелчок — перейти к нему в файловой панели; F3 — просмотр, F4 — редактирование без смены каталогов панелей. Кнопка «Во временную панель» передаёт все найденные на этот момент результаты. Временная панель является снимком. Удалённые или заменённые объекты проверяются повторно перед действием.
+    Выберите результат: Enter или двойной щелчок останавливает поиск и переводит курсор файловой панели к объекту. F3 открывает просмотр, F4 — редактор. Локальные результаты можно открыть, пока поиск продолжается. Кнопка «Во временную панель» передаёт все найденные на этот момент результаты. Временная панель является снимком. Удалённые или заменённые объекты проверяются повторно перед действием.
 
     В открытой архивной или сетевой панели Alt+F7 ищет от текущей папки этого источника. Переходы по ссылкам отключены; содержимое проверяется через ограниченные приватные копии, до 64 МиБ на файл. Для сети действует общий предел скачивания 256 МиБ. Enter возвращает к найденному объекту, F3/F4 открывают рабочую копию; изменения отправляются отдельно. Общие результаты можно передать во временную виртуальную панель; каждый объект сохраняет свой исходный источник. При локальном поиске «Искать в архивах» добавляет содержимое архивов; «Включая вложенные архивы» разрешает их рекурсивное раскрытие. В открытой архивной панели доступен поиск во вложенных архивах. Сетевой поиск архивы не раскрывает. Путь архивного результата показывает цепочку «архив !/вложенный архив !/файл». Вложенные архивы доступны только для просмотра; F4 для них отключена. Смешанные результаты сохраняют исходные локальные, архивные и сетевые адреса; рабочие копии не становятся адресами результатов. Для архивного обхода: до 256 контейнеров, 100000 обработанных заголовков, четыре уровня вложения и 256 МиБ суммарной обработки данных (включая повторное чтение при проверках). На содержимое одного файла — до 64 МиБ. При достижении предела поиск завершается частично с сообщением. Для явно отмеченного зашифрованного архива пароль запрашивается перед поиском содержимого или вложенных архивов и хранится только на время этого запуска. Автоматический обход не запрашивает пароли для зашифрованного содержимого.
     """
@@ -73,14 +73,18 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
         let controller = SearchWindow(directory: root, maskGroups: [:], onReveal: { _ in }, onOpen: { _, _ in }, onSendToPanel: { _ in })
         var options = SearchOptions(roots: [root]); options.contentMode = .literal
         options.contentQuery = "Привет"; options.contentEncoding = .utf16BE; options.maximumContentBytes = 96 * 1_048_576
+        options.firstContentBytes = 1_048_576
         controller.restore(options)
         let restored = try controller.readOptions()
         guard restored.contentEncoding == .utf16BE, restored.maximumContentBytes == options.maximumContentBytes,
+              restored.firstContentBytes == options.firstContentBytes,
               controller.contentEncoding.isEnabled else { throw PanelSessionError("Search encoding/streaming limit did not round trip in UI") }
+        controller.firstContentBytes.stringValue = "1k"
+        guard try controller.readOptions().firstContentBytes == 1000 else { throw PanelSessionError("Lowercase search prefix units must use decimal sizes") }
         options.contentEncoding = nil; options.contentMode = .none; options.maximumContentBytes = 8 * 1_048_576
         controller.restore(options)
         guard controller.contentEncoding.indexOfSelectedItem == 1, !controller.contentEncoding.isEnabled else { throw PanelSessionError("Old search options must use UTF-8 and disable encoding without content") }
-        return ["Search UI preserves encoding and large literal limit", "Old search options retain UTF-8 without implicit content search"]
+        return ["Search UI preserves encoding, the safety limit and an explicit prefix with size units", "Old search options retain UTF-8 without implicit content search"]
     }
     static func runProviderSearchUISmokeChecks() async throws -> [String] {
         guard AppRuntime.isSmoke, let root = AppRuntime.smokeStateDirectory else { throw PanelSessionError("Provider search smoke requires isolated state") }
@@ -315,6 +319,48 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
                 "Remote identities with equal paths remain distinct and large local limits round trip",
                 "Unified settings exclude captured paths, providers and credentials",
                 "Unified close cancels the shared worker and retains its lease through cleanup"]
+            + (try await runLiveSearchActionsUISmokeCheck(in: folder))
+    }
+
+    private static func runLiveSearchActionsUISmokeCheck(in folder: URL) async throws -> [String] {
+        let local = folder.appendingPathComponent("live", isDirectory: true)
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        for index in 0..<70 {
+            try Data([0x61, 0x00]).write(to: local.appendingPathComponent("live-\(index).txt"))
+        }
+        let provider = ProviderUISmokeFixture()
+        provider.waitForCancellation = true
+        var opened: [Bool] = [], revealed: String?
+        let controller = SearchWindow(sources: [.local(local), .remote(provider, root: "/docs")],
+            maskGroups: [:], onReveal: { revealed = $0.id }, onOpen: { _, editable in opened.append(editable) }, onSendToPanel: { _ in })
+        defer { controller.close() }
+        var options = SearchOptions(roots: [local]); options.namePattern = "*.txt"
+        options.contentMode = .literal; options.contentQuery = "a"; options.firstContentBytes = 1
+        controller.restore(options); controller.showWindow(nil); controller.startSearch()
+        let deadline = Date().addingTimeInterval(8)
+        while controller.matches.isEmpty && controller.isWorkerRunning && Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        guard controller.isWorkerRunning, let match = controller.matches.first else {
+            throw PanelSessionError("Unified search did not expose a live local prefix match")
+        }
+        controller.table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        guard controller.viewButton.isEnabled, controller.editButton.isEnabled, controller.revealButton.isEnabled else {
+            throw PanelSessionError("F3, F4 and Go to must be available for a live local match")
+        }
+        controller.viewSelected(); controller.editSelected()
+        guard opened == [false, true], controller.providerCancellation?.isCancelled == false else {
+            throw PanelSessionError("F3/F4 must open the selected file without stopping the search")
+        }
+        controller.revealSelected()
+        guard controller.providerCancellation?.isCancelled == true, revealed == nil else {
+            throw PanelSessionError("Go to must cancel the worker before revealing the selected result")
+        }
+        try await waitForSearch(controller)
+        guard revealed == match.id, controller.window?.isVisible == false else {
+            throw PanelSessionError("Go to must close the results and reveal the selected match after cleanup")
+        }
+        return ["Unified search opens live local matches without cancellation and cancels, closes, and navigates on Go to"]
     }
 
     static func runHexSearchUISmokeChecks() async throws -> [String] {
@@ -405,6 +451,7 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
     private let afterDate = NSTextField(string: "")
     private let beforeDate = NSTextField(string: "")
     private let contentMB = NSTextField(string: "8")
+    private let firstContentBytes = NSTextField(string: "")
     private let resultLimit = NSTextField(string: "10000")
     private let table = SearchResultsTable()
     private let issues = NSTextView()
@@ -423,6 +470,7 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
     private var displayedIssues: [String] = []
     private var issueCount = 0
     private var cancellation: SearchCancellation?
+    private var revealAfterCleanup: (() -> Void)?
     private var generation = UUID()
     private var keyMonitor: Any?
     private var parameterControls: [NSControl] = []
@@ -526,6 +574,7 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
 
     func windowWillClose(_ notification: Notification) {
         persistParameters()
+        revealAfterCleanup = nil
         cancellation?.cancel(); providerCancellation?.cancel(); sourceOpeningCancellation?.cancel()
         generation = UUID() // Any callbacks already waiting for the main thread are stale.
         // Keep cancellation and captured snapshots alive until the worker has cleaned up.
@@ -569,7 +618,9 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
         query.setAccessibilityLabel("Содержимое")
         for (field, placeholder, title) in [(minSize, "нет", "Минимальный размер в байтах"), (maxSize, "нет", "Максимальный размер в байтах"),
                                           (afterDate, "ГГГГ-ММ-ДД", "Изменён начиная с даты"), (beforeDate, "ГГГГ-ММ-ДД", "Изменён по дату включительно"),
-                                          (contentMB, "1…64", "Лимит чтения файла в МиБ"), (resultLimit, "1…10000", "Лимит результатов")] {
+                                          (contentMB, "1…64", "Лимит чтения файла в МиБ"),
+                                          (firstContentBytes, "например 1M", "Искать только в первых байтах"),
+                                          (resultLimit, "1…10000", "Лимит результатов")] {
             field.placeholderString = placeholder
             field.setAccessibilityLabel(title)
             field.widthAnchor.constraint(equalToConstant: field === afterDate || field === beforeDate ? 118 : 95).isActive = true
@@ -577,7 +628,7 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
         let choose = chooseRootButton
         parameterControls = [pattern, query, contentMode, contentEncoding, caseSensitive, hidden, followLinks,
                              files, directories, links, searchArchives, searchNestedArchives, minSize, maxSize, afterDate, beforeDate,
-                             contentMB, resultLimit, choose, archiveSourceButton, panelSourcesButton, editSourceButton, removeSourceButton]
+                             contentMB, firstContentBytes, resultLimit, choose, archiveSourceButton, panelSourcesButton, editSourceButton, removeSourceButton]
         rootHeading.font = .systemFont(ofSize: 12, weight: .semibold)
         let rootTitle = row([rootHeading, NSView(), choose])
         let sourceActions = row([archiveSourceButton, panelSourcesButton, editSourceButton, removeSourceButton, NSView()])
@@ -594,7 +645,9 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
         searchArchives.toolTip = "Искать также среди элементов локальных архивов независимо от маски имени самого архива."
         searchNestedArchives.toolTip = "Открывать вложенные архивы в пределах лимитов глубины и рабочих копий; результаты только для чтения."
         let archiveFlags = row([searchArchives, searchNestedArchives, NSView()])
-        let sizes = row([text("Размер, байт: от"), minSize, text("до"), maxSize, NSView(), text("Читать файл до, МиБ:"), contentMB])
+        let sizes = row([text("Размер, байт: от"), minSize, text("до"), maxSize, NSView(),
+                         text("Искать в первых"), firstContentBytes, text("Лимит чтения, МиБ"), contentMB])
+        firstContentBytes.toolTip = "Байты без суффикса. B, K, M, G, T, P, E — двоичные единицы, строчные — десятичные. Пусто — весь файл в пределах лимита."
         let dates = row([text("Изменён с:"), afterDate, text("по:"), beforeDate, text("включительно; пусто — без границы", size: 11), NSView()])
         let limits = row([text("Максимум результатов:"), resultLimit, NSView(), startButton, cancelButton])
         let form = column([rootTitle, rootInputs, sourceActions, nameRow, contentRow, flags, types, archiveFlags, sizes, dates, limits], spacing: 7)
@@ -668,6 +721,7 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
         afterDate.stringValue = options.modifiedAfter.map { formatter.string(from: $0) } ?? ""
         beforeDate.stringValue = options.modifiedBefore.map { formatter.string(from: $0) } ?? ""
         contentMB.stringValue = String(max(1, min(4096, options.maximumContentBytes / (1024 * 1024))))
+        firstContentBytes.stringValue = options.firstContentBytes.map(String.init) ?? ""
         resultLimit.stringValue = String(max(1, min(10000, options.maximumResults)))
         modeChanged(); archiveModeChanged()
     }
@@ -715,8 +769,29 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
             throw InputError(message: "Лимит результатов должен быть целым числом от 1 до 10000.")
         }
         options.maximumContentBytes = mb * 1024 * 1024
+        if options.contentMode != .none {
+            options.firstContentBytes = try prefixByteCount(firstContentBytes.stringValue, limit: options.maximumContentBytes)
+        }
         options.maximumResults = limit
         return options
+    }
+
+    private func prefixByteCount(_ raw: String, limit: Int) throws -> Int? {
+        let value = raw.trimmingCharacters(in: .whitespaces)
+        guard !value.isEmpty else { return nil }
+        let digits = value.prefix { $0.isASCII && $0.isNumber }
+        let suffix = value.dropFirst(digits.count).trimmingCharacters(in: .whitespaces)
+        let units = ["B", "K", "M", "G", "T", "P", "E"]
+        let error = InputError(message: "Начало файла: введите число байт или размер с суффиксом, например 1M, в пределах лимита чтения.")
+        guard var count = Int(digits), let power = units.firstIndex(of: suffix.isEmpty ? "B" : suffix.uppercased()) else { throw error }
+        guard count > 0 else { return nil }
+        let base = suffix == suffix.lowercased() ? 1000 : 1024
+        for _ in 0..<power {
+            guard count <= limit / base else { throw error }
+            count *= base
+        }
+        guard count <= limit else { throw error }
+        return count
     }
 
     private func optionalSize(_ field: NSTextField, title: String) throws -> Int64? {
@@ -804,7 +879,8 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
             issueCount = 0; issues.string = ""; currentPath.stringValue = ""
             issueHeading.stringValue = "Ошибки и замечания: 0"
             table.reloadData()
-            workerUsesProvider = locations != nil || source != nil || options.searchArchives == true
+            workerUsesProvider = source != nil || options.searchArchives == true ||
+                locations?.contains(where: { !$0.isLocalSearchSource }) == true
             isSearching = true; isWorkerRunning = true
             status.stringValue = "Поиск… Просмотрено: 0 · Найдено: 0 · Замечаний: 0"
             progress.startAnimation(nil)
@@ -865,7 +941,7 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
     }
 
     private func receive(_ events: [WindowEvent], generation id: UUID) {
-        guard generation == id, isSearching else { return }
+        guard generation == id, isSearching, revealAfterCleanup == nil else { return }
         var addedResults = false
         var addedIssues = false
         var latestProgress: SearchProgress?
@@ -922,6 +998,10 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
         status.stringValue = summary.summary
         currentPath.stringValue = ""
         refreshActions()
+        if let action = revealAfterCleanup {
+            revealAfterCleanup = nil
+            completeReveal(action)
+        }
     }
     private func updateIssueHeading() {
         issueHeading.stringValue = "Ошибки и замечания: \(issueCount)" + (issueCount > Self.issueLimit ? " · показаны первые \(Self.issueLimit), остальные учтены в счётчике" : "")
@@ -932,6 +1012,7 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
         query.isEnabled = !isWorkerRunning && contentMode.indexOfSelectedItem != 0
         let hex = contentMode.indexOfSelectedItem == 3
         contentEncoding.isEnabled = query.isEnabled && !hex
+        firstContentBytes.isEnabled = query.isEnabled
         caseSensitive.isEnabled = !isWorkerRunning && !hex
         directories.isEnabled = !isWorkerRunning && !hex
         query.placeholderString = hex ? "Пары байтов: 00 FF 41 42" : "Искомый текст или регулярное выражение"
@@ -1090,17 +1171,38 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
     }
     private var matches: [SearchMatch] { resultRows.compactMap { if case .match(let match) = $0 { return match }; return nil } }
     @objc private func revealSelected() {
-        if let match = selectedMatch { if !isWorkerRunning { onMatchReveal?(match) }; return }
-        if let result = selectedProviderResult { if !isWorkerRunning { onProviderReveal?(result) }; return }
-        performSelected { onReveal($0) }
+        guard revealAfterCleanup == nil, sourceOpeningCancellation == nil else { return }
+        if let match = selectedMatch, let onMatchReveal { reveal { onMatchReveal(match) }; return }
+        if let result = selectedProviderResult, let onProviderReveal { reveal { onProviderReveal(result) }; return }
+        performSelected { [onReveal] result in reveal { onReveal(result) } }
+    }
+    private func reveal(_ action: @escaping () -> Void) {
+        if isWorkerRunning {
+            revealAfterCleanup = action
+            cancel()
+            status.stringValue = "Остановка поиска перед переходом…"
+            refreshActions()
+        } else { completeReveal(action) }
+    }
+    private func completeReveal(_ action: () -> Void) {
+        if window?.isVisible == true { close() }
+        action()
+    }
+    private func canOpen(_ match: SearchMatch, editable: Bool) -> Bool {
+        guard revealAfterCleanup == nil, sourceOpeningCancellation == nil,
+              !match.isDirectory, !match.isSymbolicLink, !editable || match.canEdit else { return false }
+        if case .local = match { return true }
+        return !isWorkerRunning
     }
     @objc private func viewSelected() {
-        if let match = selectedMatch { if !isWorkerRunning && !match.isDirectory && !match.isSymbolicLink { onMatchOpen?(match, false) }; return }
+        guard revealAfterCleanup == nil else { return }
+        if let match = selectedMatch { if canOpen(match, editable: false) { onMatchOpen?(match, false) }; return }
         if selectedProviderResult != nil { openProviderSelection(editable: false); return }
         performSelected { onOpen($0, false) }
     }
     @objc private func editSelected() {
-        if let match = selectedMatch { if !isWorkerRunning && !match.isDirectory && !match.isSymbolicLink && match.canEdit { onMatchOpen?(match, true) }; return }
+        guard revealAfterCleanup == nil else { return }
+        if let match = selectedMatch { if canOpen(match, editable: true) { onMatchOpen?(match, true) }; return }
         if selectedProviderResult != nil { openProviderSelection(editable: true); return }
         performSelected { onOpen($0, true) }
     }
@@ -1119,6 +1221,7 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
         catch { status.stringValue = error.localizedDescription; NSSound.beep() }
     }
     @objc private func sendResults() {
+        guard revealAfterCleanup == nil else { return }
         if usesMultipleSources { if !matches.isEmpty { onMatchesToPanel?(matches) }; return }
         guard providerResults.isEmpty, !results.isEmpty else { return }
         onSendToPanel(results)
@@ -1131,22 +1234,22 @@ final class SearchWindow: NSWindowController, NSWindowDelegate, NSTableViewDataS
         modeChanged(); archiveModeChanged()
         startButton.isEnabled = !isWorkerRunning
         cancelButton.isEnabled = isSearching && (sourceOpeningCancellation.map { !$0.isCancelled } ?? (providerCancellation.map { !$0.isCancelled } ?? (cancellation?.isCancelled == false)))
-        revealButton.isEnabled = selectedResult != nil
-        viewButton.isEnabled = selectedResult != nil
-        editButton.isEnabled = selectedResult != nil
-        sendButton.isEnabled = providerSource == nil && providerResults.isEmpty && !results.isEmpty
+        let actionsAvailable = revealAfterCleanup == nil && sourceOpeningCancellation == nil
+        revealButton.isEnabled = actionsAvailable && selectedResult != nil
+        viewButton.isEnabled = revealButton.isEnabled
+        editButton.isEnabled = revealButton.isEnabled
+        sendButton.isEnabled = actionsAvailable && providerSource == nil && providerResults.isEmpty && !results.isEmpty
         if providerSource != nil || selectedProviderResult != nil {
-            revealButton.isEnabled = !isWorkerRunning && selectedProviderResult != nil
-            let regular = selectedProviderResult.map { !$0.isDirectory && !$0.isSymbolicLink } ?? false
+            revealButton.isEnabled = actionsAvailable && selectedProviderResult != nil
+            let regular = actionsAvailable && selectedProviderResult.map { !$0.isDirectory && !$0.isSymbolicLink } == true
             viewButton.isEnabled = !isWorkerRunning && regular
             editButton.isEnabled = !isWorkerRunning && regular && selectedProviderResult.map { canEdit($0) } == true
         }
         if usesMultipleSources {
-            sendButton.isEnabled = !matches.isEmpty
-            revealButton.isEnabled = !isWorkerRunning && selectedMatch != nil
-            let regular = selectedMatch.map { !$0.isDirectory && !$0.isSymbolicLink } ?? false
-            viewButton.isEnabled = !isWorkerRunning && regular
-            editButton.isEnabled = !isWorkerRunning && regular && selectedMatch?.canEdit == true
+            sendButton.isEnabled = actionsAvailable && !matches.isEmpty
+            revealButton.isEnabled = actionsAvailable && selectedMatch != nil
+            viewButton.isEnabled = selectedMatch.map { canOpen($0, editable: false) } == true
+            editButton.isEnabled = selectedMatch.map { canOpen($0, editable: true) } == true
             editSourceButton.isEnabled = !isWorkerRunning && sourceRows.indices.contains(sourceTable.selectedRow)
             removeSourceButton.isEnabled = editSourceButton.isEnabled
             for row in sourceRows.indices {
