@@ -1840,12 +1840,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.makeKeyAndOrderFront(nil); active.focus()
         NSApp.activate(ignoringOtherApps: true)
         let deadline = Date().addingTimeInterval(5)
-        while (!NSApp.isActive || !window.isKeyWindow) && Date() < deadline {
+        // Activation also invokes applicationDidBecomeActive, which refreshes
+        // local panels asynchronously. Keyboard focus alone is not readiness.
+        repeat {
             try await Task.sleep(nanoseconds: 20_000_000)
             if NSApp.isActive { window.makeKeyAndOrderFront(nil); active.focus() }
-        }
-        guard NSApp.isActive, window.isKeyWindow else {
-            throw PanelSessionError("Smoke main window did not become active: app=\(NSApp.isActive), key=\(window.isKeyWindow)")
+        } while (!NSApp.isActive || !window.isKeyWindow || left.loading || right.loading) && Date() < deadline
+        guard NSApp.isActive, window.isKeyWindow, !left.loading, !right.loading else {
+            throw PanelSessionError("Smoke main window not ready: app=\(NSApp.isActive), key=\(window.isKeyWindow), leftLoading=\(left.loading), rightLoading=\(right.loading)")
         }
     }
 
@@ -1895,9 +1897,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             applyInterfacePreferences()
             try require(NSApp.mainMenu?.items.contains(where: { $0.title == "Файлы" }) == true, "Russian main menu restored")
             activate(left); window.makeKeyAndOrderFront(nil); left.focus()
+            // Deterministically cover refresh triggered by application activation.
+            applicationDidBecomeActive(Notification(name: NSApplication.didBecomeActiveNotification))
             try await focusMainWindowForSmoke()
-            try require(NSApp.isActive && window.isKeyWindow && window.firstResponder === left.table,
-                        "Main window is active and its file table owns keyboard focus before macro execution")
+            try require(NSApp.isActive && window.isKeyWindow && window.firstResponder === left.table && !left.loading && !right.loading,
+                        "Main window owns keyboard focus and activation-triggered panel refresh finishes before macro execution")
             try CommandWorkspace.shared.macros.startRecording()
             try CommandWorkspace.shared.macros.execute("panel.markAll", in: .panel)
             let macro = try CommandWorkspace.shared.macros.stopRecording(name: "smoke")
