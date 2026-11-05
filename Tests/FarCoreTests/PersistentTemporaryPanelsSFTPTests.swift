@@ -3,8 +3,9 @@ import Testing
 @testable import FarCore
 
 /// Exercises the saved descriptor against real SFTP packets and two SSH jump hosts.
-/// Uses the same Paramiko fixture and FAR_TEST_PYTHON setup as the SFTP integration suite.
-@Suite struct PersistentTemporaryPanelsSFTPTests {
+/// Share the serialized SSH suite: its cleanup checks cover the global namespace
+/// of authentication helpers, which this restoration test also creates.
+extension SFTPPasswordTests {
     @Test func nativeSFTPRestoreUsesOriginalConfigurationAndRejectsChangedEntry() throws {
         let fixture = try JumpSSHFixture()
         defer { fixture.stop() }
