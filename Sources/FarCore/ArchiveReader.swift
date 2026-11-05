@@ -311,13 +311,30 @@ public final class ArchiveNavigationFrame: @unchecked Sendable {
 /// The directory and all working copies are deleted on cleanup or deinitialization.
 public final class ArchiveWorkspace: @unchecked Sendable {
     public let rootURL: URL
+    private let device: dev_t
+    private let inode: ino_t
     private let lock = NSLock()
     private var removed = false
     fileprivate init() throws {
-        let template = FileManager.default.temporaryDirectory.appendingPathComponent("far-archive-XXXXXXXX").path
+        let parent = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        let template = parent.appendingPathComponent("far-archive-XXXXXXXX").path
         var bytes = Array(template.utf8CString)
-        guard let result = mkdtemp(&bytes) else { throw ArchiveError.io("Не удалось создать рабочую папку.") }
-        rootURL = URL(fileURLWithPath: String(cString: result), isDirectory: true)
+        // mkdtemp returns a pointer into the supplied buffer. Copy the string
+        // while that buffer is borrowed; a returned pointer must not escape it.
+        let path = bytes.withUnsafeMutableBufferPointer { buffer -> String? in
+            guard let base = buffer.baseAddress, mkdtemp(base) != nil else { return nil }
+            return String(cString: base)
+        }
+        guard let path, path.hasPrefix("/"), path.hasPrefix(String(template.dropLast(8))),
+              path.utf8.count == template.utf8.count else {
+            throw ArchiveError.io("Не удалось создать приватную рабочую папку.")
+        }
+        var info = stat()
+        guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR, info.st_uid == getuid() else {
+            throw ArchiveError.io("Рабочая папка изменилась во время создания.")
+        }
+        rootURL = URL(fileURLWithPath: path, isDirectory: true)
+        device = info.st_dev; inode = info.st_ino
     }
     public func url(for path: String) throws -> URL {
         guard let safe = try ArchivePath.validate(path, directory: false, limits: .default) else { throw ArchiveError.invalidPath(path) }
@@ -327,6 +344,9 @@ public final class ArchiveWorkspace: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard !removed else { return }
         removed = true
+        var info = stat()
+        guard lstat(rootURL.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR,
+              info.st_dev == device, info.st_ino == inode, info.st_uid == getuid() else { return }
         try? FileManager.default.removeItem(at: rootURL)
     }
     deinit { cleanup() }

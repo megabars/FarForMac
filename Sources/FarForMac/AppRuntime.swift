@@ -40,7 +40,11 @@ enum AppRuntime {
         var success = error == nil
         do {
             guard let smokeReport else { throw NSError(domain: "Smoke", code: 1) }
-            try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: smokeReport, options: .atomic)
+            let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+            // Keep the diagnostic even if the filesystem under the report path
+            // becomes unavailable. CI captures stdout independently of this file.
+            FileHandle.standardOutput.write(data + Data("\n".utf8))
+            try data.write(to: smokeReport, options: .atomic)
         } catch { fputs("UI smoke report failed: \(error)\n", stderr); success = false }
         AppPreferences.cleanSmokeDomain()
         if let smokeStateDirectory { try? FileManager.default.removeItem(at: smokeStateDirectory) }

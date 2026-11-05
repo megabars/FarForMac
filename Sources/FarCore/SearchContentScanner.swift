@@ -182,10 +182,18 @@ enum SearchContentScanner {
         if cancellation.isCancelled { throw ViewerError.cancelled }
         try document.source.verifyUnchanged()
         if literal { return first }
+        let range = NSRange(location: 0, length: (text as NSString).length)
         let budget = MatchingTimeBudget(seconds: 0.05)
-        var match: NSRange?, timedOut = false, failed = false
+        var match: NSRange?, timedOut = false, failed = false, progressCount = 0
         expression.enumerateMatches(in: text, options: [.reportProgress, .reportCompletion],
-                                    range: NSRange(location: 0, length: (text as NSString).length)) { result, flags, stop in
+                                    range: range) { result, flags, stop in
+            // ICU can report progress on every character. Avoid spending the
+            // search budget on thousands of locks and clock syscalls; results,
+            // errors and completion still always pass the checks below.
+            if result == nil, flags == .progress {
+                progressCount &+= 1
+                if progressCount & 15 != 0 { return }
+            }
             if cancellation.isCancelled { stop.pointee = true }
             else if budget.expired { timedOut = true; stop.pointee = true }
             else if flags.contains(.internalError) { failed = true; stop.pointee = true }

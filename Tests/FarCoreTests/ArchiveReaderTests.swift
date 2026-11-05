@@ -92,6 +92,43 @@ final class ArchiveReaderTests {
         }
     }
 
+    @Test func workspaceOwnsAnAbsoluteTemporaryDirectoryAcrossRepeatedExtraction() throws {
+        let snapshot = try ArchiveReader.open(fixture([]))
+        let parent = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        let currentDirectory = FileManager.default.currentDirectoryPath
+        for _ in 0..<32 {
+            let workspace = try ArchiveReader.extract(snapshot)
+            let path = workspace.rootURL
+            #expect(path.path != currentDirectory)
+            #expect(path.deletingLastPathComponent().resolvingSymlinksInPath() == parent)
+            #expect(path.lastPathComponent.hasPrefix("far-archive-"))
+            workspace.cleanup()
+            #expect(!FileManager.default.fileExists(atPath: path.path))
+            #expect(FileManager.default.fileExists(atPath: currentDirectory))
+        }
+    }
+
+    @Test func workspaceCleanupDoesNotRemoveAReplacementDirectoryOrSymlink() throws {
+        let snapshot = try ArchiveReader.open(fixture([]))
+        for replacementIsLink in [false, true] {
+            let workspace = try ArchiveReader.extract(snapshot)
+            let owned = workspace.rootURL
+            let moved = root.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.moveItem(at: owned, to: moved)
+            defer { try? FileManager.default.removeItem(at: owned) }
+            if replacementIsLink {
+                try FileManager.default.createSymbolicLink(at: owned, withDestinationURL: moved)
+            } else {
+                try FileManager.default.createDirectory(at: owned, withIntermediateDirectories: false)
+            }
+            let marker = owned.appendingPathComponent("keep.txt")
+            try Data("preserve".utf8).write(to: marker)
+            workspace.cleanup()
+            #expect(try Data(contentsOf: marker) == Data("preserve".utf8))
+            #expect(FileManager.default.fileExists(atPath: moved.path))
+        }
+    }
+
     @Test func rejectsTraversalAbsoluteWindowsPathsAndAmbiguousHierarchy() throws {
         for format in [ArchiveFormat.zip, .tar] {
             for path in ["../escape", "/absolute", "a/../../escape", "a//b", "C:/escape", "a\\b", "a/./b"] {
