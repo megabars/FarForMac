@@ -1835,6 +1835,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             else { panel.invalidateUnavailableVolume(panel.directory) }
         }
     }
+    private func focusMainWindowForSmoke() async throws {
+        guard AppRuntime.isSmoke else { throw PanelSessionError("Missing smoke scope") }
+        window.makeKeyAndOrderFront(nil); active.focus()
+        NSApp.activate(ignoringOtherApps: true)
+        let deadline = Date().addingTimeInterval(5)
+        while (!NSApp.isActive || !window.isKeyWindow) && Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            if NSApp.isActive { window.makeKeyAndOrderFront(nil); active.focus() }
+        }
+        guard NSApp.isActive, window.isKeyWindow else {
+            throw PanelSessionError("Smoke main window did not become active: app=\(NSApp.isActive), key=\(window.isKeyWindow)")
+        }
+    }
+
     private func runUISmoke() async {
         var checks: [String] = []
         func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
@@ -1845,7 +1859,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let deadline = Date().addingTimeInterval(20)
             while (left.loading || right.loading) && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
             try require(!left.loading && !right.loading, "Both panels finish loading")
-            try require(left.directory == AppRuntime.smokeDirectory && right.directory == AppRuntime.smokeDirectory, "Panels use isolated fixtures")
+            let expectedFixturePath = AppRuntime.smokeDirectory?.resolvingSymlinksInPath().path
+            try require(left.directory.resolvingSymlinksInPath().path == expectedFixturePath &&
+                        right.directory.resolvingSymlinksInPath().path == expectedFixturePath,
+                        "Panels use isolated fixtures (left=\(left.directory.path), right=\(right.directory.path), expected=\(expectedFixturePath ?? "nil"))")
             try require(left.table.numberOfRows == 3 && right.table.numberOfRows == 3, "Real table views contain the expected files")
             try require(window.contentView != nil && NSApp.mainMenu != nil, "Main window and command menu constructed")
             try require(CommandWorkspace.shared.registry.descriptor(for: "panel.markAll") != nil, "Stable commands registered")
@@ -1878,12 +1895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             applyInterfacePreferences()
             try require(NSApp.mainMenu?.items.contains(where: { $0.title == "Файлы" }) == true, "Russian main menu restored")
             activate(left); window.makeKeyAndOrderFront(nil); left.focus()
-            NSApp.activate(ignoringOtherApps: true)
-            let activationDeadline = Date().addingTimeInterval(5)
-            while (!NSApp.isActive || !window.isKeyWindow) && Date() < activationDeadline {
-                try await Task.sleep(nanoseconds: 20_000_000)
-                if NSApp.isActive { window.makeKeyAndOrderFront(nil); left.focus() }
-            }
+            try await focusMainWindowForSmoke()
             try require(NSApp.isActive && window.isKeyWindow && window.firstResponder === left.table,
                         "Main window is active and its file table owns keyboard focus before macro execution")
             try CommandWorkspace.shared.macros.startRecording()
@@ -1939,6 +1951,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                         "Switching both former shared views and reopening the slot does not resurrect removed references")
             activate(left)
             checks += try await runVolumeToolsMenuUISmokeChecks()
+            try await focusMainWindowForSmoke()
             checks += try runFarMainMenuUISmokeChecks()
             checks += try await runTemporaryDestinationUISmokeChecks()
             checks += try TemporaryPanelsWindow.runUISmokeChecks()
@@ -2081,8 +2094,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             throw PanelSessionError("Host shared slots did not open offline")
         }
         activate(left); window.makeKeyAndOrderFront(nil); left.focus()
+        try await focusMainWindowForSmoke()
         let menu = menuCommand("Общие временные панели · 0–9", "temporarySlots")
-        guard validateMenuItem(menu) else { throw PanelSessionError("Common slot menu unavailable on a virtual panel") }
+        guard validateMenuItem(menu) else { throw PanelSessionError("Common slot menu unavailable: key=\(window.isKeyWindow), sheet=\(window.attachedSheet != nil), busy=\(busy), loading=\(left.loading), mode=\(left.contentMode), virtual=\(left.isVirtual)") }
         // Supply a real session provider; restore must match it exactly and avoid credentials.
         lastVirtualResults = matches
         var restored: [SearchMatch]?

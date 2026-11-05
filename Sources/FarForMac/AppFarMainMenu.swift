@@ -242,7 +242,8 @@ extension AppDelegate {
         right.setContentMode(.files)
         activate(right); right.focus()
         showCommandMenu()
-        try require(farMainMenu.selectedSection == .right && !farMainMenu.isExpanded, "F9 did not start at the right active panel")
+        try require(farMainMenu.selectedSection == .right && !farMainMenu.isExpanded,
+                    "F9 did not start on right: presented=\(farMainMenu.isPresented), section=\(farMainMenu.selectedSection), activeRight=\(active === right), key=\(window.isKeyWindow), modal=\(NSApp.modalWindow != nil), sheet=\(window.attachedSheet != nil)")
         try press(53)
         activate(left); left.focus()
         let responder = window.firstResponder
