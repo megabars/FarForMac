@@ -45,7 +45,7 @@ import Testing
         // Pass the path as an argv value; no shell interpolation of fixture paths.
         // Closing stdout/stderr must not let a process escape group ownership.
         let helperOutput = closesOutput ? " >/dev/null 2>&1" : ""
-        let helper = "(i=0; while [ \"$i\" -lt 100 ]; do printf x >> \"$1\"; i=$((i+1)); sleep 0.03; done)" + helperOutput + " & "
+        let helper = "(i=0; while [ -d \"${1%/*}\" ] && [ \"$i\" -lt 1000 ]; do printf x >> \"$1\"; i=$((i+1)); sleep 0.03; done)" + helperOutput + " & "
         let response = "printf '%s' '{\"apiVersion\":1,\"kind\":\"command\",\"title\":\"Done\",\"text\":\"OK\",\"rows\":[]}'"
         for ending in ["success", "timeout", "cancel", "oversize", "malformed"] {
             let marker = directory.appendingPathComponent("orphan-" + ending)
@@ -55,13 +55,16 @@ import Testing
             case "success": body = response
             case "oversize": body = "while :; do printf 1234567890; done"
             case "malformed": body = "printf invalid"
-            default: body = "sleep 5"
+            default: body = "while :; do sleep 1; done"
             }
             let awaitHelper = "while [ ! -s \"$1\" ]; do sleep 0.005; done; "
             let descriptor = ExtensionDescriptor(id: "children", title: "Children", kind: .command,
                 executableURL: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", helper + awaitHelper + body, "extension-test", marker.path])
             if ending == "cancel" {
-                DispatchQueue.global().async {
+                // This synchronous suite shares the global pool with hundreds
+                // of tests. Give cancellation its own thread so a blocked pool
+                // cannot turn the fixture into a normal exit before cancellation.
+                Thread.detachNewThread {
                     let deadline = ProcessInfo.processInfo.systemUptime + 5
                     while ((try? Data(contentsOf: marker))?.isEmpty ?? true), ProcessInfo.processInfo.systemUptime < deadline {
                         Thread.sleep(forTimeInterval: 0.001)
