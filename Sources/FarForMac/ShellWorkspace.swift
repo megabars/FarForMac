@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import FarCore
 
 /// Commands may use isolated processes or an explicitly enabled managed zsh.
@@ -29,6 +30,12 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     private var promptActive = false
     private var pendingPromptClears = 0
     private var awaitingTypedCommand = false
+    private enum CommandPhase { case entering, busy, continuation }
+    private var commandPhase: CommandPhase = .entering
+    private var managedInterrupt: Task<Void, Never>?
+    private var inputAfterInterrupt: [Data] = []
+    private var inputAfterInterruptBytes = 0
+    private var smokeShellTrace: [String] = []
     private var shellDirectory: URL?
     private var pendingCommand: String?
     private var preparedRunning: PreparedUserCommand?
@@ -175,8 +182,9 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     }
     private func start(command: String?, directory: URL) throws {
         let id = UUID(); sessionID = id
+        cancelManagedInterrupt()
         integration?.cleanup(); integration = nil; shellReady = false; shellDirectory = nil; terminalDraft = false; awaitingInitialPrompt = false
-        promptActive = false; pendingPromptClears = 0; awaitingTypedCommand = false
+        promptActive = false; pendingPromptClears = 0; awaitingTypedCommand = false; commandPhase = .entering
         let configuration: TerminalSession.Configuration
         if persistentMode.state == .on {
             let bridge = try PersistentShellIntegration(); integration = bridge; awaitingInitialPrompt = true
@@ -191,6 +199,7 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
             guard let self, self.sessionID == id else { return }; self.receive(data)
         }, onExit: { [weak self] result in
             guard let self, self.sessionID == id else { return }
+            self.cancelManagedInterrupt()
             self.input.isEnabled = true; self.persistentMode.isEnabled = true
             self.shellReady = false; self.pendingCommand = nil; self.shellDirectory = nil
             self.promptActive = false; self.pendingPromptClears = 0; self.awaitingTypedCommand = false; self.terminalDraft = false
@@ -210,13 +219,16 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     private func receive(_ data: Data) {
         if let integration {
             for state in integration.consume(data) {
+                traceShellStateForSmoke(state.clearedDraft ? "cleared" : state.ready ? "ready" : state.continuation ? "continuation" : "busy")
                 if state.clearedDraft {
                     guard pendingPromptClears > 0 else { continue }
                     pendingPromptClears -= 1
                 }
                 if state.ready {
                     awaitingInitialPrompt = false
-                    if !state.clearedDraft { awaitingTypedCommand = false }
+                    if !state.clearedDraft { awaitingTypedCommand = false; commandPhase = .entering }
+                } else {
+                    commandPhase = state.continuation ? .continuation : .busy
                 }
                 promptActive = state.ready && !awaitingTypedCommand
                 shellReady = promptActive && !terminalDraft && pendingPromptClears == 0
@@ -236,6 +248,7 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
                     terminalStatus.stringValue = L10n.text("Есть ввод в терминале · Ctrl+C — очистить строку и включить командную строку")
                 }
             }
+            if promptActive, managedInterrupt != nil { finishManagedInterrupt() }
         }
         screen.append(data)
         let responses = screen.takeResponses()
@@ -269,20 +282,33 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         guard isRunning else { return }
         if integration != nil {
             guard !awaitingInitialPrompt else { NSSound.beep(); return }
-            if data == Data([3]), promptActive { interrupt(); return }
-            if data == Data([3]) { pendingPromptClears = 0 }
+            if data == Data([3]) {
+                let foreground = session?.foregroundProcessGroup
+                if promptActive || managedInterrupt != nil || commandPhase != .busy || foreground == nil
+                    || (foreground == session?.processID && session?.interruptKeyIsInput != true) {
+                    interrupt(); return
+                }
+                pendingPromptClears = 0
+            }
+            if managedInterrupt != nil {
+                guard data.count <= 1_048_576 - inputAfterInterruptBytes else { report(TerminalSession.SessionError.inputBufferFull.localizedDescription); return }
+                inputAfterInterrupt.append(data)
+                inputAfterInterruptBytes += data.count
+                return
+            }
             let paste = data.starts(with: Data("\u{1b}[200~".utf8))
+            let entered = !paste && data.contains(where: { $0 == 13 || $0 == 10 })
             if promptActive {
                 // Only a standalone Enter ends a known prompt draft. A paste
                 // containing newlines can leave unread text after a program.
                 terminalDraft = paste || !(data == Data([13]) || data == Data([10]))
-                if !paste && data.contains(where: { $0 == 13 || $0 == 10 }) {
-                    promptActive = false; awaitingTypedCommand = true
-                }
             } else {
                 // Foreground programs need not read input. Keep the bar blocked
                 // on return until Ctrl+C explicitly clears possible typeahead.
                 terminalDraft = true
+            }
+            if entered && (promptActive || commandPhase == .continuation) {
+                promptActive = false; awaitingTypedCommand = true; commandPhase = .entering
             }
             shellReady = false; input.isEnabled = false; panelToShell.isEnabled = false; shellToPanel.isEnabled = false
         }
@@ -291,7 +317,7 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     private func submitPersistent(_ command: String) throws {
         guard shellReady else { throw TerminalSession.SessionError.notRunning }
         try session?.sendToForegroundShell(PersistentShellIntegration.submission(command))
-        promptActive = false
+        promptActive = false; awaitingTypedCommand = true; commandPhase = .entering
         shellReady = false; input.isEnabled = false; panelToShell.isEnabled = false; shellToPanel.isEnabled = false
         showTerminal(); focusTerminal()
     }
@@ -309,24 +335,88 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         navigate(directory)
     }
     @objc private func interrupt() {
-        let editingPrompt = integration != nil && promptActive
-        terminalDraft = false
         do {
             // Clear through ZLE in input order; SIGINT may flush queued bytes.
-            if editingPrompt {
+            if integration == nil {
+                try session?.interrupt()
+            } else if promptActive {
+                terminalDraft = false
                 shellReady = false; input.isEnabled = false
                 panelToShell.isEnabled = false; shellToPanel.isEnabled = false
                 pendingPromptClears += 1
-                try session?.send(PersistentShellIntegration.clearDraftInput)
-            }
-            else {
+                do { try session?.send(PersistentShellIntegration.clearDraftInput) }
+                catch { pendingPromptClears -= 1; throw error }
+            } else if !awaitingInitialPrompt {
+                if managedInterrupt != nil {
+                    inputAfterInterrupt.removeAll(); inputAfterInterruptBytes = 0
+                    return
+                }
                 pendingPromptClears = 0
-                try session?.interrupt()
+                traceShellStateForSmoke("interrupt requested")
+                managedInterrupt = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.waitToInterruptManagedShell()
+                }
             }
         } catch { report(error.localizedDescription) }
     }
+    private func waitToInterruptManagedShell() async {
+        let started = ProcessInfo.processInfo.systemUptime
+        var handoffStarted: TimeInterval?
+        var shellSignalled: TimeInterval?
+        var shellSignals = 0
+        defer { if !Task.isCancelled { finishManagedInterrupt() } }
+        do {
+            while !Task.isCancelled, isRunning, !promptActive {
+                let now = ProcessInfo.processInfo.systemUptime
+                guard now - started < 3 else { throw TerminalSession.SessionError.system("interrupt terminal", ETIMEDOUT) }
+                if commandPhase != .entering, handoffStarted == nil { handoffStarted = now }
+                // preexec precedes job control handoff. Give external jobs time
+                // to take the PTY, while still allowing shell builtins and PS2
+                // input to be interrupted when zsh remains the foreground group.
+                let handoffElapsed = handoffStarted.map { now - $0 >= 0.04 } == true
+                // A quoted Enter can stay inside ZLE without emitting a frame.
+                let unconfirmedEditor = commandPhase == .entering
+                let editorSettled = unconfirmedEditor && now - (shellSignalled ?? started) >= 0.25
+                let allowShell = (shellSignals == 0 && handoffElapsed) || (shellSignals < 2 && editorSettled)
+                if let target = try session?.interruptForeground(allowShell: allowShell) {
+                    terminalDraft = false
+                    traceShellStateForSmoke(target == .job ? "SIGINT job" : "SIGINT shell")
+                    if target == .job {
+                        // Prefer to replay in the new prompt. A job that handles
+                        // SIGINT may stay active, so release its input after a bound.
+                        try await Task.sleep(nanoseconds: 250_000_000)
+                        return
+                    }
+                    shellSignalled = now
+                    shellSignals += 1
+                }
+                // The job may acquire the PTY just after the shell was signalled.
+                // Keep any subsequent input out of reach of a possible second flush.
+                if let shellSignalled, now - shellSignalled >= 0.25, !unconfirmedEditor || shellSignals == 2 { return }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+        } catch is CancellationError {
+        } catch { report(error.localizedDescription) }
+    }
+    private func finishManagedInterrupt() {
+        let queued = inputAfterInterrupt
+        cancelManagedInterrupt()
+        if promptActive && terminalDraft { interrupt() }
+        for data in queued { send(data) }
+    }
+    private func cancelManagedInterrupt() {
+        managedInterrupt?.cancel(); managedInterrupt = nil
+        inputAfterInterrupt.removeAll(); inputAfterInterruptBytes = 0
+    }
+    private func traceShellStateForSmoke(_ event: String) {
+        guard AppRuntime.isSmoke else { return }
+        if smokeShellTrace.count == 24 { smokeShellTrace.removeFirst() }
+        smokeShellTrace.append("\(event) shell=\(session?.processID ?? -1) fg=\(session?.foregroundProcessGroup ?? -1)")
+    }
     @objc private func stop() { session?.stop() }
     func stopForExit() {
+        cancelManagedInterrupt()
         configWindow?.finalizeClose()
         for terminal in separateTerminals { terminal.workspace?.stopForExit() }
         session?.forceStop(); integration?.cleanup(); pendingCommand = nil
@@ -579,65 +669,95 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         }, navigate: { navigation = $0 }, openFile: { _, _ in }, showTerminal: {}, togglePanels: {}, refreshPanels: {}, report: { messages.append($0) })
         defer { workspace.stopForExit() }
         workspace.persistentMode.state = .on; workspace.updateDirectory()
-        func wait(_ condition: () -> Bool) async throws {
+        func wait(_ step: String, _ condition: () -> Bool) async throws {
             let deadline = Date().addingTimeInterval(5)
             while !condition() {
-                guard Date() < deadline else { throw NetworkError.io("Managed shell UI did not reach expected state: " + messages.joined(separator: "; ") + "\n" + workspace.screen.plainText) }
+                guard Date() < deadline else {
+                    let state = "ready=\(workspace.shellReady), prompt=\(workspace.promptActive), draft=\(workspace.terminalDraft), awaitingEnter=\(workspace.awaitingTypedCommand), clears=\(workspace.pendingPromptClears), interrupt=\(workspace.managedInterrupt != nil)"
+                    let detail = (messages + workspace.smokeShellTrace).joined(separator: "; ")
+                    throw NetworkError.io("Managed shell UI did not reach \(step) (\(state)): \(detail)\n" + workspace.screen.plainText)
+                }
                 try await Task.sleep(nanoseconds: 10_000_000)
             }
         }
         guard workspace.execute("export FAR_UI_SMOKE_VALUE=retained; cd -- " + (try ShellCommand.quoteArgument(child.path)), directory: root) else { throw NetworkError.io("Could not start managed shell") }
-        try await wait { workspace.shellReady }
+        try await wait("prompt after initial command") { workspace.shellReady }
         guard navigation == nil, workspace.shellDirectory?.resolvingSymlinksInPath() == child.resolvingSymlinksInPath(), workspace.input.isEnabled,
               workspace.input.placeholderString == L10n.text("Команда в папке shell · Enter — выполнить · Tab — путь") else { throw NetworkError.io("Shell cwd must not move panels automatically") }
         workspace.previewCommand("printf '%s' {name}", title: "fixture", source: "smoke")
         guard messages.count == 1 else { throw NetworkError.io("Menu command must refuse a different shell directory") }
         workspace.useShellDirectory()
         guard navigation?.resolvingSymlinksInPath() == child.resolvingSymlinksInPath() else { throw NetworkError.io("Explicit shell-to-panel navigation failed") }
-        workspace.usePanelDirectory(); try await wait { workspace.shellReady }
+        workspace.usePanelDirectory(); try await wait("prompt after panel directory sync") { workspace.shellReady }
         guard workspace.shellDirectory?.resolvingSymlinksInPath() == root.resolvingSymlinksInPath() else { throw NetworkError.io("Explicit panel-to-shell cd failed") }
         workspace.send(Data("printf partial".utf8))
         guard !workspace.input.isEnabled, !workspace.panelToShell.isEnabled else { throw NetworkError.io("Partial terminal input must disable command-bar submissions") }
-        workspace.interrupt(); try await wait { workspace.shellReady }
+        workspace.interrupt(); try await wait("prompt after clearing partial input") { workspace.shellReady }
         workspace.send(Data("first draft".utf8)); workspace.interrupt()
         workspace.send(Data("new draft".utf8))
-        try await wait { workspace.pendingPromptClears == 0 && workspace.promptActive }
+        try await wait("ordered clear acknowledgement") { workspace.pendingPromptClears == 0 && workspace.promptActive }
         guard !workspace.input.isEnabled else { throw NetworkError.io("Clear acknowledgement must not unlock a newly typed draft") }
-        workspace.interrupt(); try await wait { workspace.shellReady }
+        workspace.interrupt(); try await wait("prompt after clearing the second draft") { workspace.shellReady }
         workspace.send(Data("draft".utf8)); workspace.interrupt()
         workspace.send(Data("/bin/sleep 30\r".utf8)); workspace.interrupt()
-        try await wait { workspace.shellReady }
+        try await wait("prompt after rapid Enter and interrupt button") { workspace.shellReady }
         guard workspace.pendingPromptClears == 0 else { throw NetworkError.io("Interrupt after Enter must invalidate queued clear acknowledgements") }
+        workspace.send(Data("draft".utf8)); workspace.interrupt()
+        workspace.send(Data("/bin/sleep 30\r".utf8)); workspace.send(Data([3]))
+        workspace.send(Data("discard this draft".utf8)); workspace.send(Data([3]))
+        workspace.send(Data("printf 'INTERRUPT_DRAFT:%s\\n' kept".utf8))
+        try await wait("editable prompt after rapid keyboard interrupt") { workspace.promptActive && workspace.managedInterrupt == nil }
+        guard !workspace.input.isEnabled else { throw NetworkError.io("The draft typed after Ctrl+C must keep command-bar submissions blocked") }
+        workspace.send(Data([13]))
+        try await wait("execution of the draft typed after Ctrl+C") { workspace.shellReady }
+        guard workspace.screen.plainText.contains("INTERRUPT_DRAFT:kept") else { throw NetworkError.io("The draft typed after Ctrl+C was lost") }
+        workspace.send(Data("printf 'unfinished\r".utf8)); workspace.send(Data([3]))
+        try await wait("prompt after interrupting a continuation") { workspace.shellReady }
+        workspace.send(Data("draft".utf8)); workspace.send(Data([22])); workspace.send(Data([13])); workspace.send(Data([3]))
+        try await wait("prompt after interrupting quoted Enter") { workspace.shellReady }
+        guard workspace.execute("printf 'BUILTIN_%s\\n' WAITING; read farformac_value", directory: root) else { throw NetworkError.io("Shell builtin rejected") }
+        try await wait("running shell builtin") { workspace.screen.plainText.contains("BUILTIN_WAITING") }
+        workspace.interrupt(); try await wait("prompt after interrupting a shell builtin") { workspace.shellReady }
+        let rawScript = "stty raw -echo; printf 'RAW_%s_READY\\n' BYTE; value=$(/usr/bin/od -An -tu1 -N1 | /usr/bin/tr -d '[:space:]'); stty sane; printf 'RAW_BYTE:%s\\n' \"$value\""
+        guard workspace.execute("unsetopt monitor; /bin/sh -c " + (try ShellCommand.quoteArgument(rawScript)) + "; setopt monitor", directory: root) else {
+            throw NetworkError.io("Raw terminal fixture rejected")
+        }
+        try await wait("raw program sharing shell process group") { workspace.screen.plainText.contains("RAW_BYTE_READY") }
+        guard workspace.session?.foregroundProcessGroup == workspace.session?.processID,
+              workspace.session?.interruptKeyIsInput == true else { throw NetworkError.io("Raw fixture did not share the shell group") }
+        workspace.send(Data([3]))
+        try await wait("raw program receiving Ctrl+C as a byte") { workspace.promptActive && workspace.screen.plainText.contains("RAW_BYTE:3") }
+        workspace.interrupt(); try await wait("prompt after raw input") { workspace.shellReady }
         guard workspace.execute("printf 'VALUE:%s\\n' \"$FAR_UI_SMOKE_VALUE\"", directory: root) else { throw NetworkError.io("Second command rejected") }
-        try await wait { workspace.shellReady }
+        try await wait("prompt after reading persistent value") { workspace.shellReady }
         guard workspace.screen.plainText.contains("VALUE:retained") else { throw NetworkError.io("Managed shell did not preserve variable: " + workspace.screen.plainText) }
         guard workspace.execute("/bin/sh -c 'printf \"CHILD_%s_READY\\n\" RUNNING; exec /bin/cat'", directory: root) else { throw NetworkError.io("Foreground program rejected") }
-        try await wait { workspace.screen.plainText.contains("CHILD_RUNNING_READY") }
+        try await wait("foreground child start") { workspace.screen.plainText.contains("CHILD_RUNNING_READY") }
         workspace.send(Data("foreground input".utf8))
         guard !workspace.promptActive else { throw NetworkError.io("Foreground program must be interrupted, not sent a ZLE widget") }
-        workspace.interrupt(); try await wait { workspace.shellReady }
+        workspace.interrupt(); try await wait("prompt after foreground child interrupt") { workspace.shellReady }
         guard workspace.execute("/bin/sh -c 'printf \"SLEEP_%s_READY\\n\" INPUT; /bin/sleep 0.3'", directory: root) else { throw NetworkError.io("Sleep rejected") }
-        try await wait { workspace.screen.plainText.contains("SLEEP_INPUT_READY") }
+        try await wait("foreground sleep start") { workspace.screen.plainText.contains("SLEEP_INPUT_READY") }
         workspace.send(Data("unconsumed input".utf8))
-        try await wait { workspace.promptActive }
+        try await wait("prompt after foreground sleep with unread input") { workspace.promptActive }
         guard !workspace.input.isEnabled else { throw NetworkError.io("Unread foreground input must block command bar after normal exit") }
-        workspace.interrupt(); try await wait { workspace.shellReady }
+        workspace.interrupt(); try await wait("prompt after clearing foreground typeahead") { workspace.shellReady }
         workspace.send(Data("/bin/sleep 0.2\npartial".utf8))
-        try await wait { workspace.promptActive }
+        try await wait("prompt after unbracketed multiline paste") { workspace.promptActive }
         guard !workspace.input.isEnabled else { throw NetworkError.io("Unbracketed multiline paste must preserve unread tail protection") }
-        workspace.interrupt(); try await wait { workspace.shellReady }
+        workspace.interrupt(); try await wait("prompt after clearing the pasted tail") { workspace.shellReady }
         guard workspace.execute("exit", directory: root) else { throw NetworkError.io("Shell exit rejected") }
-        try await wait { workspace.integration == nil && !workspace.isRunning }
+        try await wait("shell exit") { workspace.integration == nil && !workspace.isRunning }
         guard workspace.shellDirectory == nil, workspace.persistentMode.isEnabled else { throw NetworkError.io("Shell exit must clear cwd and reenable mode") }
         guard workspace.execute("printf 'NEW:%s\\n' \"${FAR_UI_SMOKE_VALUE-unset}\"", directory: root) else { throw NetworkError.io("New shell rejected") }
-        try await wait { workspace.shellReady }
+        try await wait("prompt in a fresh shell") { workspace.shellReady }
         guard workspace.screen.plainText.contains("NEW:unset") else { throw NetworkError.io("New shell leaked old state") }
         let prepared = try UserCommandExpander.prepare("cat {list}", context: workspace.context())
         let listURL = prepared.listFiles["list"]!
         guard workspace.executePrepared(prepared, directory: root), FileManager.default.fileExists(atPath: listURL.path) else {
             throw NetworkError.io("Prepared command must retain list files while running")
         }
-        try await wait { workspace.shellReady }
+        try await wait("prompt after command with prepared list files") { workspace.shellReady }
         guard workspace.screen.plainText.contains("fixture.txt"), !FileManager.default.fileExists(atPath: listURL.path), workspace.preparedRunning == nil else {
             throw NetworkError.io("Prepared list file must survive command execution and be cleaned at the next shell prompt")
         }
@@ -647,7 +767,7 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         guard FileManager.default.fileExists(atPath: draftURL.path) else { throw NetworkError.io("Inserted list command lost its resources") }
         workspace.setCommand("printf replacement")
         guard !FileManager.default.fileExists(atPath: draftURL.path) else { throw NetworkError.io("Replacing an inserted command must clean unused list files") }
-        return ["List files survive managed shell execution and are removed at prompt; replacing a draft releases its files", "Managed shell command bar preserves state without implicit panel navigation", "Shell directory sync is explicit and menu commands reject directory mismatch", "Partial terminal input blocks command bar and Ctrl+C restores prompt", "Shell exit clears cwd and a new session starts without old variables"] + (try await runMenuSmoke(in: root))
+        return ["List files survive managed shell execution and are removed at prompt; replacing a draft releases its files", "Managed shell command bar preserves state without implicit panel navigation", "Shell directory sync is explicit and menu commands reject directory mismatch", "Partial terminal input blocks command bar and Ctrl+C restores prompt", "Rapid and repeated Ctrl+C preserve new input through job handoff, continuation and quoted Enter", "Raw programs sharing the shell group receive the Ctrl+C byte", "Shell exit clears cwd and a new session starts without old variables"] + (try await runMenuSmoke(in: root))
     }
 
     private static func runMenuSmoke(in root: URL) async throws -> [String] {

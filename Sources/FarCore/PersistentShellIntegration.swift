@@ -8,6 +8,7 @@ public final class PersistentShellIntegration {
         public let directory: URL?
         public let exitCode: Int?
         public let clearedDraft: Bool
+        public let continuation: Bool
     }
     public let directory: URL
     /// An ordered ZLE widget, rather than a terminal-driver signal which can
@@ -36,7 +37,11 @@ public final class PersistentShellIntegration {
               builtin printf -v _farformac_prompt_state '\\033]777;farformac;\(token);ready;%s;%s\\007' "$farmac_result" "$farmac_directory"
             }
             function _farformac_line_init() {
-              [[ "$CONTEXT" == start && -z "$BUFFER" ]] && builtin printf '%s' "$_farformac_prompt_state"
+              if [[ "$CONTEXT" == start && -z "$BUFFER" ]]; then
+                builtin printf '%s' "$_farformac_prompt_state"
+              elif [[ "$CONTEXT" == cont ]]; then
+                builtin printf '\\033]777;farformac;\(token);continuation\\007'
+              fi
             }
             zle -N zle-line-init _farformac_line_init
             function _farformac_clear_draft() {
@@ -98,11 +103,13 @@ public final class PersistentShellIntegration {
         guard let text = String(data: data, encoding: .utf8) else { return nil }
         let parts = text.split(separator: ";", omittingEmptySubsequences: false)
         guard parts.count >= 4, parts[0] == "777", parts[1] == "farformac", parts[2] == token else { return nil }
-        if parts.count == 4, parts[3] == "busy" { return .init(ready: false, directory: nil, exitCode: nil, clearedDraft: false) }
+        if parts.count == 4, parts[3] == "busy" || parts[3] == "continuation" {
+            return .init(ready: false, directory: nil, exitCode: nil, clearedDraft: false, continuation: parts[3] == "continuation")
+        }
         guard parts.count == 6, parts[3] == "ready" || parts[3] == "cleared", let status = Int(parts[4]), (0...255).contains(status),
               let bytes = Data(base64Encoded: String(parts[5])), bytes.count <= 8192,
               let path = String(data: bytes, encoding: .utf8), path.hasPrefix("/"), !path.contains("\0") else { return nil }
-        return .init(ready: true, directory: URL(fileURLWithPath: path), exitCode: status, clearedDraft: parts[3] == "cleared")
+        return .init(ready: true, directory: URL(fileURLWithPath: path), exitCode: status, clearedDraft: parts[3] == "cleared", continuation: false)
     }
     public func cleanup() { try? FileManager.default.removeItem(at: directory) }
     deinit { cleanup() }

@@ -18,7 +18,7 @@ cleanup() {
 }
 trap cleanup EXIT
 # This is a whole-suite watchdog, not an individual operation deadline.
-# Keep room for all 179 checks on the slower hosted Intel runner; each
+# Keep room for the complete suite on the slower hosted Intel runner; each
 # asynchronous scenario retains its own readiness/error timeout.
 for ((i=0; i<120; i++)); do
     if ! kill -0 "$PID" 2>/dev/null; then break; fi

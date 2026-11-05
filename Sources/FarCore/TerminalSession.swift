@@ -73,6 +73,19 @@ public final class TerminalSession: @unchecked Sendable {
 
     public var isRunning: Bool { synchronized { pid != nil } }
     public var processID: Int32? { synchronized { pid } }
+    public var foregroundProcessGroup: Int32? {
+        synchronized {
+            guard descriptor >= 0 else { return nil }
+            let foreground = tcgetpgrp(descriptor)
+            return foreground > 1 ? foreground : nil
+        }
+    }
+    public var interruptKeyIsInput: Bool {
+        synchronized {
+            var settings = termios()
+            return descriptor >= 0 && tcgetattr(descriptor, &settings) == 0 && settings.c_lflag & tcflag_t(ISIG) == 0
+        }
+    }
 
     public func start() throws {
         try synchronized {
@@ -180,18 +193,32 @@ public final class TerminalSession: @unchecked Sendable {
 
     /// Send SIGINT only to the PTY's current foreground process group.
     public func interrupt() throws {
+        guard try interruptForeground(allowShell: true) != nil else {
+            throw SessionError.system("terminal foreground process", ESRCH)
+        }
+    }
+
+    public enum InterruptTarget: Equatable { case shell, job }
+
+    /// With `allowShell` disabled, leave both input queues untouched until a job owns the PTY.
+    public func interruptForeground(allowShell: Bool) throws -> InterruptTarget? {
         try synchronized {
             guard let child = pid, descriptor >= 0 else { throw SessionError.notRunning }
             let foreground = tcgetpgrp(descriptor)
-            guard foreground > 1, foreground != getpgrp(), getsid(foreground) == child else {
-                throw SessionError.system("terminal foreground process", ESRCH)
-            }
+            // A pipeline can retain its foreground group after its group leader exits.
+            guard foreground > 1, foreground != getpgrp(), tcgetsid(descriptor) == child,
+                  allowShell || foreground != child else { return nil }
             // A program may never read its stdin. Do not hand its queued text
             // to the shell after interruption (including our unwritten buffer).
             input.removeAll()
             writer?.cancel(); writer = nil
             guard tcflush(descriptor, TCIFLUSH) == 0 else { throw error("flush terminal input") }
-            guard kill(-foreground, SIGINT) == 0 else { throw error("interrupt terminal") }
+            guard tcgetpgrp(descriptor) == foreground else { return nil }
+            if kill(-foreground, SIGINT) != 0 {
+                if errno == ESRCH { return nil }
+                throw error("interrupt terminal")
+            }
+            return foreground == child ? .shell : .job
         }
     }
 

@@ -20,6 +20,9 @@ struct PersistentShellTests {
         #expect(bridge.consume(Data(frame.replacingOccurrences(of: bridge.token, with: "other-session").utf8)).isEmpty)
         #expect(bridge.consume(Data(("\u{1b}]" + String(repeating: "x", count: 20_000) + "\u{7}").utf8)).isEmpty)
         #expect(bridge.consume(Data("\u{1b}]777;farformac;\(bridge.token);busy\u{1b}\\".utf8)).first?.ready == false)
+        let continuation = bridge.consume(Data("\u{1b}]777;farformac;\(bridge.token);continuation\u{7}".utf8)).first
+        #expect(continuation?.continuation == true)
+        #expect(continuation?.ready == false)
         #expect(bridge.consume(Data(frame.utf8)).count == 1)
         #expect(bridge.consume(Data(frame.replacingOccurrences(of: ";ready;", with: ";cleared;").utf8)).first?.clearedDraft == true)
         #expect(throws: (any Error).self) { try PersistentShellIntegration.submission("bad\0command") }
@@ -88,6 +91,30 @@ struct PersistentShellTests {
         #expect(fixture.waitReady(4))
     }
 
+    @Test func foregroundOnlyInterruptPreservesDraftAndReachesPipelineAfterLeaderExit() throws {
+        let fixture = try ManagedShellFixture()
+        defer { fixture.stop() }
+        try fixture.start()
+        try #require(fixture.waitReady(1))
+        try fixture.session.send("printf 'QUEUED_%s\\n' DRAFT")
+        #expect(try fixture.session.interruptForeground(allowShell: false) == nil)
+        try fixture.session.send("\r")
+        try #require(fixture.waitReady(2))
+        #expect(fixture.output.contains("QUEUED_DRAFT\r\n"))
+
+        try fixture.submit("/usr/bin/true | /bin/sh -c 'printf \"PIPELINE_%s\\n\" RUNNING; exec /bin/sleep 30'")
+        try #require(fixture.waitOutput("PIPELINE_RUNNING\r\n"))
+        let group = try #require(fixture.session.foregroundProcessGroup)
+        try #require(group != fixture.session.processID)
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        while getsid(group) != -1 && ProcessInfo.processInfo.systemUptime < deadline {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        try #require(getsid(group) == -1)
+        #expect(try fixture.session.interruptForeground(allowShell: false) == .job)
+        #expect(fixture.waitReady(3))
+    }
+
     @Test func privateStartupFilesAreRemovedAndDoNotUseUserHistory() throws {
         let bridge = try PersistentShellIntegration()
         let directory = bridge.directory
@@ -129,6 +156,7 @@ private final class ManagedShellFixture: @unchecked Sendable {
     var exit: TerminalSession.Exit? { lock.lock(); defer { lock.unlock() }; return result }
     func waitReady(_ count: Int) -> Bool { wait { self.states.filter(\.ready).count >= count } }
     func waitBusy() -> Bool { wait { self.states.last?.ready == false } }
+    func waitOutput(_ text: String) -> Bool { wait { String(decoding: self.bytes, as: UTF8.self).contains(text) } }
     func waitExit() -> Bool { wait { self.result != nil } }
     private func wait(_ predicate: () -> Bool) -> Bool {
         lock.lock(); defer { lock.unlock() }
