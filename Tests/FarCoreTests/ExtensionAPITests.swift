@@ -37,15 +37,18 @@ import Testing
             try ExtensionHost().invoke(descriptor, request: ExtensionRequest(kind: .command), cancellation: cancellation)
         }
     }
-    @Test func invocationOwnsInheritedHelpersAfterSuccessTimeoutAndCancellation() throws {
+    @Test(arguments: [false, true])
+    func invocationOwnsInheritedHelpersAfterSuccessTimeoutAndCancellation(closesOutput: Bool) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ExtensionChildren-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let marker = directory.appendingPathComponent("orphan")
         // Pass the path as an argv value; no shell interpolation of fixture paths.
-        let helper = "(i=0; while [ \"$i\" -lt 100 ]; do printf x >> \"$1\"; i=$((i+1)); sleep 0.03; done) & "
+        // Closing stdout/stderr must not let a process escape group ownership.
+        let helperOutput = closesOutput ? " >/dev/null 2>&1" : ""
+        let helper = "(i=0; while [ \"$i\" -lt 100 ]; do printf x >> \"$1\"; i=$((i+1)); sleep 0.03; done)" + helperOutput + " & "
         let response = "printf '%s' '{\"apiVersion\":1,\"kind\":\"command\",\"title\":\"Done\",\"text\":\"OK\",\"rows\":[]}'"
         for ending in ["success", "timeout", "cancel", "oversize", "malformed"] {
+            let marker = directory.appendingPathComponent("orphan-" + ending)
             let token = ExtensionCancellation()
             let body: String
             switch ending {
@@ -54,21 +57,34 @@ import Testing
             case "malformed": body = "printf invalid"
             default: body = "sleep 5"
             }
+            let awaitHelper = "while [ ! -s \"$1\" ]; do sleep 0.005; done; "
             let descriptor = ExtensionDescriptor(id: "children", title: "Children", kind: .command,
-                executableURL: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", helper + body, "extension-test", marker.path])
-            if ending == "cancel" { DispatchQueue.global().asyncAfter(deadline: .now() + 0.04) { token.cancel() } }
+                executableURL: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", helper + awaitHelper + body, "extension-test", marker.path])
+            if ending == "cancel" {
+                DispatchQueue.global().async {
+                    let deadline = ProcessInfo.processInfo.systemUptime + 5
+                    while ((try? Data(contentsOf: marker))?.isEmpty ?? true), ProcessInfo.processInfo.systemUptime < deadline {
+                        Thread.sleep(forTimeInterval: 0.001)
+                    }
+                    token.cancel()
+                }
+            }
             do {
-                let invocation = try ExtensionHost(timeout: ending == "timeout" ? 0.12 : 3, maximumBytes: 1024).invoke(descriptor, request: ExtensionRequest(kind: .command), cancellation: token)
+                let timeout: TimeInterval = ending == "timeout" ? 0.12 : (ending == "cancel" ? 10 : 3)
+                let invocation = try ExtensionHost(timeout: timeout, maximumBytes: 1024).invoke(descriptor, request: ExtensionRequest(kind: .command), cancellation: token)
                 #expect(ending == "success")
                 #expect(invocation.response.text == "OK")
             } catch {
                 #expect(ending != "success")
+                let expectedErrors = ["cancel": "Extension cancelled.", "timeout": "Extension timed out.",
+                                      "oversize": "Extension output exceeds the byte limit.", "malformed": "Malformed extension response JSON."]
+                if let expected = expectedErrors[ending] { #expect(error.localizedDescription == expected) }
             }
             let before = (try? Data(contentsOf: marker)) ?? Data()
+            if ending == "cancel" { #expect(!before.isEmpty, "Cancellation must exercise an already running helper") }
             Thread.sleep(forTimeInterval: 0.15)
             let after = (try? Data(contentsOf: marker)) ?? Data()
             #expect(after == before, "Inherited helper kept writing after \(ending)")
-            try? FileManager.default.removeItem(at: marker)
         }
     }
     @Test func bundledExamples() throws {

@@ -118,9 +118,6 @@ public struct ExtensionHost: Sendable {
                                            errors: errors.fileHandleForWriting.fileDescriptor)
         // Parent must release write ends so EOF is observable.
         try? output.fileHandleForWriting.close(); try? errors.fileHandleForWriting.close()
-        // Each invocation owns its process group. Cleanup also runs after success,
-        // so helpers cannot outlive a one-request extension session.
-        defer { process.finish() }
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         var stdout = Data(), stderr = Data(), totalBytes = 0
         func drain(_ handle: FileHandle, into data: inout Data) throws {
@@ -137,14 +134,21 @@ public struct ExtensionHost: Sendable {
                 if ProcessInfo.processInfo.systemUptime >= deadline { throw ExtensionAPIError("Extension timed out.") }
             }
         }
-        repeat {
-            if cancellation?.isCancelled == true { throw ExtensionAPIError("Extension cancelled.") }
-            try drain(output.fileHandleForReading, into: &stdout)
-            try drain(errors.fileHandleForReading, into: &stderr)
-            if try !process.isRunning() { break }
-            guard ProcessInfo.processInfo.systemUptime < deadline else { throw ExtensionAPIError("Extension timed out.") }
-            Thread.sleep(forTimeInterval: 0.005)
-        } while true
+        do {
+            repeat {
+                if cancellation?.isCancelled == true { throw ExtensionAPIError("Extension cancelled.") }
+                try drain(output.fileHandleForReading, into: &stdout)
+                try drain(errors.fileHandleForReading, into: &stderr)
+                if try !process.isRunning() { break }
+                guard ProcessInfo.processInfo.systemUptime < deadline else { throw ExtensionAPIError("Extension timed out.") }
+                Thread.sleep(forTimeInterval: 0.005)
+            } while true
+        } catch {
+            let invocationError = error
+            do { try process.finish() }
+            catch { throw ExtensionAPIError(invocationError.localizedDescription + " " + error.localizedDescription) }
+            throw invocationError
+        }
         try drain(output.fileHandleForReading, into: &stdout)
         try drain(errors.fileHandleForReading, into: &stderr)
         guard process.status == 0 else {
@@ -179,7 +183,7 @@ public struct ExtensionHost: Sendable {
 /// deliberately detached descendant can leave the group using setsid/setpgid.
 private final class ExtensionProcess {
     private let pid: pid_t
-    private var reaped = false
+    private var finished = false
     private(set) var status: Int32 = 0
     init(descriptor: ExtensionDescriptor, directory: URL, input: Int32, output: Int32, errors: Int32) throws {
         guard descriptor.executableURL.isFileURL, descriptor.executableURL.path.hasPrefix("/"),
@@ -221,24 +225,98 @@ private final class ExtensionProcess {
         pid = child
     }
     func isRunning() throws -> Bool {
-        if reaped { return false }
+        guard !finished else { return false }
+        if try !childHasExited() { return true }
+        try finish()
+        return false
+    }
+    private func childHasExited() throws -> Bool {
         while true {
             var info = siginfo_t()
             // Keep the group leader waitable until its group is killed. Reaping
             // first would permit PID/group-ID reuse before the cleanup signal.
             let result = waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
-            if result == 0, info.si_pid == 0 { return true }
-            if result == 0 { finish(); return false }
+            if result == 0 { return info.si_pid != 0 }
             if errno == EINTR { continue }
             throw ExtensionAPIError("Could not read extension process status (\(errno)).")
         }
     }
-    func finish() {
-        if reaped { return }
-        kill(-pid, SIGKILL)
+    func finish() throws {
+        guard !finished else { return }
+        defer { finished = true }
+        _ = kill(-pid, SIGKILL)
         // A direct child cannot escape reaping even if it changed its process group.
-        kill(pid, SIGKILL)
-        while waitpid(pid, &status, 0) < 0, errno == EINTR {}
-        reaped = true
+        _ = kill(pid, SIGKILL)
+        let termination = Result { try waitForTermination() }
+        let reaping = Result { try reapChild() }
+        try termination.get()
+        try reaping.get()
+    }
+    private func waitForTermination() throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        var members = [pid_t](repeating: 0, count: 32)
+        repeat {
+            let hasLiveMember = try groupHasLiveMember(&members)
+            // A helper can fork while the first group signal is being delivered.
+            // Signal again while the leader still reserves this group ID.
+            let signalError = kill(-pid, SIGKILL) == 0 ? 0 : errno
+            // Darwin can report EPERM when the group contains only zombies.
+            // A live member from the snapshot can exit before the signal.
+            let noSignalableMember = signalError == ESRCH || signalError == EPERM
+            if !hasLiveMember, noSignalableMember, try childHasExited() { return }
+            if signalError != 0, signalError != EINTR, !noSignalableMember {
+                throw ExtensionAPIError("Could not stop extension process group (\(signalError)).")
+            }
+            Thread.sleep(forTimeInterval: 0.005)
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        throw ExtensionAPIError("Extension process cleanup timed out.")
+    }
+    private func groupHasLiveMember(_ members: inout [pid_t]) throws -> Bool {
+        while true {
+            let (bytes, code) = members.withUnsafeMutableBytes { buffer in
+                errno = 0
+                let bytes = proc_listpids(UInt32(PROC_PGRP_ONLY), UInt32(pid), buffer.baseAddress, Int32(buffer.count))
+                return (Int(bytes), errno)
+            }
+            let stride = MemoryLayout<pid_t>.stride
+            guard bytes >= 0, bytes > 0 || code == 0, bytes % stride == 0, bytes <= members.count * stride else {
+                throw ExtensionAPIError("Could not list extension process group (\(code)).")
+            }
+            let count = bytes / stride
+            if count == members.count {
+                // A full buffer could omit members. Bound even this retry path.
+                guard count < 262_144 else { throw ExtensionAPIError("Extension process group is too large to inspect.") }
+                members.append(contentsOf: repeatElement(0, count: count))
+                continue
+            }
+            for member in members.prefix(count) {
+                var info = proc_bsdinfo()
+                let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+                errno = 0
+                let result = proc_pidinfo(member, PROC_PIDTBSDINFO, 0, &info, size)
+                if result == size {
+                    if info.pbi_pgid == UInt32(pid), info.pbi_status != UInt32(SZOMB) { return true }
+                } else if errno != ESRCH {
+                    throw ExtensionAPIError("Could not inspect extension process group member (\(errno)).")
+                }
+            }
+            return false
+        }
+    }
+    private func reapChild() throws {
+        var waited: pid_t
+        repeat { waited = waitpid(pid, &status, WNOHANG) } while waited == -1 && errno == EINTR
+        if waited == pid { return }
+        if waited == 0 {
+            // If termination could not be confirmed, still retain responsibility
+            // for reaping the direct child without blocking the caller indefinitely.
+            let child = pid
+            DispatchQueue.global().async {
+                var status: Int32 = 0
+                while waitpid(child, &status, 0) == -1, errno == EINTR {}
+            }
+            throw ExtensionAPIError("Extension process is still exiting.")
+        }
+        throw ExtensionAPIError("Could not reap extension process (\(errno)).")
     }
 }
