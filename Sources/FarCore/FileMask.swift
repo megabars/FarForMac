@@ -3,7 +3,7 @@ import Foundation
 /// FAR glob lists, quoted masks, named groups and explicit `/expression/imsx` regexes.
 /// Globs match the complete filename, case-insensitively; regexes search within it.
 /// Regex syntax is Foundation/ICU, rather than the complete FAR regex dialect.
-/// Runtime deadlines are cooperative: ICU's progress callbacks cannot promise hard real-time cancellation.
+/// CPU budgets are cooperative: ICU's progress callbacks cannot promise hard real-time cancellation.
 public struct FileMask: Sendable {
     private let includes: [Matcher]
     private let excludes: [Matcher]
@@ -95,12 +95,12 @@ public struct FileMask: Sendable {
     }
 
     private struct Deadline {
-        let end: TimeInterval
+        let budget: MatchingTimeBudget
         init(_ limit: TimeInterval) throws {
             guard limit.isFinite, limit > 0 else { throw MaskError("Время проверки маски должно быть положительным конечным числом.") }
-            end = ProcessInfo.processInfo.systemUptime + limit
+            budget = MatchingTimeBudget(seconds: limit)
         }
-        var expired: Bool { ProcessInfo.processInfo.systemUptime >= end }
+        var expired: Bool { budget.expired }
         func check() throws {
             if expired { throw MaskError("Превышено время проверки маски файлов.") }
         }

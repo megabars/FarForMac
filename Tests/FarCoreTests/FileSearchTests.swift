@@ -460,7 +460,9 @@ struct FileSearchTests {
             #expect(found.results.first?.lineNumber == 2)
             #expect(found.results.first?.snippet?.contains(needle) == true)
             options.contentMode = .regex; options.contentQuery = "(?m)^" + needle
-            #expect(collect(options).results.first?.lineNumber == 2)
+            let regexFound = collect(options)
+            #expect(regexFound.issues.isEmpty, "Encoding \(encoding.rawValue): \(regexFound.issues.map(\.message))")
+            #expect(regexFound.results.first?.lineNumber == 2, "Encoding \(encoding.rawValue)")
         }
         let bom = tree.url("bom.txt")
         try (Data([0xFF, 0xFE]) + #require("one\r\nПривет".data(using: .utf16LittleEndian))).write(to: bom)

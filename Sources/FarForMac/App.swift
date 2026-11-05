@@ -1878,6 +1878,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             applyInterfacePreferences()
             try require(NSApp.mainMenu?.items.contains(where: { $0.title == "Файлы" }) == true, "Russian main menu restored")
             activate(left); window.makeKeyAndOrderFront(nil); left.focus()
+            NSApp.activate(ignoringOtherApps: true)
+            let activationDeadline = Date().addingTimeInterval(5)
+            while (!NSApp.isActive || !window.isKeyWindow) && Date() < activationDeadline {
+                try await Task.sleep(nanoseconds: 20_000_000)
+                if NSApp.isActive { window.makeKeyAndOrderFront(nil); left.focus() }
+            }
+            try require(NSApp.isActive && window.isKeyWindow && window.firstResponder === left.table,
+                        "Main window is active and its file table owns keyboard focus before macro execution")
             try CommandWorkspace.shared.macros.startRecording()
             try CommandWorkspace.shared.macros.execute("panel.markAll", in: .panel)
             let macro = try CommandWorkspace.shared.macros.stopRecording(name: "smoke")

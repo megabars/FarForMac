@@ -182,18 +182,18 @@ enum SearchContentScanner {
         if cancellation.isCancelled { throw ViewerError.cancelled }
         try document.source.verifyUnchanged()
         if literal { return first }
-        let deadline = ProcessInfo.processInfo.systemUptime + 0.05
+        let budget = MatchingTimeBudget(seconds: 0.05)
         var match: NSRange?, timedOut = false, failed = false
         expression.enumerateMatches(in: text, options: [.reportProgress, .reportCompletion],
                                     range: NSRange(location: 0, length: (text as NSString).length)) { result, flags, stop in
             if cancellation.isCancelled { stop.pointee = true }
-            else if ProcessInfo.processInfo.systemUptime >= deadline { timedOut = true; stop.pointee = true }
+            else if budget.expired { timedOut = true; stop.pointee = true }
             else if flags.contains(.internalError) { failed = true; stop.pointee = true }
             else if let result { match = result.range; stop.pointee = true }
         }
         if cancellation.isCancelled { throw ViewerError.cancelled }
-        if timedOut || ProcessInfo.processInfo.systemUptime >= deadline {
-            throw Failure("Содержимое пропущено: превышено время проверки выражения (50 мс).")
+        if timedOut || budget.expired {
+            throw Failure("Содержимое пропущено: превышено процессорное время проверки выражения (50 мс).")
         }
         if failed { throw Failure("Содержимое пропущено: ошибка выполнения регулярного выражения.") }
         return match.map { describe(text, range: $0, baseLine: 1, previousCR: false) }
