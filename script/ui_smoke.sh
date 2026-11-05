@@ -17,11 +17,14 @@ cleanup() {
     rm -rf "$SMOKE_CWD"
 }
 trap cleanup EXIT
-for ((i=0; i<30; i++)); do
+# This is a whole-suite watchdog, not an individual operation deadline.
+# Keep room for all 179 checks on the slower hosted Intel runner; each
+# asynchronous scenario retains its own readiness/error timeout.
+for ((i=0; i<120; i++)); do
     if ! kill -0 "$PID" 2>/dev/null; then break; fi
     sleep 1
 done
-if kill -0 "$PID" 2>/dev/null; then echo 'UI smoke timed out after 30 seconds' >&2; exit 1; fi
+if kill -0 "$PID" 2>/dev/null; then echo 'UI smoke timed out after 120 seconds; see the last progress checkpoint above' >&2; exit 1; fi
 EXIT_STATUS=0
 wait "$PID" || EXIT_STATUS=$?
 if [[ ! -f "$SMOKE_CWD/.smoke-owned" ]]; then

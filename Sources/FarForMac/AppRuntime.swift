@@ -8,6 +8,7 @@ enum AppRuntime {
     static private(set) var smokeReport: URL?
     static private(set) var smokeDirectory: URL?
     static private(set) var smokeStateDirectory: URL?
+    private static var smokeStartedAt: TimeInterval = 0
     static var isSmoke: Bool { smokeReport != nil }
     static func configure() throws {
         let arguments = CommandLine.arguments
@@ -16,6 +17,8 @@ enum AppRuntime {
             throw NSError(domain: "Smoke", code: 2, userInfo: [NSLocalizedDescriptionKey: "--ui-smoke-report requires an absolute JSON output path"])
         }
         smokeReport = URL(fileURLWithPath: arguments[index + 1])
+        smokeStartedAt = ProcessInfo.processInfo.systemUptime
+        smokeProgress("Configuring isolated fixtures")
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("FarForMac-smoke-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         smokeStateDirectory = directory
@@ -28,7 +31,13 @@ enum AppRuntime {
     static var commandStore: UserCommandStore { UserCommandStore(globalURL: smokeStateDirectory?.appendingPathComponent("commands.json") ?? UserCommandStore.defaultGlobalURL) }
     static var recoveryStore: EditorRecoveryStore { EditorRecoveryStore(directory: smokeStateDirectory?.appendingPathComponent("Recovery")) }
     static var historyURL: URL { smokeStateDirectory?.appendingPathComponent("history.json") ?? CommandHistory.defaultFileURL }
+    static func smokeProgress(_ message: String) {
+        guard isSmoke else { return }
+        let elapsed = String(format: "%.3f", ProcessInfo.processInfo.systemUptime - smokeStartedAt)
+        FileHandle.standardOutput.write(Data("[UI smoke +\(elapsed)s] \(message)\n".utf8))
+    }
     static func finishSmoke(checks: [String], error: String? = nil) -> Never {
+        smokeProgress("Finished \(checks.count) checks: \(error == nil ? "passed" : "failed")")
         #if arch(arm64)
         let architecture = "arm64"
         #elseif arch(x86_64)
