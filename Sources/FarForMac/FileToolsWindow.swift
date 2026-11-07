@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import FarCore
 
 /// Independent tool windows retain themselves until closed; all filesystem work
@@ -203,9 +204,15 @@ final class FilePropertiesWindow: FileToolsWindowController {
     private let changePermissions = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let changeAccessed = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let changeModified = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let changeCreated = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let accessed = NSDatePicker()
     private let modified = NSDatePicker()
+    private let created = NSDatePicker()
+    private let hiddenFlag = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let noDumpFlag = NSPopUpButton(frame: .zero, pullsDown: false)
     private let ownership = NSTextField(wrappingLabelWithString: "")
+    private let changeOwner = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let ownerID = NSTextField(string: "")
     private let changeGroup = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let groupPicker = NSPopUpButton(frame: .zero, pullsDown: false)
     private var groups: [MetadataGroup] = []
@@ -215,43 +222,61 @@ final class FilePropertiesWindow: FileToolsWindowController {
     private var plan: MetadataMutationPlan?
     private var cancellation: FileToolCancellation?
     private var source: FileToolItem?
+    private var pendingACL: String?
+    private lazy var aclButton = button(metadataText("ACL…", "ACL…"), #selector(editACL))
+    private let aclStatus = NSTextField(labelWithString: "")
     private lazy var previewButton = button(metadataText("Предпросмотр изменений", "Preview changes"), #selector(makePreview))
     private lazy var saveButton = button(metadataText("Применить по предпросмотру…", "Apply reviewed changes…"), #selector(savePermissions))
     private lazy var cancelButton = button(L10n.text("Отмена"), #selector(cancelWork))
 
     init(url: URL, canMutate: @escaping () -> Bool = { true }, onComplete: @escaping () -> Void) {
         self.url = url; self.onComplete = onComplete; self.canMutate = canMutate
-        super.init(title: metadataText("Свойства — ", "Properties — ") + url.lastPathComponent, width: 840, height: 770)
-        window?.minSize = NSSize(width: 800, height: 750)
+        super.init(title: metadataText("Свойства — ", "Properties — ") + url.lastPathComponent, width: 840, height: 820)
+        window?.minSize = NSSize(width: 800, height: 790)
         details.isSelectable = true
         permissions.placeholderString = "0755"
         changePermissions.title = metadataText("Изменить POSIX-права (000–7777):", "Change POSIX permissions (000–7777):")
         changeAccessed.title = metadataText("Изменить дату доступа:", "Change access date:")
         changeModified.title = metadataText("Изменить дату изменения:", "Change modification date:")
+        changeCreated.title = metadataText("Изменить дату создания:", "Change creation date:")
         changeGroup.title = metadataText("Изменить группу:", "Change group:")
+        changeOwner.title = metadataText("Изменить UID:", "Change UID:")
+        ownerID.setAccessibilityLabel(metadataText("Номер нового владельца", "New owner ID"))
+        ownerID.widthAnchor.constraint(equalToConstant: 96).isActive = true
         ownership.isSelectable = true
         groupPicker.setAccessibilityLabel(metadataText("Группа текущего пользователя", "Current user group"))
         groupPicker.target = self; groupPicker.action = #selector(invalidatePreview)
         recursive.title = metadataText("Все выбранные изменения для вложенных файлов и папок", "Apply all selected changes to nested files and folders")
-        for picker in [accessed, modified] {
+        for picker in [accessed, modified, created] {
             picker.datePickerStyle = .textFieldAndStepper
             picker.datePickerElements = [.yearMonthDay, .hourMinuteSecond]
             picker.locale = .current; picker.timeZone = .current
         }
         accessed.setAccessibilityLabel(metadataText("Дата доступа, местное время", "Access date, local time"))
         modified.setAccessibilityLabel(metadataText("Дата изменения, местное время", "Modification date, local time"))
+        created.setAccessibilityLabel(metadataText("Дата создания, местное время", "Creation date, local time"))
         permissions.setAccessibilityLabel(metadataText("POSIX-права в восьмеричной форме", "Octal POSIX permissions"))
-        for checkbox in [changePermissions, changeAccessed, changeModified, changeGroup, recursive] { checkbox.target = self; checkbox.action = #selector(invalidatePreview) }
-        NotificationCenter.default.addObserver(self, selector: #selector(invalidatePreview), name: NSControl.textDidChangeNotification, object: permissions)
-        for picker in [accessed, modified] { picker.target = self; picker.action = #selector(invalidatePreview) }
+        for control in [changePermissions, changeAccessed, changeModified, changeCreated, changeGroup, changeOwner, recursive,
+                        accessed, modified, created, hiddenFlag, noDumpFlag] as [NSControl] {
+            control.target = self; control.action = #selector(invalidatePreview)
+        }
+        for field in [permissions, ownerID] {
+            NotificationCenter.default.addObserver(self, selector: #selector(invalidatePreview), name: NSControl.textDidChangeNotification, object: field)
+        }
+        for (picker, name) in [(hiddenFlag, metadataText("Скрытый", "Hidden")), (noDumpFlag, "NoDump")] {
+            picker.addItems(withTitles: [metadataText("Оставить", "Keep"), metadataText("Установить", "Set"), metadataText("Снять", "Clear")])
+            picker.setAccessibilityLabel(name)
+        }
         preview.isEditable = false; preview.isRichText = false; preview.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         preview.isVerticallyResizable = true; preview.autoresizingMask = [.width]; preview.textContainer?.widthTracksTextView = true
         let scroll = NSScrollView(); scroll.documentView = preview; scroll.hasVerticalScroller = true
-        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
-        let note = NSTextField(wrappingLabelWithString: metadataText("Время задаётся в текущем часовом поясе. Ссылки, специальные файлы и другие тома пропускаются. Метаданные общие для всех жёстких ссылок на файл. Группу можно менять только своим объектам на свою группу; смена группы может снять set-ID биты. Смена владельца требует повышенных прав и недоступна. ACL и даты создания/смены метаданных не редактируются. Отката нет.", "Dates use the current time zone. Links, special files and other volumes are skipped. Metadata affects all hard links to a file. Group changes require your own items and one of your groups; changing group may clear set-ID bits. Owner changes require elevated privileges and are unavailable. ACLs, creation and metadata-change dates are not edited. Changes cannot be rolled back."))
+        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 145).isActive = true
+        let note = NSTextField(wrappingLabelWithString: metadataText("Даты в местном времени. Ссылки, специальные файлы и другие тома пропускаются. Метаданные общие для всех жёстких ссылок. Смена UID доступна с правами root. Смена UID/GID может снять set-ID биты. ACL применяется к одному объекту.", "Dates use local time. Links, special files and other volumes are skipped. Metadata affects all hard links. Changing UID requires root. Changing UID/GID may clear set-ID bits. ACLs apply to one item."))
         saveButton.isEnabled = false; previewButton.isEnabled = false; cancelButton.isEnabled = false
-        content([details, ownership, row([changeGroup, groupPicker]), row([changePermissions, permissions]), row([changeAccessed, accessed]), row([changeModified, modified]), recursive,
-                 note, row([previewButton, saveButton, cancelButton]), scroll, status])
+        content([details, ownership, row([changeGroup, groupPicker, changeOwner, ownerID]), row([changePermissions, permissions]),
+                 row([changeAccessed, accessed]), row([changeModified, modified]), row([changeCreated, created]),
+                 row([label(metadataText("Скрытый", "Hidden"), size: 12), hiddenFlag, label("NoDump", size: 12), noDumpFlag, aclButton, aclStatus]),
+                 recursive, note, row([previewButton, saveButton, cancelButton]), scroll, status])
         setControlsEnabled(false)
         load()
     }
@@ -262,14 +287,15 @@ final class FilePropertiesWindow: FileToolsWindowController {
             case .success(let result):
                 let (item, owner, availableGroups) = result
                 source = item; ownershipSnapshot = owner; groups = availableGroups
-                ownership.stringValue = metadataText("Владелец (только чтение): ", "Owner (read only): ") + "\(owner.ownerName) (UID \(owner.ownerID)) · " + metadataText("Группа: ", "Group: ") + "\(owner.groupName) (GID \(owner.groupID))"
+                ownership.stringValue = metadataText("Владелец: ", "Owner: ") + "\(owner.ownerName) (UID \(owner.ownerID)) · " + metadataText("Группа: ", "Group: ") + "\(owner.groupName) (GID \(owner.groupID))"
+                ownerID.stringValue = String(owner.ownerID)
                 groupPicker.removeAllItems(); groupPicker.addItems(withTitles: groups.map(\.title))
                 groupPicker.selectItem(at: groups.firstIndex(where: { $0.id == owner.groupID }) ?? 0)
                 if !owner.isOwnedByCurrentUser { changeGroup.state = .off }
                 let type = item.isSymbolicLink ? metadataText("Символическая ссылка", "Symbolic link") : (item.isDirectory ? metadataText("Папка", "Folder") : metadataText("Файл", "File"))
-                details.stringValue = "\(item.url.path)\n\(type) · \(item.size) " + metadataText("байт", "bytes")
+                details.stringValue = "\(item.url.path)\n\(type) · \(item.size) " + metadataText("байт", "bytes") + " · BSD 0x" + String(item.flags, radix: 16)
                 permissions.stringValue = String(format: "%04o", Int(item.permissions))
-                accessed.dateValue = item.accessed; modified.dateValue = item.modified
+                accessed.dateValue = item.accessed; modified.dateValue = item.modified; created.dateValue = item.created
                 setControlsEnabled(!item.isSymbolicLink)
                 previewButton.isEnabled = !item.isSymbolicLink
                 if !item.isDirectory { recursive.state = .off; recursive.isEnabled = false }
@@ -280,16 +306,78 @@ final class FilePropertiesWindow: FileToolsWindowController {
         }
     }
     private func selectedChanges() throws -> MetadataChanges {
-        MetadataChanges(permissions: changePermissions.state == .on ? try FileTools.parsePermissions(permissions.stringValue) : nil,
+        var owner: UInt32?
+        if changeOwner.state == .on {
+            guard let uid = UInt32(ownerID.stringValue), uid < UInt32.max else { throw ExtensionAPIError(metadataText("Укажите числовой UID.", "Enter a numeric UID.")) }
+            owner = uid
+        }
+        func flag(_ picker: NSPopUpButton) -> Bool? { picker.indexOfSelectedItem == 0 ? nil : picker.indexOfSelectedItem == 1 }
+        return MetadataChanges(permissions: changePermissions.state == .on ? try FileTools.parsePermissions(permissions.stringValue) : nil,
                         accessed: changeAccessed.state == .on ? accessed.dateValue : nil,
                         modified: changeModified.state == .on ? modified.dateValue : nil,
-                        groupID: changeGroup.state == .on && groups.indices.contains(groupPicker.indexOfSelectedItem) ? groups[groupPicker.indexOfSelectedItem].id : nil)
+                        groupID: changeGroup.state == .on && groups.indices.contains(groupPicker.indexOfSelectedItem) ? groups[groupPicker.indexOfSelectedItem].id : nil,
+                        created: changeCreated.state == .on ? created.dateValue : nil, ownerID: owner,
+                        hidden: flag(hiddenFlag), noDump: flag(noDumpFlag), aclText: pendingACL)
     }
     private func setControlsEnabled(_ enabled: Bool) {
-        for control in [permissions, changePermissions, changeAccessed, changeModified, accessed, modified, recursive] as [NSControl] { control.isEnabled = enabled }
+        for control in [permissions, changePermissions, changeAccessed, changeModified, changeCreated,
+                        accessed, modified, created, hiddenFlag, noDumpFlag, aclButton] as [NSControl] { control.isEnabled = enabled }
         let canChangeGroup = enabled && ownershipSnapshot?.isOwnedByCurrentUser == true && !groups.isEmpty
         changeGroup.isEnabled = canChangeGroup; groupPicker.isEnabled = canChangeGroup
-        if source?.isDirectory != true { recursive.isEnabled = false }
+        changeOwner.isEnabled = enabled && geteuid() == 0; ownerID.isEnabled = changeOwner.isEnabled
+        recursive.isEnabled = enabled && source?.isDirectory == true && pendingACL == nil
+    }
+    @objc private func editACL() {
+        guard !isWorking, let window, window.attachedSheet == nil else { return }
+        isWorking = true
+        setControlsEnabled(false)
+        previewButton.isEnabled = false
+        worker({ try MetadataMutation.aclText(url: self.url) }) { [weak self] result in
+            guard let self else { return }
+            self.isWorking = false
+            self.setControlsEnabled(true)
+            self.previewButton.isEnabled = true
+            guard window.isVisible, window.attachedSheet == nil else { return }
+            switch result {
+            case .success(let text): self.presentACL(text, on: window)
+            case .failure(let error): self.status.stringValue = error.localizedDescription
+            }
+        }
+    }
+    private func presentACL(_ original: String, on parent: NSWindow) {
+        let alert = NSAlert()
+        alert.messageText = metadataText("Список управления доступом macOS", "macOS access control list")
+        alert.informativeText = metadataText("Текст ACL в формате macOS (!#acl). Пустой список удаляет ACL. Изменение вступит в силу после общего предпросмотра и подтверждения.", "Use macOS ACL text (!#acl). An empty list clears the ACL. The change takes effect after preview and confirmation.")
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 630, height: 220))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let editor = NSTextView(frame: scroll.bounds)
+        editor.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        editor.isRichText = false
+        editor.isAutomaticQuoteSubstitutionEnabled = false
+        editor.isAutomaticDashSubstitutionEnabled = false
+        editor.isVerticallyResizable = true
+        editor.autoresizingMask = [.width]
+        editor.textContainer?.widthTracksTextView = true
+        editor.setAccessibilityLabel(metadataText("Текст ACL", "ACL text"))
+        editor.string = pendingACL ?? original
+        scroll.documentView = editor
+        alert.accessoryView = scroll
+        alert.addButton(withTitle: metadataText("Выбрать изменение", "Review this change"))
+        alert.addButton(withTitle: L10n.text("Отмена")).keyEquivalent = "\u{1b}"
+        if pendingACL != nil { alert.addButton(withTitle: metadataText("Снять изменение ACL", "Discard the ACL change")) }
+        alert.beginSheetModal(for: parent) { [weak self] response in
+            guard let self, response == .alertFirstButtonReturn || response == .alertThirdButtonReturn else { return }
+            if response == .alertFirstButtonReturn, editor.string != original {
+                self.pendingACL = editor.string
+                self.recursive.state = .off
+            } else {
+                self.pendingACL = nil
+            }
+            self.aclStatus.stringValue = self.pendingACL == nil ? "" : metadataText("Выбрано изменение ACL", "ACL change selected")
+            self.setControlsEnabled(true)
+            self.invalidatePreview()
+        }
     }
     @objc private func invalidatePreview() {
         guard !isWorking else { return }
@@ -321,7 +409,23 @@ final class FilePropertiesWindow: FileToolsWindowController {
         if let value = plan.changes.permissions { lines.append(metadataText("Новые права для всех перечисленных объектов: ", "New permissions for every listed item: ") + String(format: "%04o", Int(value))) }
         if let date = plan.changes.accessed { lines.append(metadataText("Дата доступа всех перечисленных объектов: ", "Access date for every listed item: ") + date.formatted()) }
         if let date = plan.changes.modified { lines.append(metadataText("Дата изменения всех перечисленных объектов: ", "Modification date for every listed item: ") + date.formatted()) }
+        if let date = plan.changes.created { lines.append(metadataText("Дата создания всех перечисленных объектов: ", "Creation date for every listed item: ") + date.formatted()) }
         if let groupID = plan.changes.groupID { lines.append(metadataText("Новая группа всех перечисленных объектов (GID): ", "New group for every listed item (GID): ") + String(groupID)) }
+        if let ownerID = plan.changes.ownerID { lines.append(metadataText("Новый владелец (UID): ", "New owner (UID): ") + String(ownerID)) }
+        for (flag, name) in [(plan.changes.hidden, "UF_HIDDEN"), (plan.changes.noDump, "UF_NODUMP")] {
+            if let flag { lines.append(name + " · " + (flag ? metadataText("установить", "set") : metadataText("снять", "clear"))) }
+        }
+        if let acl = plan.changes.aclText {
+            lines.append(acl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                         ? metadataText("Очистить ACL.", "Clear the ACL.")
+                         : metadataText("Заменить ACL:", "Replace the ACL:"))
+            if limit > 6 {
+                lines.append(metadataText("Текущий ACL", "Current ACL"))
+                lines.append(plan.entries.first?.previousACLText ?? "")
+                lines.append(metadataText("Новый ACL", "New ACL"))
+                lines.append(acl)
+            }
+        }
         lines.append(metadataText("Пропущено: ссылки/спецфайлы/другие тома/повторные hardlink: ", "Skipped: links/special files/other volumes/duplicate hard links: ") + "\(plan.skippedSymbolicLinks)/\(plan.skippedSpecialFiles)/\(plan.skippedOtherVolumes)/\(plan.skippedDuplicateHardLinks)")
         if plan.entries.count > limit {
             lines.append(metadataText("Показаны первые ", "Showing the first ") + "\(limit)/\(plan.entries.count). " + metadataText("Применяется весь подготовленный план.", "The entire prepared plan will be applied."))
@@ -330,6 +434,8 @@ final class FilePropertiesWindow: FileToolsWindowController {
             var previous = String(format: "%04o", Int(entry.previousPermissions)) + " UID \(entry.previousOwnerID) GID \(entry.previousGroupID)"
             if plan.changes.accessed != nil { previous += " · " + metadataText("доступ ", "access ") + entry.previousAccessed.formatted() }
             if plan.changes.modified != nil { previous += " · " + metadataText("изменён ", "modified ") + entry.previousModified.formatted() }
+            if plan.changes.created != nil { previous += " · " + metadataText("создан ", "created ") + entry.previousCreated.formatted() }
+            if plan.changes.hidden != nil || plan.changes.noDump != nil { previous += " · BSD 0x" + String(entry.previousFlags, radix: 16) }
             return previous + "  " + entry.url.path
         }
         return lines.joined(separator: "\n")
@@ -360,6 +466,7 @@ final class FilePropertiesWindow: FileToolsWindowController {
         }) { [self] result in
             isWorking = false; hasPendingMutation = false
             cancellation = nil; self.plan = nil; cancelButton.isEnabled = false
+            pendingACL = nil; aclStatus.stringValue = ""
             setControlsEnabled(true); previewButton.isEnabled = true
             onComplete()
             switch result {

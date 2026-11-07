@@ -292,6 +292,24 @@ extension PanelView {
         panel.markAll()
         guard panel.selectedVirtualResults.count == 3 else { throw PanelSessionError("Virtual Select All lost marks") }
         panel.clearMarks()
+        panel.setSort(.selected)
+        do {
+            _ = try panel.luaMacroPanelCall("Panel.Select", [.integer(0), .integer(1), .integer(1), .integer(1)])
+            let marks = panel.virtualPanel?.markedResults.map(\.id) ?? []
+            guard marks.count == 1, let luaMark = marks.first else {
+                throw PanelSessionError("Lua Panel.Select must mark one virtual row")
+            }
+            _ = try panel.luaMacroPanelCall("Panel.Select", [.integer(0), .integer(2)])
+            let inverted = panel.virtualPanel?.markedResults.map(\.id) ?? []
+            guard inverted.count == 2, !inverted.contains(luaMark) else {
+                throw PanelSessionError("Lua Panel.Select invert must batch updates before re-sorting")
+            }
+            _ = try panel.luaMacroPanelCall("Panel.Select", [.integer(0), .integer(3)])
+            guard panel.virtualPanel?.markedResults.map(\.id) == [luaMark] else {
+                throw PanelSessionError("Lua Panel.Select restore confused mixed rows with the same name")
+            }
+        }
+        panel.clearMarks()
         try panel.applyMask("alpha.txt", mark: true)
         guard panel.selectedVirtualResults.count == 3 else { throw PanelSessionError("Virtual mask selection lost source duplicates") }
         panel.clearMarks()
@@ -315,7 +333,47 @@ extension PanelView {
         guard panel.filterField.stringValue == "directory-filter", mutationCounts == [3, 2] else { throw PanelSessionError("Virtual exit changed directory filter or result history") }
         return ["Mixed local/archive/network results occupy the actual panel with distinct typed identities and full origins",
                 "Virtual cursor marks masks filtering Enter and reference-only removal preserve underlying files",
+                "Lua Panel.Select inverts and restores mixed marks by identity before sorting",
                 "Virtual refresh/path/session guards prevent local operations or disk persistence",
                 "Panel exit restores directory filter and releases nested workspace/provider references"]
+    }
+}
+
+extension VirtualResultsPanelView {
+    var luaPanelProperties: FarLuaValue { luaPanel.properties }
+
+    func luaPanelCall(_ name: String, _ arguments: [FarLuaValue], left: Bool = false) throws -> [FarLuaValue] {
+        try luaPanel.call(name, arguments, left: left)
+    }
+
+    func luaApplyMarkChanges(_ changes: [FarLuaPanelMarkChange]) {
+        for (row, marked) in changes where visible.indices.contains(row) {
+            selection.setMarked([visible[row].id], marked: marked)
+        }
+        rebuild()
+    }
+
+    private var luaPanel: FarLuaBuiltinPanel {
+        let sort: Int?
+        switch options.sort {
+        case .name, .created, .accessed: sort = 2  // These cases share the view's name comparator.
+        case .extension: sort = 3
+        case .modified: sort = 4
+        case .size: sort = 7
+        case .selected: sort = nil
+        }
+        return FarLuaBuiltinPanel(table: table, active: active, path: "", fullPath: "", root: true,
+            format: nil, hostFile: nil, prefix: nil, sortMode: sort,
+            directoriesFirst: options.directoriesFirst, ascending: options.ascending,
+            selectedFirst: options.sort == .selected && options.ascending, filtered: !filter.isEmpty, parentRow: false,
+            markedRows: { [self] in visible.indices.filter { selection.markedIDs.contains(visible[$0].id) } },
+            item: { [self] row in
+                guard visible.indices.contains(row) else { return nil }
+                let item = visible[row]
+                return .init(name: item.name, directory: item.isDirectory, size: item.size, symbolicLink: item.isSymbolicLink,
+                             marked: selection.markedIDs.contains(item.id), origin: item.displayPath)
+            },
+            move: moveCursor(to:),
+            mark: luaApplyMarkChanges)
     }
 }

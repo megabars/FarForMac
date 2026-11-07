@@ -31,7 +31,8 @@ public enum SSHConfigurationError: LocalizedError, Equatable {
 /// Include accepts %%/%d/%u; HostName accepts %%/%h; IdentityFile accepts
 /// %%/%d/%h/%n/%p/%r/%u; ProxyJump accepts %%/%h/%n/%p/%r.
 ///
-/// Match and unrepresented routing/authentication/security directives fail closed.
+/// Match supports only all, host, originalhost, user and localuser in one pass.
+/// Other criteria and unrepresented routing/authentication/security directives fail closed.
 /// Multiple distinct IdentityFile values also fail, because OpenSSH accumulates
 /// them while a connection profile stores one key. Only presentation, session and
 /// keepalive hints in `ignoredHints` below may be omitted during import. System
@@ -129,7 +130,7 @@ public enum SSHConfiguration {
             guard !inheritProxyJump || !ancestors.contains(normalizedAlias) else { throw SSHConfigurationError.jumpCycle(alias) }
             guard ancestors.count <= 4 else { throw SSHConfigurationError.limitExceeded("не более четырёх SSH-шлюзов") }
             var options = Options()
-            try evaluate(file: url, alias: alias, options: &options, stack: [])
+            try evaluate(file: url, alias: alias, userOverride: username, options: &options, stack: [])
             for (name, requiredValue) in Self.fixedPolicy {
                 if let value = options.first[name], value.lowercased() != requiredValue {
                     throw SSHConfigurationError.unsupported("\(name)=\(value) не соответствует политике SFTP; поддерживается только \(requiredValue).")
@@ -181,7 +182,7 @@ public enum SSHConfiguration {
             return Resolved(host: endpoint, jumps: jumps, timeout: Double(timeout))
         }
 
-        func evaluate(file: URL, alias: String, options: inout Options, stack: [URL]) throws {
+        func evaluate(file: URL, alias: String, userOverride: String?, options: inout Options, stack: [URL]) throws {
             let canonical = file.standardizedFileURL.resolvingSymlinksInPath()
             guard !stack.contains(canonical) else { throw SSHConfigurationError.includeCycle(canonical.path) }
             guard stack.count < 8 else { throw SSHConfigurationError.limitExceeded("глубина Include не более 8") }
@@ -194,9 +195,10 @@ public enum SSHConfiguration {
                     active = matches(alias, patterns: directive.arguments)
                     continue
                 }
-                // Match starts a new section and cannot safely be skipped based
-                // on the preceding Host section. In particular, never run exec.
-                if directive.name == "match" { throw SSHConfigurationError.unsupported("Match (включая Match exec) не поддерживается; команды не выполнялись.") }
+                if directive.name == "match" {
+                    active = try evaluateMatch(directive, alias: alias, userOverride: userOverride, options: options)
+                    continue
+                }
                 guard active else { continue }
                 switch directive.name {
                 case "include":
@@ -204,7 +206,7 @@ public enum SSHConfiguration {
                     for argument in directive.arguments {
                         let path = try expandHome(expand(argument, values: ["d": home, "u": localUsername], context: "Include"))
                         for included in try includedFiles(path) {
-                            try evaluate(file: included, alias: alias, options: &options, stack: stack + [canonical])
+                            try evaluate(file: included, alias: alias, userOverride: userOverride, options: &options, stack: stack + [canonical])
                         }
                     }
                 case "hostname", "user", "port", "proxyjump", "connecttimeout", "identitiesonly":
@@ -223,6 +225,45 @@ public enum SSHConfiguration {
                     }
                 }
             }
+        }
+
+        func evaluateMatch(_ directive: Directive, alias: String, userOverride: String?, options: Options) throws -> Bool {
+            var tokens = directive.arguments.makeIterator()
+            guard let first = tokens.next() else { throw directive.malformed("Match требует условие.") }
+            let initial = first.lowercased()
+            if initial == "all" || initial == "!all" {
+                guard tokens.next() == nil else { throw directive.malformed("Match all должно быть единственным условием.") }
+                return initial == "all"
+            }
+            var current: String? = first
+            var active = true
+            while let token = current {
+                let fields = token.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                guard let firstField = fields.first, !firstField.isEmpty else { throw directive.malformed("Пустое условие Match.") }
+                let key = firstField.lowercased()
+                let negated = key.hasPrefix("!")
+                let name = negated ? String(key.dropFirst()) : key
+                let value: String
+                switch name {
+                case "host":
+                    value = try expand(options.first["hostname"] ?? alias, values: ["h": alias], context: "HostName")
+                case "originalhost": value = alias
+                case "user": value = userOverride ?? options.first["user"] ?? localUsername
+                case "localuser": value = localUsername
+                default:
+                    throw SSHConfigurationError.unsupported("Условие Match «\(name)» не поддерживается; команды не выполнялись.")
+                }
+                let argument = fields.count == 2 ? String(fields[1]) : tokens.next()
+                guard let argument, !argument.isEmpty else { throw directive.malformed("Match \(name) требует шаблон.") }
+                let patterns = argument.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+                guard patterns.allSatisfy({ !$0.isEmpty && $0 != "!" && !$0.contains(where: \.isWhitespace) }) else {
+                    throw directive.malformed("Match \(name) требует непустые шаблоны через запятую.")
+                }
+                let matched = matches(value, patterns: patterns, ignoreCase: name == "host" || name == "originalhost")
+                active = active && (matched != negated)
+                current = tokens.next()
+            }
+            return active
         }
 
         func read(_ file: URL) throws -> [Directive] {
@@ -335,12 +376,13 @@ public enum SSHConfiguration {
         }
     }
 
-    private static func matches(_ alias: String, patterns: [String]) -> Bool {
+    private static func matches(_ alias: String, patterns: [String], ignoreCase: Bool = true) -> Bool {
+        let text = ignoreCase ? alias.lowercased() : alias
         var positive = false
         for pattern in patterns {
             let negative = pattern.hasPrefix("!")
             let value = negative ? String(pattern.dropFirst()) : pattern
-            if wildcardMatch(alias.lowercased(), pattern: value.lowercased()) {
+            if wildcardMatch(text, pattern: ignoreCase ? value.lowercased() : value) {
                 if negative { return false }
                 positive = true
             }

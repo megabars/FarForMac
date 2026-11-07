@@ -102,7 +102,7 @@ extension AppDelegate {
             farItem("archiveCommands", "Архивные команды", "Archive commands", "Shift+F3"),
             nil,
             farCommand("properties", "Атрибуты файлов", "File attributes", "Ctrl+A", enabled: cursorOnly),
-            farItem("applyCommand", "Применить команду", "Apply command", "Ctrl+G"),
+            farAction("applyCommand", "Применить команду", "Apply command", "Ctrl+G", action: { [weak self] in self?.applyCommandToSelection() }),
             farCommand("fileDescription", "Описание файлов", "Describe files", "Ctrl+Z", enabled: cursorOnly),
             nil,
             farCommand("markMask", "Пометить группу", "Select group", "Num +"),
@@ -133,7 +133,7 @@ extension AppDelegate {
             farItem("folderShortcuts", "Ссылки на папки", "Folder shortcuts"),
             farItem("fileFilter", "Фильтр панели файлов", "File panel filter", "Ctrl+I"),
             nil,
-            farItem("pluginCommands", "Команды плагинов", "Plugin commands", "F11"),
+            farAction("pluginCommands", "Команды плагинов", "Plugin commands", "F11", action: { FarLuaPlugins.shared.showMenu() }),
             farItem("screens", "Список экранов", "Screens list", "F12"),
             farItem("tasks", "Список задач", "Task list", "Ctrl+W"),
             farItem("hotplug", "Список устройств", "Hotplug devices list")
@@ -147,12 +147,12 @@ extension AppDelegate {
             farItem("treeSettings", "Настройки дерева папок", "Tree settings"),
             farItem("interfaceSettings", "Настройки интерфейса", "Interface settings"),
             farItem("languages", "Языки", "Languages"),
-            farItem("plugins", "Параметры плагинов", "Plugins configuration"),
+            farAction("plugins", "Параметры плагинов", "Plugins configuration", action: { FarLuaPlugins.shared.showConfiguration() }),
             farItem("pluginManager", "Параметры менеджера плагинов", "Plugin manager settings"),
             farItem("dialogs", "Настройки диалогов", "Dialog settings"),
             farItem("menus", "Настройки меню", "Menu settings"),
-            farItem("commandLine", "Настройки командной строки", "Command line settings"),
-            farItem("autocomplete", "Настройки автодополнения", "AutoComplete settings"),
+            farCommand("commandLineSettings", "Настройки командной строки", "Command line settings", menuID: "commandLine"),
+            farAction("autocomplete", "Настройки автодополнения", "AutoComplete settings", action: { [weak self] in self?.luaShell.configureAutoCompletion() }),
             farItem("infoPanel", "Настройки панели информации", "InfoPanel settings"),
             farCommand("maskGroups", "Группы масок файлов", "Groups of file masks"),
             nil,
@@ -178,6 +178,12 @@ extension AppDelegate {
         MenuItem(id: id, title: farText(ru, en), shortcut: shortcut, checked: checked)
     }
 
+    private func farAction(_ id: String, _ ru: String, _ en: String, _ shortcut: String = "", action: @escaping () -> Void) -> MenuItem {
+        var item = farItem(id, ru, en, shortcut)
+        item.action = action
+        return item
+    }
+
     private func farCommand(_ id: String, _ ru: String, _ en: String, _ shortcut: String = "",
                             enabled: Bool = true, menuID: String? = nil) -> MenuItem {
         var row = farItem(menuID ?? id, ru, en, shortcut)
@@ -199,6 +205,7 @@ extension AppDelegate {
         switch active.resourceKind {
         case .localNetwork: supported = [4, 5, 8].contains(number)
         case .connections: supported = [4, 5, 7, 8].contains(number)
+        case .plugin: supported = true
         case .processes: supported = [3, 8].contains(number)
         case nil:
             if [5, 6].contains(number), passive.isResource {

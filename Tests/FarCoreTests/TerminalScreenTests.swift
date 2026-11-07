@@ -167,9 +167,9 @@ import Testing
         #expect(screen.lines[0] == "A BC")
         screen.append("\r\u{1b}[2J界界")
         screen.resize(columns: 3, rows: 1)
-        #expect(screen.lines[0] == "界")
+        #expect(screen.lines == ["界", "界"])
         screen.append("\r\u{1b}[C\u{1b}[K")
-        #expect(!screen.plainText.contains("界"))
+        #expect(screen.lines == ["界", " "])
         #expect(screen.cursorOffset <= screen.plainText.utf16.count)
     }
 
@@ -248,4 +248,97 @@ import Testing
         #expect(wider.lines.first == "ab界X")
         #expect(wider.cursorColumn == 5)
     }
+
+    @Test func restartingAnIsolatedProcessPreservesItsTranscriptWithoutLeakingModes() {
+        var screen = TerminalScreen(columns: 20, rows: 3)
+        screen.append("\u{1b}[31mfirst\u{1b}[?1049h\u{1b}[?1;2004h\u{1b}[?25lalt\u{1b}]2;incomplete")
+        screen.continueWithNewProcess()
+        screen.append("next")
+        #expect(screen.lines == ["first", "next", ""])
+        #expect(screen.styledRuns.first?.attributes.foreground == .indexed(1))
+        #expect(screen.styledRuns.last?.attributes.foreground == nil)
+        #expect(screen.title == nil && screen.cursorVisible)
+        #expect(!screen.applicationCursorKeys && !screen.bracketedPasteEnabled)
+    }
+    @Test func reflowKeepsExplicitLineBreaksWideGraphemesStylesAndBothCursors() {
+        var screen = TerminalScreen(columns: 5, rows: 6, scrollbackLimit: 8)
+        screen.append("abcd\u{1b}[31m界\u{1b}[0me\u{1b}7\r\nHARD")
+        #expect(screen.lines.prefix(3) == ["abcd", "界e", "HARD"])
+        screen.resize(columns: 9, rows: 6)
+        #expect(screen.lines.prefix(2) == ["abcd界e", "HARD"])
+        #expect(screen.cursorRow == 1 && screen.cursorColumn == 4)
+        screen.append("\u{1b}8+")
+        #expect(screen.lines.first == "abcd界e+")
+        #expect(screen.styledRuns.contains { $0.text == "界" && $0.attributes.foreground == .indexed(1) })
+        screen.append("\u{1b}[2;5H")
+        screen.resize(columns: 1, rows: 4)
+        screen.resize(columns: 9, rows: 6)
+        #expect(screen.lines.contains("abcd界e+"))
+        #expect(screen.lines.contains("HARD"))
+    }
+
+    @Test func reflowPreservesTrailingSpacesAndAClusterStillArrivingAcrossResize() {
+        var screen = TerminalScreen(columns: 4, rows: 3)
+        screen.append("A  Bc")
+        screen.resize(columns: 8, rows: 3)
+        #expect(screen.lines.first == "A  Bc")
+        screen.append("e")
+        screen.resize(columns: 5, rows: 3)
+        screen.append("\u{301}!")
+        #expect(screen.lines.prefix(2) == ["A  Bc", "e\u{301}!"])
+        #expect(screen.cursorRow == 1 && screen.cursorColumn == 2)
+    }
+
+    @Test func decOriginAutoWrapCharacterSetsInsertAndTabs() {
+        var screen = TerminalScreen(columns: 12, rows: 5)
+        screen.append("\u{1b}[2;4r\u{1b}[?6h\u{1b}[1;1H\u{1b}(0lqqk\u{1b}(B")
+        screen.append("\u{1b}[2;1H\u{1b})0\u{e}x\u{f}AA\u{1b}[2;2H\u{1b}[4hB\u{1b}[4l")
+        #expect(screen.lines[1] == "┌──┐")
+        #expect(screen.lines[2] == "│BAA")
+        screen.append("\u{1b}[99;12H\u{1b}[?7lXY\u{1b}[?6n\u{1b}[?7$p")
+        #expect(screen.lines[3].last == "Y")
+        #expect(screen.cursorRow == 3 && screen.cursorColumn == 11)
+        #expect(String(decoding: screen.takeResponses(), as: UTF8.self) == "\u{1b}[?3;12R\u{1b}[?7;2$y")
+        screen.append("\u{1b}[?6l\u{1b}[3g\u{1b}[1;6H\u{1b}H\r\tT")
+        #expect(screen.lines.first == "     T")
+    }
+
+    @Test func decAlternateModesPreserveOrClearSeparateBuffersAndSaveCursor() {
+        var screen = TerminalScreen(columns: 12, rows: 3)
+        screen.append("PRIMARY\u{1b}[2;3H\u{1b}[31m\u{1b}[?1048h")
+        screen.append("\u{1b}[?47h\u{1b}[HALT\u{1b}[?47l\u{1b}[?47h")
+        #expect(screen.isAlternateScreen)
+        #expect(screen.lines.first == "ALT")
+        screen.append("\u{1b}[?1047l\u{1b}[?47h")
+        #expect(screen.lines.first == "   ")
+        screen.append("\u{1b}[?47l\u{1b}[?1048lX")
+        #expect(screen.lines.prefix(2) == ["PRIMARY", "  X"])
+        screen.append("\u{1b}[?1049h\u{1b}[?1002;1006;1004hhidden")
+        screen.finishProcess()
+        #expect(!screen.isAlternateScreen)
+        #expect(!screen.focusReportingEnabled && screen.mouseReporting.tracking == .off)
+        #expect(screen.lines.prefix(2) == ["PRIMARY", "  X"])
+        #expect(screen.cursorRow == 1 && screen.cursorColumn == 3)
+    }
+
+    @Test func dynamicColorsReportsAndTitleStackAreBoundedTerminalState() {
+        var screen = TerminalScreen(columns: 10, rows: 3)
+        screen.append("\u{1b}]2;main\u{7}\u{1b}[22;2t\u{1b}]2;editor\u{7}\u{1b}[23;2t")
+        screen.append("\u{1b}]4;10;#f80;9;rgb:0/1234/ffff\u{1b}\\\u{1b}]10;#123;#ffffff;#aabbcc\u{7}")
+        #expect(screen.title == "main")
+        #expect(screen.palette[10] == .rgb(255, 136, 0))
+        #expect(screen.palette[9] == .rgb(0, 18, 255))
+        #expect(screen.defaultForeground == .rgb(17, 34, 51))
+        #expect(screen.defaultBackground == .rgb(255, 255, 255))
+        #expect(screen.cursorColor == .rgb(170, 187, 204))
+        screen.append("\u{1b}]4;10;?\u{7}\u{1b}]12;?\u{7}\u{1b}[5 q\u{1b}P$q q\u{1b}\\\u{1b}[18t")
+        #expect(screen.cursorShape == .blinkBar)
+        let replies = String(decoding: screen.takeResponses(), as: UTF8.self)
+        let st = "\u{1b}\\"
+        #expect(replies == "\u{1b}]4;10;rgb:ffff/8888/0000" + st + "\u{1b}]12;rgb:aaaa/bbbb/cccc" + st
+                + "\u{1b}P1$r5 q" + st + "\u{1b}[8;3;10t")
+        screen.append("\u{1b}]104\u{7}\u{1b}]110\u{7}\u{1b}]111\u{7}\u{1b}]112\u{7}")
+        #expect(screen.palette.isEmpty && screen.defaultForeground == nil && screen.defaultBackground == nil && screen.cursorColor == nil)
+    }
+
 }

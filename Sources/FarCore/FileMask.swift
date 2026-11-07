@@ -42,7 +42,16 @@ public struct FileMask: Sendable {
         return result
     }
 
+    /// A matching glob returns an empty dictionary. Regex groups use FAR variable names.
+    func associationCaptures(_ name: String, timeLimit: TimeInterval = 0.01) throws -> [String: String]? {
+        try match(name, deadline: Deadline(timeLimit), capture: true)
+    }
+
     private func matches(_ name: String, deadline: Deadline) throws -> Bool {
+        try match(name, deadline: deadline, capture: false) != nil
+    }
+
+    private func match(_ name: String, deadline: Deadline, capture: Bool) throws -> [String: String]? {
         try deadline.check()
         guard name.utf16.count <= Self.maximumNameLength else {
             throw MaskError("Имя файла превышает допустимую длину для проверки маски.")
@@ -50,15 +59,15 @@ public struct FileMask: Sendable {
         let normalized = name.precomposedStringWithCanonicalMapping
         // Fold only when a glob is actually evaluated; regex case sensitivity is explicit.
         var characters: [String]?
-        func matchesAny(_ matchers: [Matcher]) throws -> Bool {
+        func firstMatch(_ matchers: [Matcher], capturing: Bool) throws -> [String: String]? {
             for matcher in matchers {
                 try deadline.check()
                 switch matcher {
                 case .glob(let tokens):
                     if characters == nil { characters = normalized.map { Self.fold($0) } }
-                    if try Self.matches(tokens, characters!, deadline: deadline) { return true }
-                case .regex(let regex):
-                    var matched = false
+                    if try Self.matches(tokens, characters!, deadline: deadline) { return [:] }
+                case .regex(let regex, let namedGroups):
+                    var match: NSTextCheckingResult?
                     var timedOut = false
                     var internalError = false
                     regex.enumerateMatches(in: normalized, options: [.reportProgress, .reportCompletion],
@@ -69,29 +78,43 @@ public struct FileMask: Sendable {
                         } else if flags.contains(.internalError) {
                             internalError = true
                             stop.pointee = true
-                        } else if result != nil {
-                            matched = true
+                        } else if let result {
+                            match = result
                             stop.pointee = true
                         }
                     }
                     if timedOut { throw MaskError("Превышено время проверки маски файлов.") }
                     if internalError { throw MaskError("Не удалось выполнить регулярное выражение маски.") }
                     try deadline.check()
-                    if matched { return true }
+                    if let match {
+                        guard capturing else { return [:] }
+                        func value(_ range: NSRange) -> String {
+                            guard range.location != NSNotFound else { return "" }
+                            return (normalized as NSString).substring(with: range)
+                        }
+                        var captures: [String: String] = [:]
+                        for index in 0..<match.numberOfRanges {
+                            captures["RegexGroup\(index)"] = value(match.range(at: index))
+                        }
+                        for (name, icuName) in namedGroups {
+                            captures["RegexGroup{\(name)}"] = value(match.range(withName: icuName))
+                        }
+                        return captures
+                    }
                 }
             }
-            return false
+            return nil
         }
-        let included = try matchesAny(includes)
-        let excluded = included ? try matchesAny(excludes) : false
+        guard let included = try firstMatch(includes, capturing: capture),
+              try firstMatch(excludes, capturing: false) == nil else { return nil }
         try deadline.check()
-        return included && !excluded
+        return included
     }
 
     private enum Matcher: Sendable {
         case glob([Token])
         // NSRegularExpression is immutable and supports concurrent matching.
-        case regex(NSRegularExpression)
+        case regex(NSRegularExpression, namedGroups: [String: String])
     }
 
     private struct Deadline {
@@ -275,12 +298,50 @@ public struct FileMask: Sendable {
                 default: throw MaskError("Неизвестная опция регулярного выражения «\(option)»; допустимы i, m, s, x.")
                 }
             }
-            do { return .regex(try NSRegularExpression(pattern: body, options: options)) }
+            let converted = namedGroups(in: body)
+            do { return .regex(try NSRegularExpression(pattern: converted.pattern, options: options), namedGroups: converted.names) }
             catch { throw MaskError("Некорректное регулярное выражение в маске файлов.") }
         }
         guard !pattern.contains("\""), !pattern.contains("/") else { throw MaskError("Кавычки должны окружать маску целиком; пути в масках не поддерживаются.") }
         return .glob(try compile(pattern == "*.*" ? "*" : pattern))
     }
+    /// FAR uses (?{group}...) while ICU uses (?<group>...). The synthetic
+    /// ICU name also accommodates FAR names containing spaces or underscores.
+    private static func namedGroups(in body: String) -> (pattern: String, names: [String: String]) {
+        var pattern = "", names: [String: String] = [:]
+        var remainder = body[...], escaped = false, inClass = false, literal = false
+        while let character = remainder.first {
+            if !escaped, !inClass, !literal, remainder.hasPrefix("(?{") || remainder.hasPrefix("(?<") {
+                let far = remainder.hasPrefix("(?{")
+                let start = remainder.index(remainder.startIndex, offsetBy: 3)
+                if let end = remainder[start...].firstIndex(of: far ? "}" : ">") {
+                    let name = String(remainder[start..<end])
+                    if !name.isEmpty, name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || (far && $0.isWhitespace) }) {
+                        var icuName = name
+                        if far {
+                            icuName = "FarNamedGroup\(names.count)"
+                            while body.contains("(?<" + icuName + ">") { icuName += "x" }
+                        }
+                        names[name] = icuName
+                        pattern += "(?<" + icuName + ">"
+                        remainder = remainder[remainder.index(after: end)...]
+                        continue
+                    }
+                }
+            }
+            if escaped {
+                if character == "Q" { literal = true }
+                else if character == "E" { literal = false }
+                escaped = false
+            } else if character == "\\" { escaped = true }
+            else if !literal, character == "[" { inClass = true }
+            else if !literal, character == "]" { inClass = false }
+            pattern.append(character)
+            remainder = remainder.dropFirst()
+        }
+        return (pattern, names)
+    }
+
     private static func compile(_ pattern: String) throws -> [Token] {
         let characters = Array(pattern.precomposedStringWithCanonicalMapping)
         var tokens = [Token]()

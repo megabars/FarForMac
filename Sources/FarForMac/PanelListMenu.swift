@@ -15,6 +15,7 @@ final class PanelListMenu: NSWindowController, NSWindowDelegate, NSTableViewData
 
     var onKey: ((NSEvent) -> Bool)?
     var onActivate: ((Int) -> Void)?
+    var macroArea = "Menu"
     private let table = FileTable()
     private let status = NSTextField(wrappingLabelWithString: "")
     private var rows: [Row] = []
@@ -90,6 +91,7 @@ final class PanelListMenu: NSWindowController, NSWindowDelegate, NSTableViewData
             if smokeKey != nil {
                 self.smokeTrace = "code=\(event.keyCode), modifiers=\(event.modifierFlags.rawValue), modalMatch=\(NSApp.modalWindow === window), windowMatch=\(event.window === window), selection=\(self.selection ?? -1)"
             }
+            if isMenuEvent, FarLuaWorkspace.shared.handle(event) { return nil }
             return isMenuEvent && self.process(event) ? nil : event
         }
         defer { if let monitor { NSEvent.removeMonitor(monitor) } }

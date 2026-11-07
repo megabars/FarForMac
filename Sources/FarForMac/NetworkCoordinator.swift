@@ -318,9 +318,13 @@ private final class NetworkDownloadBatch {
     }
     func transfer(from active: PanelView, to passive: PanelView, move: Bool, cursorOnly: Bool = false) {
         guard available(), !active.isResource, !passive.isResource, !active.isVirtual, !passive.isVirtual, !passive.isTemporary else { return }
-        if active.isRemote && passive.isRemote {
-            guard move else { onStatus("Копирование между двумя сетевыми панелями пока недоступно."); return }
-            moveRemote(from: active, to: passive, cursorOnly: cursorOnly); return
+        if let source = active.remotePanel, let target = passive.remotePanel {
+            if move && source.provider === target.provider {
+                moveRemote(from: active, to: passive, cursorOnly: cursorOnly)
+            } else {
+                transferRemote(from: active, to: passive, source: source, target: target, move: move, cursorOnly: cursorOnly)
+            }
+            return
         }
         guard active.isRemote != passive.isRemote, !active.isArchive, !passive.isArchive else { onStatus("Для сетевой передачи выберите одну обычную и одну сетевую панель."); return }
         let remote = active.remotePanel ?? passive.remotePanel!
@@ -328,6 +332,9 @@ private final class NetworkDownloadBatch {
         let entries = download ? (cursorOnly ? remote.cursor.map { [$0] } ?? [] : remote.selectedEntries) : []
         let files = download ? [] : (cursorOnly ? active.cursorEntry.map { [$0] } ?? [] : active.selectedEntries)
         guard !(download ? entries.isEmpty : files.isEmpty) else { return }
+        if move && !download && remote.provider is FTPRemoteProvider {
+            onError(NetworkError.unsupported("FTP/FTPS не гарантирует запрет замены при переносе. Используйте копирование.")); return
+        }
         let initial = download ? passive.directory.path : remote.currentPath
         guard let value = prompt(move ? "Перенести — источник удаляется после проверки копии" : "Копировать", value: initial) else { return }
         if download ? entries.contains(where: { $0.isDirectory }) : files.contains(where: { $0.isDirectory }) {
@@ -341,7 +348,20 @@ private final class NetworkDownloadBatch {
         let alert = NSAlert(); alert.messageText = "Если файл назначения существует"
         alert.informativeText = "Выбор применяется к этому заданию. Это задание содержит только обычные файлы. Для папок используется отдельный предпросмотр дерева и конфликтов."
         alert.addButton(withTitle: "Остановиться на конфликте"); alert.addButton(withTitle: "Разрешить замену файлов"); alert.addButton(withTitle: "Отмена")
-        let answer = alert.runModal(); guard answer != .alertThirdButtonReturn else { return }; let replace = answer == .alertSecondButtonReturn
+        if move {
+            alert.buttons[1].isEnabled = false
+            alert.informativeText += " При сетевом переносе существующий файл может совпадать с источником. Выберите новое имя или пропустите конфликт."
+        }
+        let canReviewFiles = download || remote.provider is RemoteNoReplaceRenameProvider
+        if canReviewFiles { alert.addButton(withTitle: L10n.text("Выбрать для каждого файла")) }
+        let answer = alert.runModal()
+        if canReviewFiles && answer.rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 3 {
+            prepareDirectoryTransfer(from: active, to: passive, provider: remote.provider, entries: entries, files: files,
+                destination: value, download: download, move: move, policy: .mergeSkippingExisting)
+            return
+        }
+        guard answer == .alertFirstButtonReturn || answer == .alertSecondButtonReturn else { return }
+        let replace = answer == .alertSecondButtonReturn
         do {
             let target = download ? (value as NSString).expandingTildeInPath : try RemotePath.validate(value)
             if download, !target.hasPrefix("/") { throw NetworkError.invalidPath(target) }
@@ -373,57 +393,93 @@ private final class NetworkDownloadBatch {
             }) { [weak self] result in self?.finished(result) }
         } catch { onError(error) }
     }
+    private func transferRemote(from active: PanelView, to passive: PanelView, source: RemotePanelView,
+                                target: RemotePanelView, move: Bool, cursorOnly: Bool) {
+        let entries = cursorOnly ? source.cursor.map { [$0] } ?? [] : source.selectedEntries
+        guard !entries.isEmpty,
+              let path = prompt("Папка назначения — " + target.provider.connection.displayName, value: target.currentPath) else { return }
+        let sourceProvider = source.provider, destinationProvider = target.provider
+        reviewDirectoryTransfer(from: active, to: passive, provider: destinationProvider, sourceProvider: sourceProvider,
+                                move: move, captured: []) { token, progress in
+            try RemoteDirectoryTransfer.prepareRemote(source: sourceProvider, destination: destinationProvider, entries: entries,
+                into: RemotePath.validate(path), policy: .mergeSkippingExisting, move: move, cancellation: token, progress: progress)
+        }
+    }
+
     private func prepareDirectoryTransfer(from active: PanelView, to passive: PanelView, provider: any RemoteProvider,
-                                          entries: [RemoteEntry], files: [FileEntry], destination: String, download: Bool, move: Bool) {
-        let policyAlert = NSAlert(); policyAlert.messageText = move ? L10n.text("Перенос дерева: конфликты") : L10n.text("Копирование дерева: конфликты")
-        policyAlert.informativeText = L10n.text("Выберите новые назначения или слияние папок. При слиянии для каждого конфликта можно выбрать пропуск, замену обычного файла или другое имя. Затем будет показан итоговый план.")
-        policyAlert.addButton(withTitle: "Отмена"); policyAlert.addButton(withTitle: "Только новые назначения"); policyAlert.addButton(withTitle: L10n.text("Слияние / выбрать конфликты"))
-        let answer = policyAlert.runModal(); guard answer != .alertFirstButtonReturn else { return }
-        let policy: RemoteDirectoryConflictPolicy = answer == .alertThirdButtonReturn ? .mergeSkippingExisting : .requireNew
-        let sourceGeneration = active.locationGeneration, targetGeneration = passive.locationGeneration
+                                          entries: [RemoteEntry], files: [FileEntry], destination: String, download: Bool, move: Bool,
+                                          policy selectedPolicy: RemoteDirectoryConflictPolicy? = nil) {
+        let policy: RemoteDirectoryConflictPolicy
+        if let selectedPolicy { policy = selectedPolicy }
+        else {
+            let alert = NSAlert()
+            alert.messageText = move ? L10n.text("Перенос дерева: конфликты") : L10n.text("Копирование дерева: конфликты")
+            alert.informativeText = L10n.text("Выберите новые назначения или слияние папок. При слиянии можно выбрать действие для каждого конфликта. Затем будет показан итоговый план.")
+            alert.addButton(withTitle: "Отмена"); alert.addButton(withTitle: "Только новые назначения")
+            alert.addButton(withTitle: L10n.text("Слияние / выбрать конфликты"))
+            let answer = alert.runModal(); guard answer != .alertFirstButtonReturn else { return }
+            policy = answer == .alertThirdButtonReturn ? .mergeSkippingExisting : .requireNew
+        }
         let captured = active.capturedSearchResults(for: files)
-        operations.run(title: "Предпросмотр сетевого копирования дерева", work: { token, progress in
+        reviewDirectoryTransfer(from: active, to: passive, provider: provider, sourceProvider: nil, move: move, captured: captured) { token, progress in
             try captured.forEach { try $0.verifyCurrent() }
             if download {
                 let target = (destination as NSString).expandingTildeInPath
                 guard target.hasPrefix("/") else { throw NetworkError.invalidPath(target) }
                 return try RemoteDirectoryTransfer.prepareDownload(provider: provider, entries: entries,
-                    into: URL(fileURLWithPath: target), policy: policy, cancellation: token, progress: progress)
+                    into: URL(fileURLWithPath: target), policy: policy, move: move, cancellation: token, progress: progress)
             }
             return try RemoteDirectoryTransfer.prepareUpload(provider: provider, sources: files.map(\.url),
-                into: destination, policy: policy, cancellation: token, progress: progress)
-        }) { [weak self, weak active, weak passive] result in
+                into: destination, policy: policy, move: move, cancellation: token, progress: progress)
+        }
+    }
+
+    private func reviewDirectoryTransfer(from active: PanelView, to passive: PanelView, provider: any RemoteProvider,
+                                         sourceProvider: (any RemoteProvider)?, move: Bool, captured: [SearchResult],
+                                         preview: @escaping (TransferCancellation, @escaping (NetworkProgress) -> Void) throws -> RemoteDirectoryTransferPlan) {
+        let sourceGeneration = active.locationGeneration, targetGeneration = passive.locationGeneration
+        operations.run(title: L10n.text("Предпросмотр сетевой передачи"), work: preview) { [weak self, weak active, weak passive] result in
             guard let self, let active, let passive,
                   active.locationGeneration == sourceGeneration, passive.locationGeneration == targetGeneration else { return }
+            let confirm: (RemoteDirectoryTransferPlan) -> Void = { [weak self, weak active, weak passive] plan in
+                self?.confirmDirectoryTransfer(provider: provider, sourceProvider: sourceProvider, plan: plan, move: move, captured: captured) {
+                    active?.locationGeneration == sourceGeneration && passive?.locationGeneration == targetGeneration
+                }
+            }
             switch result {
             case .failure(let error): self.onError(error)
             case .success(let plan):
-                if plan.conflicts.isEmpty { self.confirmDirectoryTransfer(provider: provider, plan: plan, move: move, captured: captured); return }
+                if plan.conflicts.isEmpty { confirm(plan); return }
                 let editor = NetworkConflictEditor(plan: plan)
                 let alert = NSAlert(); alert.messageText = L10n.text("Конфликты при слиянии")
-                alert.informativeText = L10n.text("Выберите действие для каждой строки. Папки и ссылки не заменяются. Новое имя относится к копии в папке назначения. Этот шаг не изменяет файлы.")
+                alert.informativeText = L10n.text("Действие относится к назначению. Продолжение требует совпадения всего существующего начала файла. При добавлении байты источника дописываются к существующим.")
                 alert.accessoryView = editor.view
                 alert.addButton(withTitle: L10n.text("Отмена")); alert.addButton(withTitle: L10n.text("Проверить решения"))
-                guard alert.runModal() == .alertSecondButtonReturn, self.available() else { return }
+                guard alert.runModal() == .alertSecondButtonReturn, self.available(),
+                      active.locationGeneration == sourceGeneration, passive.locationGeneration == targetGeneration else { return }
                 let decisions = editor.decisions()
                 self.operations.run(title: L10n.text("Проверка решений конфликтов"), work: { token, progress in
-                    try RemoteDirectoryTransfer.resolve(provider: provider, plan: plan, decisions: decisions, cancellation: token, progress: progress)
+                    try RemoteDirectoryTransfer.resolve(provider: provider, plan: plan, decisions: decisions, sourceProvider: sourceProvider,
+                                                        cancellation: token, progress: progress)
                 }) { [weak self, weak active, weak passive] resolved in
                     guard let self, let active, let passive,
                           active.locationGeneration == sourceGeneration, passive.locationGeneration == targetGeneration else { return }
                     switch resolved {
-                    case .success(let resolvedPlan): self.confirmDirectoryTransfer(provider: provider, plan: resolvedPlan, move: move, captured: captured)
+                    case .success(let resolvedPlan): confirm(resolvedPlan)
                     case .failure(let error): self.onError(error)
                     }
                 }
             }
         }
     }
-    private func confirmDirectoryTransfer(provider: any RemoteProvider, plan: RemoteDirectoryTransferPlan, move: Bool, captured: [SearchResult]) {
-        guard Self.directoryTransferPreview(plan, move: move).runModal() == .alertSecondButtonReturn, available() else { return }
-        operations.run(title: move ? L10n.text("Перенос дерева с проверкой копии") : L10n.text("Копирование дерева"), work: { token, progress in
+
+    private func confirmDirectoryTransfer(provider: any RemoteProvider, sourceProvider: (any RemoteProvider)?,
+                                          plan: RemoteDirectoryTransferPlan, move: Bool, captured: [SearchResult], stillCurrent: () -> Bool) {
+        guard Self.directoryTransferPreview(plan, move: move).runModal() == .alertSecondButtonReturn, available(), stillCurrent() else { return }
+        operations.run(title: move ? L10n.text("Перенос с проверкой копии") : L10n.text("Сетевое копирование"), work: { token, progress in
             try captured.forEach { try $0.verifyCurrent() }
-            return try RemoteDirectoryTransfer.copy(provider: provider, plan: plan, move: move, cancellation: token, progress: progress)
+            return try RemoteDirectoryTransfer.copy(provider: provider, plan: plan, move: move, sourceProvider: sourceProvider,
+                                                    cancellation: token, progress: progress)
         }) { [weak self] result in
             guard let self else { return }
             switch result {
@@ -437,7 +493,7 @@ private final class NetworkDownloadBatch {
     }
     static func directoryTransferSummary(_ report: RemoteDirectoryTransferReport) -> String {
         let copied = "Скопировано поддеревьев: \(report.completed.count); пропущено конфликтов: \(report.skipped.count)."
-        return report.moving ? copied + " Удалено исходников: \(report.removedSources.count); сохранено: \(report.retainedSources.count)." : copied + " Исходники сохранены."
+        return report.moving ? copied + " Удалено исходников: \(report.removedSources.count); сохранено или удаление не подтверждено: \(report.retainedSources.count)." : copied + " Исходники сохранены."
     }
     static func directoryTransferResult(_ report: RemoteDirectoryTransferReport) -> NSAlert {
         let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = L10n.text("Перенос выполнен частично")
@@ -448,12 +504,31 @@ private final class NetworkDownloadBatch {
     }
     static func directoryTransferPreview(_ plan: RemoteDirectoryTransferPlan, move: Bool = false) -> NSAlert {
         let alert = NSAlert(); alert.messageText = move ? L10n.text("Перенести дерево после проверки копии?") : L10n.text("Копировать дерево по плану?")
-        alert.informativeText = "Выбрано файлов: \(plan.fileCount), папок: \(plan.directoryCount), байт: \(plan.totalBytes); к передаче байт: \(plan.transferBytes). Поддеревьев к записи: \(plan.copies.count), замен файлов: \(plan.replacementSources.count), пропущено конфликтов: \(plan.skipped.count). " +
+        alert.informativeText = "Выбрано файлов: \(plan.fileCount), папок: \(plan.directoryCount), байт: \(plan.totalBytes); прочитать байт источника: \(plan.transferBytes), записать байт: \(plan.outputBytes). Поддеревьев к записи: \(plan.copies.count), замен файлов: \(plan.replacementSources.count), пропущено конфликтов: \(plan.skipped.count). " +
             (plan.policy == .mergeSkippingExisting ? "Существующие папки объединяются; решения для файлов перечислены ниже. " : "Все назначения должны быть новыми. ") +
             (move ? "После проверки копий исходные объекты удаляются без Корзины. Пропущенные или изменённые источники сохраняются; пустые папки удаляются последними. " : "Исходники сохраняются. ") +
             "При отмене выполненные изменения сохраняются. Неподтверждённая последняя операция указана в сообщении об ошибке."
+        if let source = plan.sourceConnection, let destination = plan.destinationConnection {
+            alert.informativeText = source.displayName + " → " + destination.displayName + "\n" + alert.informativeText
+        }
+        if plan.policy == .mergeSkippingExisting {
+            if move { alert.informativeText += " Исходные папки, объединённые с существующими папками назначения, сохраняются." }
+            if move || plan.sourceConnection != nil {
+                alert.informativeText += " При конфликте с существующим файлом доступны пропуск и новое имя."
+            }
+        }
         let roots = plan.roots.map { "ИСТОЧНИК: " + $0.source + " → " + $0.destination }
-        let copies = plan.copies.map { (plan.replacementSources.contains($0.source) ? "ЗАМЕНИТЬ: " : "КОПИРОВАТЬ: ") + $0.source + " → " + $0.destination }
+        let copies = plan.copies.map { mapping in
+            let title: String
+            switch plan.replacementDecision(for: mapping.source) {
+            case .replace: title = "ЗАМЕНИТЬ"
+            case .newer: title = "ЗАМЕНИТЬ БОЛЕЕ НОВЫМ"
+            case .append: title = "ДОБАВИТЬ В КОНЕЦ"
+            case .resume: title = "ПРОДОЛЖИТЬ СОВПАДАЮЩИЙ ФАЙЛ"
+            default: title = "КОПИРОВАТЬ"
+            }
+            return title + ": " + mapping.source + " → " + mapping.destination
+        }
         let skipped = plan.skipped.map { "ПРОПУСТИТЬ: " + $0.source + " → " + $0.destination }
         previewPaths(roots + copies + skipped, in: alert)
         alert.addButton(withTitle: "Отмена"); alert.addButton(withTitle: move ? L10n.text("Перенести") : L10n.text("Копировать"))
@@ -515,6 +590,24 @@ private final class NetworkDownloadBatch {
         }
         guard case .failure(NetworkError.cancelled) = cancelled else { throw NetworkError.io("Disconnect must cancel the whole transfer between requests") }
         return ["Network MOVE confirmation discloses deletion; actual progress worker preserves skipped source", "Partial MOVE result lists retained source paths without changing files", "Panel disconnect cancels the logical transfer even between provider requests"]
+            + (try runCrossConnectionUISmokeChecks())
+    }
+
+    private static func runCrossConnectionUISmokeChecks() throws -> [String] {
+        let source = ProviderUISmokeFixture(name: "Source connection")
+        let target = ProviderUISmokeFixture(name: "Target connection")
+        let token = TransferCancellation()
+        guard let entry = try source.stat(path: "/docs/alpha.txt", cancellation: token) else { throw NetworkError.io("Missing cross-connection fixture") }
+        let copy = try RemoteDirectoryTransfer.prepareRemote(source: source, destination: target, entries: [entry],
+            into: "/target", policy: .requireNew, move: false)
+        let alert = directoryTransferPreview(copy)
+        guard alert.informativeText.contains("Source connection → Target connection"),
+              let scroll = alert.accessoryView as? NSScrollView, let text = scroll.documentView as? NSTextView,
+              text.string.contains("/docs/alpha.txt → /target/alpha.txt"),
+              alert.buttons[1].isEnabled, source.downloads == 0, target.downloads == 0 else {
+            throw NetworkError.io("Cross-connection confirmation must show both profiles and exact paths before any transfer")
+        }
+        return ["Cross-connection confirmation names both saved profiles and the exact source and destination paths"]
     }
 
     func remove(_ panel: PanelView) {
@@ -594,9 +687,6 @@ private final class NetworkDownloadBatch {
     }
     private func moveRemote(from active: PanelView, to passive: PanelView, cursorOnly: Bool) {
         guard let source = active.remotePanel, let target = passive.remotePanel else { return }
-        guard source.provider.connection == target.provider.connection else {
-            onError(NetworkError.unsupported("Перенос между сетевыми панелями требует одного и того же сохранённого подключения. Передача между разными серверами пока недоступна.")); return
-        }
         let entries = cursorOnly ? source.cursor.map { [$0] } ?? [] : source.selectedEntries
         guard !entries.isEmpty, let destination = prompt("Папка назначения на том же сервере", value: target.currentPath) else { return }
         do { prepareRemoteMove(source, entries: entries, destination: try RemotePath.validate(destination), intoDirectory: true, panel: active) }

@@ -33,6 +33,7 @@ final class CommandWorkspace: NSObject, NSMenuItemValidation {
         return key === mainWindow ? .panel : .dialog
     }
     private var acceptsMacroInput: Bool {
+        guard !FarLuaWorkspace.shared.isRunning, !FarLuaWorkspace.shared.isRecording else { return false }
         guard context != .dialog else { return false }
         return MacroShortcutAdapter.acceptsInput(NSApp.keyWindow?.firstResponder)
     }
@@ -70,6 +71,11 @@ final class CommandWorkspace: NSObject, NSMenuItemValidation {
     func installMenu(in bar: NSMenu) {
         let item = NSMenuItem(title: "Автоматизация", action: nil, keyEquivalent: "")
         let menu = NSMenu(title: item.title); item.submenu = menu; bar.addItem(item)
+        let browser = NSMenuItem(title: "LuaMacro: Macro Browser…", action: #selector(FarLuaWorkspace.showBrowser), keyEquivalent: "")
+        browser.target = FarLuaWorkspace.shared; menu.addItem(browser)
+        let load = NSMenuItem(title: "LuaMacro: загрузить Lua / MoonScript…", action: #selector(FarLuaWorkspace.importScript), keyEquivalent: "")
+        load.target = FarLuaWorkspace.shared; menu.addItem(load)
+        menu.addItem(.separator())
         for (title, action, key) in [
             ("Команды текущего окна…", #selector(palette), "p"),
             ("Начать запись макроса", #selector(startRecording), "r"),

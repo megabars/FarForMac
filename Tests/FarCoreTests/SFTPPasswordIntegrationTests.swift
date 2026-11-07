@@ -76,7 +76,7 @@ extension SFTPPasswordTests {
     }
 }
 
-private final class PasswordSSHFixture {
+final class PasswordSSHFixture {
     let root: URL
     let server = Process()
     let password: String

@@ -51,12 +51,23 @@ public enum ShellCommand {
     public static func directoryChange(in command: String, currentDirectory: URL,
                                        previousDirectory: URL? = nil,
                                        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> URL? {
+        try directoryChange(in: command, currentDirectory: currentDirectory, previousDirectory: previousDirectory,
+                            homeDirectory: homeDirectory, expandPath: { $0 })
+    }
+
+    static func directoryChange(in command: String, currentDirectory: URL, previousDirectory: URL?,
+                                homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+                                expandPath: (String) -> String) throws -> URL? {
         try validate(command)
         let parsed = try lex(command, allowIncomplete: false)
-        guard !parsed.unsupported, let first = parsed.tokens.first, first.value == "cd" else { return nil }
+        guard !parsed.unsupported, let first = parsed.tokens.first, first.isBare,
+              ["cd", "chdir"].contains(first.value.lowercased()) else { return nil }
         var arguments = Array(parsed.tokens.dropFirst())
         var afterOptions = false
-        if arguments.first?.value == "--" { arguments.removeFirst(); afterOptions = true }
+        if let option = arguments.first, option.isBare, ["--", "/d"].contains(option.value.lowercased()) {
+            arguments.removeFirst()
+            afterOptions = option.value == "--"
+        }
         guard arguments.count <= 1 else { return nil }
         try validateDirectory(currentDirectory)
         guard let token = arguments.first else { try validateDirectory(homeDirectory); return homeDirectory.standardizedFileURL }
@@ -70,7 +81,9 @@ public enum ShellCommand {
         if token.value.hasPrefix("-"), token.isBare, !afterOptions { return nil }
         if token.value.hasPrefix("~"), token.leadingBareTilde,
            token.value != "~", !token.value.hasPrefix("~/") { return nil }
-        return try resolve(token.value, bareTilde: token.leadingBareTilde,
+        let rawPath = command[token.start...]
+        let path = rawPath.first == "'" ? token.value : expandPath(token.value)
+        return try resolve(path, bareTilde: token.leadingBareTilde,
                            currentDirectory: currentDirectory, homeDirectory: homeDirectory)
     }
 
@@ -80,7 +93,8 @@ public enum ShellCommand {
     public static func completePath(in command: String, currentDirectory: URL,
                                     maximumResults: Int = 100,
                                     maximumScannedEntries: Int = maximumCompletionEntries,
-                                    homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> ShellPathCompletion {
+                                    homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+                                    caseInsensitive: Bool = false) throws -> ShellPathCompletion {
         try validate(command)
         try validateDirectory(currentDirectory)
         let parsed = try lex(command, allowIncomplete: true)
@@ -118,7 +132,9 @@ public enum ShellCommand {
             if name == "." || name == ".." { continue }
             guard scanned < scanLimit else { truncated = true; break }
             scanned += 1
-            guard name.hasPrefix(prefix), prefix.hasPrefix(".") || !name.hasPrefix(".") else { continue }
+            let matches = prefix.isEmpty || (caseInsensitive
+                ? name.range(of: prefix, options: [.anchored, .caseInsensitive]) != nil : name.hasPrefix(prefix))
+            guard matches, prefix.hasPrefix(".") || !name.hasPrefix(".") else { continue }
             guard candidates.count < resultLimit else { truncated = true; continue }
             let candidate = directory.appendingPathComponent(name)
             var isDirectory: ObjCBool = false
@@ -131,7 +147,7 @@ public enum ShellCommand {
         return ShellPathCompletion(candidates: candidates, scannedEntryCount: scanned, isTruncated: truncated)
     }
 
-    private static func validate(_ command: String) throws {
+    static func validate(_ command: String) throws {
         guard command.utf8.count <= maximumCommandBytes else { throw ShellCommandError.tooLong }
         guard !command.utf8.contains(0) else { throw ShellCommandError.nullByte }
     }
@@ -140,7 +156,7 @@ public enum ShellCommand {
             throw ShellCommandError.invalidDirectory
         }
     }
-    private static func resolve(_ value: String, bareTilde: Bool, currentDirectory: URL, homeDirectory: URL) throws -> URL {
+    static func resolve(_ value: String, bareTilde: Bool, currentDirectory: URL, homeDirectory: URL) throws -> URL {
         if bareTilde, value == "~" || value.hasPrefix("~/") {
             try validateDirectory(homeDirectory)
             return value == "~" ? homeDirectory.standardizedFileURL : homeDirectory.appendingPathComponent(String(value.dropFirst(2))).standardizedFileURL
@@ -149,20 +165,20 @@ public enum ShellCommand {
         return currentDirectory.appendingPathComponent(value).standardizedFileURL
     }
 
-    private struct Token {
+    struct Token {
         var value: String
         var start: String.Index
         var isBare: Bool
         var leadingBareTilde: Bool
     }
-    private struct Lexed {
+    struct Lexed {
         var tokens: [Token]
         var unsupported: Bool
         var endsInWhitespace: Bool
     }
     private enum Quote { case single, double }
 
-    private static func lex(_ command: String, allowIncomplete: Bool) throws -> Lexed {
+    static func lex(_ command: String, allowIncomplete: Bool) throws -> Lexed {
         var tokens: [Token] = [], token: Token?, quote: Quote?, escaped = false
         var unsupported = false, endsInWhitespace = false
         for index in command.indices {
@@ -207,5 +223,29 @@ public enum ShellCommand {
         }
         if let token { tokens.append(token) }
         return Lexed(tokens: tokens, unsupported: unsupported, endsInWhitespace: endsInWhitespace)
+    }
+}
+
+public enum ShellPanelInsertion: Sendable {
+    case activeName, passiveName, activeFilePath, passiveFilePath
+    case leftDirectory, rightDirectory, activeDirectory, passiveDirectory
+}
+
+extension ShellCommand {
+    public static func panelInsertion(_ insertion: ShellPanelInsertion, context: UserCommandContext) throws -> String? {
+        let value: String?
+        let isFile: Bool
+        switch insertion {
+        case .activeName: value = context.currentFile?.lastPathComponent; isFile = true
+        case .passiveName, .passiveFilePath: value = context.passiveCurrentFile?.path; isFile = true
+        case .activeFilePath: value = context.currentFile?.path; isFile = true
+        case .leftDirectory: value = (context.activePanelIsLeft ? context.activeDirectory : context.passiveDirectory).path; isFile = false
+        case .rightDirectory: value = (context.activePanelIsLeft ? context.passiveDirectory : context.activeDirectory).path; isFile = false
+        case .activeDirectory: value = context.activeDirectory.path; isFile = false
+        case .passiveDirectory: value = context.passiveDirectory.path; isFile = false
+        }
+        guard let value, !value.isEmpty else { return nil }
+        let text = !isFile && !value.hasSuffix("/") ? value + "/" : value
+        return try quoteArgument(text) + (isFile ? " " : "")
     }
 }

@@ -9,6 +9,8 @@ public struct FileToolItem: Sendable {
     public let permissions: UInt16
     public let modified: Date
     public let accessed: Date
+    public let created: Date
+    public let flags: UInt32
     fileprivate let device: dev_t
     fileprivate let inode: ino_t
     fileprivate let mode: mode_t
@@ -89,7 +91,7 @@ public enum FileTools {
             try validateName(name)
             return BatchRenameEntry(source: source, destination: source.url.deletingLastPathComponent().appendingPathComponent(name))
         }
-        try validate(plan)
+        try validateRename(plan)
         return plan
     }
 
@@ -97,8 +99,9 @@ public enum FileTools {
     /// being overwritten. On failure, completed renames remain and are reported.
     @discardableResult
     public static func executeRename(_ plan: [BatchRenameEntry], propagateDescriptions: Bool = true,
-                                     descriptionEncodings: [String: FileDescriptionEncoding] = [:]) throws -> Int {
-        try validate(plan)
+                                     descriptionEncodings: [String: FileDescriptionEncoding] = [:],
+                                     allowCaseOnly: Bool = false) throws -> Int {
+        try validateRename(plan, allowCaseOnly: allowCaseOnly)
         let groups = Dictionary(grouping: plan, by: { FileDescriptionEncoding.directoryKey($0.source.url.deletingLastPathComponent()) })
         var descriptions = [String: FileDescriptionRenamePlan]()
         if propagateDescriptions {
@@ -288,29 +291,45 @@ public enum FileTools {
         }
     }
 
-    private static func validate(_ plan: [BatchRenameEntry]) throws {
+    static func validateRename(_ plan: [BatchRenameEntry], allowCaseOnly: Bool = false) throws {
         _ = try snapshot(plan.map { $0.source.url })
         var names = Set<String>()
+        var storedNames: [String: Set<Data>] = [:]
         let sources = Set(plan.map { $0.source.url.path })
         for entry in plan {
             try verify(entry.source)
-            try validateName(entry.destination.lastPathComponent)
-            guard entry.destination.deletingLastPathComponent() == entry.source.url.deletingLastPathComponent() else { throw Failure("Переименование не может менять папку.") }
-            let sensitive = (try? entry.destination.deletingLastPathComponent().resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
+            let parent = entry.destination.deletingLastPathComponent()
+            let oldName = entry.source.url.lastPathComponent, newName = entry.destination.lastPathComponent
+            try validateName(newName)
+            guard parent == entry.source.url.deletingLastPathComponent() else { throw Failure("Переименование не может менять папку.") }
+            let sensitivity = (try? parent.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames
             let path = entry.destination.path.precomposedStringWithCanonicalMapping
-            let key = sensitive ? path : path.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+            let key = sensitivity == true ? path : path.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
             guard names.insert(key).inserted else { throw Failure("Несколько объектов получают одинаковое имя.") }
             guard !sources.contains(entry.destination.path) else { throw Failure("Назначение совпадает с выбранным источником. Циклы и неизменённые имена запрещены.") }
             var info = stat()
-            guard lstat(entry.destination.path, &info) != 0 else { throw Failure("Назначение уже существует: \(entry.destination.lastPathComponent). Перезапись запрещена.") }
-            guard errno == ENOENT else { throw posix("Проверить назначение", entry.destination) }
+            if lstat(entry.destination.path, &info) == 0 {
+                let conflict = Failure("Назначение уже существует: \(newName). Перезапись запрещена.")
+                guard allowCaseOnly, sensitivity == false, oldName.caseInsensitiveCompare(newName) == .orderedSame,
+                      matches(entry.source, info) else { throw conflict }
+                // Same inode is insufficient because another directory entry
+                // may be a hard link to it. Check the actual stored names.
+                if storedNames[parent.path] == nil {
+                    storedNames[parent.path] = Set(try FileManager.default.contentsOfDirectory(atPath: parent.path).map { Data($0.utf8) })
+                }
+                guard let spelling = storedNames[parent.path], spelling.contains(Data(oldName.utf8)),
+                      !spelling.contains(Data(newName.utf8)) else { throw conflict }
+            } else if errno != ENOENT {
+                throw posix("Проверить назначение", entry.destination)
+            }
         }
     }
 
     private static func validateName(_ name: String) throws {
         guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else { throw Failure("Недопустимое имя файла.") }
     }
-    private static func verify(_ source: FileToolItem) throws {
+    /// Confirms that the selected directory entry still has the captured identity.
+    public static func verify(_ source: FileToolItem) throws {
         var info = stat()
         guard lstat(source.url.path, &info) == 0, matches(source, info) else { throw Failure("Источник исчез или был заменён: \(source.url.path)") }
     }
@@ -323,6 +342,8 @@ public enum FileTools {
                      permissions: UInt16(info.st_mode & 0o7777),
                      modified: Date(timeIntervalSince1970: Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1e9),
                      accessed: Date(timeIntervalSince1970: Double(info.st_atimespec.tv_sec) + Double(info.st_atimespec.tv_nsec) / 1e9),
+                     created: Date(timeIntervalSince1970: Double(info.st_birthtimespec.tv_sec) + Double(info.st_birthtimespec.tv_nsec) / 1e9),
+                     flags: info.st_flags,
                      device: info.st_dev, inode: info.st_ino, mode: info.st_mode)
     }
     private static func posix(_ action: String, _ url: URL) -> Failure {

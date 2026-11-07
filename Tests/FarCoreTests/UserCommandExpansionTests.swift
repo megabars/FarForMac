@@ -78,6 +78,23 @@ final class UserCommandExpansionTests {
         #expect(throws: (any Error).self) { try UserCommandExpander.expand("echo {passiveMarked}", context: empty) }
     }
 
+    @Test func escapedShellSeparatorsDoNotStartAPlaceholderArgument() throws {
+        let ctx = context()
+        for template in [#"printf '%s' prefix\ {name}"#, #"printf '%s' prefix\|{name}"#,
+                         #"printf '%s' prefix\>{name}"#, "printf '%s' prefix\\\t{name}"] {
+            #expect(throws: (any Error).self) { try UserCommandExpander.validate(template) }
+        }
+        for source in [#"printf '%s' prefix\ !.!"#, #"printf '%s' prefix\|!.!"#,
+                       #"printf '%s' prefix\ "!.!""#] {
+            #expect(throws: (any Error).self) { try FarMenuMetasymbols.command(source, context: ctx) }
+        }
+        let source = #"printf '%s\n' prefix\\ "!.!"|cat"#
+        let template = try FarMenuMetasymbols.command(source, context: ctx)
+        let expanded = try UserCommandExpander.expand(template, context: ctx)
+        let filename = try #require(ctx.currentFile).lastPathComponent
+        #expect(try output(expanded) == Data(("prefix\\\n" + filename + "\n").utf8))
+    }
+
     @Test func listFilesContainMarkedPathsAndNamesInOrderWithPrivatePermissions() throws {
         let ctx = context(marked: ["one file", "two'files", "Файл"])
         let prepared = try UserCommandExpander.prepare("cat {list} {listNames} {passiveList} {passiveListNames}", context: ctx)

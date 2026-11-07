@@ -5,6 +5,7 @@ import faulthandler
 faulthandler.dump_traceback_later(5)
 import base64
 import http.server
+import itertools
 import json
 import os
 import socket
@@ -25,6 +26,7 @@ files = {"/hello space.txt": b"hello remote world"}
 files.update({"/root.txt": b"Loopback FTP and WebDAV test file.\n", "/Тестовая папка/Привет.txt": "Привет из локальной тестовой папки.\n".encode()})
 files.update({"/interrupted": b"A" * 131072, "/ignore-range": b"hello remote world", "/wrong-response-etag": b"hello remote world"})
 etags = {path: '"v1"' for path in files}
+next_version = itertools.count(2)
 request_events = []
 directories = {"/", "/Тестовая папка"}
 lock = threading.Lock()
@@ -95,10 +97,14 @@ class DAV(http.server.BaseHTTPRequestHandler):
         if not self.authorized(): return
         p = self.path_value()
         if self.headers.get("If-Match") and self.headers["If-Match"] != etags.get(p): return self.reply(412)
-        files[p] = data; etags[p] = '"v2"'; self.reply(201)
+        if self.headers.get("If-None-Match") == "*" and (p in files or p in directories): return self.reply(412)
+        files[p] = data; etags[p] = f'"v{next(next_version)}"'; self.reply(201)
     def do_MOVE(self):
         if not self.authorized(): return
         src = self.path_value(); dest = urllib.parse.unquote(urllib.parse.urlsplit(self.headers["Destination"]).path)
+        lose_reply = dest == "/lost-move-ack.txt"
+        if lose_reply:
+            with open(os.path.join(root, "lost-move-requests"), "a") as record: record.write("MOVE\n")
         if src not in files and src not in directories: return self.reply(404)
         if (dest in files or dest in directories) and self.headers.get("Overwrite") == "F": return self.reply(412)
         if src in files:
@@ -111,11 +117,19 @@ class DAV(http.server.BaseHTTPRequestHandler):
             for old in list(directories):
                 if old == src or old.startswith(src + "/"):
                     directories.remove(old); directories.add(dest + old[len(src):])
+        if lose_reply:
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_RDWR)
+            return
         self.reply(201)
     def do_DELETE(self):
         if not self.authorized(): return
         p = self.path_value()
         if p == "/partial": return self.reply(207, b'<d:multistatus xmlns:d="DAV:"/>')
+        if self.headers.get("If-Match") and (p not in files or self.headers["If-Match"] != etags.get(p)): return self.reply(412)
+        if p == "/pending-delete.txt":
+            with open(os.path.join(root, "pending-delete-requests"), "a") as record: record.write(str(self.headers.get("If-Match")) + "\n")
+            return self.reply(202)
         if p in files: del files[p]
         elif p in directories: directories.remove(p)
         else: return self.reply(404)

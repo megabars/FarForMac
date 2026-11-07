@@ -139,6 +139,48 @@ struct SSHConfigurationTests {
         #expect(throws: (any Error).self) { try fixture.importAlias("undefined_alias") }
     }
 
+    @Test func dataOnlyMatchUsesPriorHostAndUserValuesWithConditionalIncludes() throws {
+        let fixture = try Fixture([
+            "config": """
+            Host prod
+              HostName Files.internal
+              User Deploy
+              ProxyJump override@jump
+            Match originalhost prod host=*.internal,!excluded.internal user Deploy !localuser guest
+              Include options.conf
+            Match user deploy
+              Port 9999
+            Match all
+              Port 2222
+            Match originalhost jump user=override
+              HostName jump.internal
+            Host jump
+              User ignored
+            """,
+            "options.conf": "Match localuser local-user\n  ConnectTimeout 41\n"
+        ])
+        defer { fixture.remove() }
+        let imported = try fixture.importAlias()
+        #expect(imported.host == "Files.internal")
+        #expect(imported.username == "Deploy")
+        #expect(imported.port == 2222)
+        #expect(imported.timeoutSeconds == 41)
+        #expect(imported.sftpJumpHosts.first?.host == "jump.internal")
+        #expect(imported.sftpJumpHosts.first?.username == "override")
+    }
+
+    @Test func matchRejectsSecondPassAndExecutablePredicatesEvenAfterFalseCondition() throws {
+        let fixture = try Fixture(["config": ""])
+        defer { fixture.remove() }
+        let marker = fixture.directory.appendingPathComponent("must-not-exist")
+        for predicate in ["all user ignored", "host", "final", "canonical", "localnetwork 127.0.0.0/8",
+                          "originalhost different exec=\"touch \(marker.path)\"", "user ,,", "\"\""] {
+            try Data(("Match " + predicate + "\nHost *\n  HostName fallback.internal\n").utf8).write(to: fixture.config)
+            #expect(throws: SSHConfigurationError.self) { try fixture.importAlias() }
+            #expect(!FileManager.default.fileExists(atPath: marker.path))
+        }
+    }
+
     @Test func dangerousHooksAndUnrepresentedSecurityOrAuthenticationFailWithoutExecution() throws {
         let fixture = try Fixture(["config": ""])
         defer { fixture.remove() }

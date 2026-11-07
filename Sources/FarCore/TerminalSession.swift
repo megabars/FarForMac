@@ -13,10 +13,11 @@ public final class TerminalSession: @unchecked Sendable {
         public var rows: Int
         public var shellArguments: [String]?
         public var environmentOverrides: [String: String]
+        public var environmentRemovals: Set<String>
 
         public init(command: String? = nil, directory: URL, shell: String? = nil,
                     columns: Int = 100, rows: Int = 30, shellArguments: [String]? = nil,
-                    environmentOverrides: [String: String] = [:]) {
+                    environmentOverrides: [String: String] = [:], environmentRemovals: Set<String> = []) {
             self.command = command
             self.directory = directory
             self.shell = shell
@@ -24,6 +25,7 @@ public final class TerminalSession: @unchecked Sendable {
             self.rows = rows
             self.shellArguments = shellArguments
             self.environmentOverrides = environmentOverrides
+            self.environmentRemovals = environmentRemovals
         }
     }
 
@@ -115,6 +117,7 @@ public final class TerminalSession: @unchecked Sendable {
             environment["TERM"] = "vt100"
             environment.removeValue(forKey: "COLORTERM")
             environment["PWD"] = configuration.directory.path
+            for name in configuration.environmentRemovals { environment.removeValue(forKey: name) }
             environment.merge(configuration.environmentOverrides) { _, new in new }
             let argv = arguments.map { strdup($0) }
             let envp = environment.sorted(by: { $0.key < $1.key }).map { strdup("\($0.key)=\($0.value)") }

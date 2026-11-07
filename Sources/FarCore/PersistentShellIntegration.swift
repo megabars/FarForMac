@@ -19,6 +19,8 @@ public final class PersistentShellIntegration {
     private var collecting = false
     private var escape = false
     private var overflow = false
+    private var suppressingEcho = false
+    private var echoBoundaryTail = Data()
 
     public init() throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("farmac-shell-" + UUID().uuidString)
@@ -28,6 +30,7 @@ public final class PersistentShellIntegration {
             unset HISTFILE
             SAVEHIST=0
             HISTSIZE=500
+            setopt HIST_IGNORE_SPACE
             PROMPT='%~ %# '
             RPROMPT=''
             function _farformac_precmd() {
@@ -71,15 +74,46 @@ public final class PersistentShellIntegration {
     }
     /// One quoted eval is one shell command, even for multiline user-menu entries.
     /// Encoding prevents terminal controls or embedded newlines from becoming key events.
-    public static func submission(_ command: String) throws -> String {
+    public static func submission(_ command: String, echo: Bool = true) throws -> String {
         guard !command.utf8.contains(0), command.utf8.count <= 65_536 else { throw ShellCommandError.invalidSyntax }
+        let prefix = echo ? "" : " "
         // Ordinary command-bar input remains readable in the terminal transcript.
         if !command.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
-            return command + "\n"
+            return prefix + command + "\n"
         }
         let encoded = Data(command.utf8).base64EncodedString()
-        return "builtin eval -- \"$(/usr/bin/printf '%s' '\(encoded)' | /usr/bin/base64 -D)\"\n"
+        return prefix + "builtin eval -- \"$(/usr/bin/printf '%s' '\(encoded)' | /usr/bin/base64 -D)\"\n"
     }
+    public func suppressNextCommandEcho() {
+        suppressingEcho = true
+        echoBoundaryTail.removeAll(keepingCapacity: true)
+    }
+
+    /// ZLE echoes programmatic input as if it were typed. For FAR's @ prefix,
+    /// withhold that echo until the private preexec frame. A ready/continuation
+    /// frame also releases suppression if zsh never reached preexec.
+    public func filterCommandEcho(_ data: Data) -> Data {
+        guard suppressingEcho else { return data }
+        let framePrefix = "\u{1b}]777;farformac;\(token);"
+        let boundaries = [Data((framePrefix + "busy\u{7}").utf8),
+                          Data((framePrefix + "ready;").utf8),
+                          Data((framePrefix + "continuation\u{7}").utf8)]
+        var combined = echoBoundaryTail
+        combined.append(data)
+        let earliest = boundaries.enumerated().compactMap { index, marker in
+            combined.range(of: marker).map { (index, $0) }
+        }.min { $0.1.lowerBound < $1.1.lowerBound }
+        if let (index, range) = earliest {
+            suppressingEcho = false
+            echoBoundaryTail.removeAll(keepingCapacity: true)
+            let start = index == 0 ? range.upperBound : range.lowerBound
+            return Data([13, 10]) + combined[start...]
+        }
+        let retained = (boundaries.map(\.count).max() ?? 1) - 1
+        echoBoundaryTail = Data(combined.suffix(retained))
+        return Data()
+    }
+
     public func consume(_ data: Data) -> [State] {
         var states: [State] = []
         for byte in data {

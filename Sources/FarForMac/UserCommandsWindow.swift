@@ -5,25 +5,31 @@ import FarCore
 @MainActor
 final class UserCommandsWindow: NSWindowController, NSWindowDelegate, NSTextViewDelegate, NSUserInterfaceValidations {
     private let store: UserCommandStore
+    private var farMenu: LoadedUserMenu?
+    var sourceURL: URL { farMenu?.source ?? store.globalURL }
     private let onSave: () -> Void
     private let textView = NSTextView()
     private let status = NSTextField(wrappingLabelWithString: "")
     private var dirty = false
     private var pendingDiscard = false
 
-    init(store: UserCommandStore = .init(), onSave: @escaping () -> Void = {}) {
-        self.store = store; self.onSave = onSave
+    init(store: UserCommandStore = .init(), farMenu: LoadedUserMenu? = nil, onSave: @escaping () -> Void = {}) {
+        self.store = store; self.farMenu = farMenu; self.onSave = onSave
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 840, height: 650), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         super.init(window: window)
-        window.title = "Меню пользователя и ассоциации"
+        window.title = farMenu == nil ? "Меню пользователя и ассоциации" : UserCommandStore.farMenuFilename
         window.isReleasedWhenClosed = false; window.delegate = self
         window.minSize = NSSize(width: 660, height: 500); window.center()
 
-        let path = NSTextField(wrappingLabelWithString: store.globalURL.path)
+        let path = NSTextField(wrappingLabelWithString: sourceURL.path)
         path.font = .monospacedSystemFont(ofSize: 11, weight: .regular); path.isSelectable = true
-        let help = NSTextField(wrappingLabelWithString: "F2 открывает меню. Ассоциации: execute/view/edit и alternateExecute/alternateView/alternateEdit. Параметры {name}, {path}, {stem}, {extension}, {marked}, {active}, {passive}, {input:Название|текст}, {list}/{list0} — отдельные слова без своих кавычек. Конфигурация сама ничего не запускает.")
+        let help = NSTextField(wrappingLabelWithString: farMenu == nil
+            ? "F2 открывает меню. Ассоциации: execute/view/edit и alternateExecute/alternateView/alternateEdit. Параметры {name}, {path}, {stem}, {extension}, {marked}, {active}, {passive}, {input:Название|текст}, {list}/{list0} — отдельные слова без своих кавычек."
+            : "Формат: клавиша: Название. Строки команд начинаются с отступа, подменю — с { на отдельной строке.")
         help.font = .systemFont(ofSize: 12)
-        let localHelp = NSTextField(wrappingLabelWithString: "Локальное меню: .farformac-menu.json в активной папке, тот же JSON с полями version и menu. Оно заменяет глобальное меню при F2; перед запуском показываются источник и готовая команда. Ассоциации берутся из глобальной конфигурации.")
+        let localHelp = NSTextField(wrappingLabelWithString: farMenu == nil
+            ? "F2 ищет FarMenu.ini и .farformac-menu.json в активной папке, затем меню установки и профиля. Ассоциации берутся из commands.json."
+            : "Команды выполняются при выборе пункта F2. Используйте POSIX-shell; Windows-команды и пути требуют переноса.")
         localHelp.font = .systemFont(ofSize: 11); localHelp.textColor = .secondaryLabelColor
 
         textView.isRichText = false; textView.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
@@ -31,7 +37,7 @@ final class UserCommandsWindow: NSWindowController, NSWindowDelegate, NSTextView
         textView.isAutomaticTextReplacementEnabled = false; textView.isAutomaticSpellingCorrectionEnabled = false
         textView.isContinuousSpellCheckingEnabled = false; textView.textContainerInset = NSSize(width: 12, height: 12)
         textView.allowsUndo = true
-        textView.setAccessibilityLabel("JSON меню пользователя и ассоциаций")
+        textView.setAccessibilityLabel(farMenu == nil ? "JSON меню пользователя и ассоциаций" : "Исходный текст FarMenu.ini")
         textView.isVerticallyResizable = true; textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]; textView.textContainer?.widthTracksTextView = true
         textView.delegate = self
@@ -44,7 +50,7 @@ final class UserCommandsWindow: NSWindowController, NSWindowDelegate, NSTextView
         let save = NSButton(title: "Сохранить", target: self, action: #selector(saveDocument(_:)))
         save.keyEquivalent = "s"; save.keyEquivalentModifierMask = [.command]
         let close = NSButton(title: "Закрыть", target: self, action: #selector(closeEditor))
-        let actions = NSStackView(views: [example, importMenu, validate, NSView(), close, save]); actions.spacing = 10
+        let actions = NSStackView(views: (farMenu == nil ? [example, importMenu] : []) + [validate, NSView(), close, save]); actions.spacing = 10
         let content = NSView()
         for view in [path, help, localHelp, scroll, status, actions] {
             view.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(view)
@@ -65,7 +71,10 @@ final class UserCommandsWindow: NSWindowController, NSWindowDelegate, NSTextView
         window.contentView = content
         window.initialFirstResponder = textView
         do {
-            if let text = try store.loadGlobalText() {
+            if let farMenu {
+                textView.string = try store.farMenuText(farMenu)
+                status.stringValue = "FarMenu.ini загружен. Сохранение проверяет структуру всего файла."
+            } else if let text = try store.loadGlobalText() {
                 textView.string = text
                 status.stringValue = "Глобальная конфигурация загружена. Сохранение проверяет весь файл."
             } else {
@@ -127,7 +136,8 @@ final class UserCommandsWindow: NSWindowController, NSWindowDelegate, NSTextView
     func finalizeClose() {
         guard pendingDiscard else { return }
         pendingDiscard = false; dirty = false; window?.isDocumentEdited = false
-        textView.string = (try? store.loadGlobalText()) ?? UserCommandStore.example
+        if let farMenu { textView.string = (try? store.farMenuText(farMenu)) ?? "" }
+        else { textView.string = (try? store.loadGlobalText()) ?? UserCommandStore.example }
         setStatus("Несохранённые изменения отменены.")
     }
 
@@ -136,13 +146,20 @@ final class UserCommandsWindow: NSWindowController, NSWindowDelegate, NSTextView
     }
     @objc private func validateText() {
         do {
-            let config = try UserCommandConfiguration.decode(Data(textView.string.utf8))
-            setStatus("Конфигурация корректна: \(config.menu.count) пунктов верхнего уровня, \(config.associations.count) ассоциаций. Команды не запускались.")
+            let data = Data(textView.string.utf8)
+            if farMenu != nil {
+                let result = try FarMenuImporter.parseNative(data)
+                setStatus("Структура корректна. Пунктов верхнего уровня: \(result.menu.count).")
+            } else {
+                let config = try UserCommandConfiguration.decode(data)
+                setStatus("Конфигурация корректна: \(config.menu.count) пунктов верхнего уровня, \(config.associations.count) ассоциаций.")
+            }
         } catch { setStatus(error.localizedDescription, error: true) }
     }
     @objc private func saveText() {
         do {
-            try store.saveGlobalText(textView.string)
+            if let original = farMenu { farMenu = try store.saveFarMenuText(textView.string, replacing: original) }
+            else { try store.saveGlobalText(textView.string) }
             pendingDiscard = false; dirty = false; window?.isDocumentEdited = false
             setStatus("Сохранено. Новые команды доступны при следующем открытии меню или вызове ассоциации.")
             onSave()
@@ -189,7 +206,7 @@ final class UserCommandsWindow: NSWindowController, NSWindowDelegate, NSTextView
         let store = UserCommandStore(globalURL: directory.appendingPathComponent("commands.json"))
         let controller = UserCommandsWindow(store: store)
         defer { controller.window?.orderOut(nil) }
-        let imported = try FarMenuImporter.parse(Data("F3: Inspect\n  printf '%s' !.!\n".utf8))
+        let imported = try FarMenuImporter.parseNative(Data("F3: Inspect\n  printf '%s' !.!\n  true\n".utf8))
         try controller.installImportedMenu(imported)
         guard controller.dirty, controller.window?.isDocumentEdited == true,
               !FileManager.default.fileExists(atPath: store.globalURL.path) else { throw UserCommandError("Import must leave a dirty buffer without saving or execution") }
@@ -222,10 +239,19 @@ final class UserCommandParameterForm {
     let fields: [NSTextField]
     private let inputs: [UserCommandInput]
     var values: [String: String] { Dictionary(uniqueKeysWithValues: zip(inputs, fields).map { ($0.identifier, $1.stringValue) }) }
-    init(inputs: [UserCommandInput]) {
+    init(inputs: [UserCommandInput], history: CommandParameterHistory = .init()) {
         self.inputs = inputs
         fields = inputs.map { input in
-            let field = NSTextField(string: input.defaultValue)
+            let values = input.historyName.map { history.values(for: $0) } ?? []
+            let field: NSTextField
+            if !values.isEmpty {
+                let combo = NSComboBox()
+                combo.addItems(withObjectValues: values)
+                combo.stringValue = input.defaultValue.isEmpty ? values[0] : input.defaultValue
+                field = combo
+            } else {
+                field = NSTextField(string: input.defaultValue)
+            }
             field.setAccessibilityLabel(input.title)
             field.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
             return field
@@ -244,16 +270,20 @@ final class UserCommandParameterForm {
         view = NSScrollView(frame: NSRect(x: 0, y: 0, width: 490, height: min(420, height)))
         view.hasVerticalScroller = true; view.documentView = document; view.borderType = .bezelBorder
     }
-    static func collect(_ inputs: [UserCommandInput], title: String) -> [String: String]? {
+    static func collect(_ inputs: [UserCommandInput], title: String, history: inout CommandParameterHistory) -> [String: String]? {
         guard !inputs.isEmpty else { return [:] }
-        let form = UserCommandParameterForm(inputs: inputs)
+        let form = UserCommandParameterForm(inputs: inputs, history: history)
         let alert = NSAlert(); alert.messageText = title
-        alert.informativeText = L10n.text("Введите параметры. Каждое значение передаётся одним буквальным аргументом; команда появится для проверки следующим шагом.")
+        alert.informativeText = L10n.text("Введите параметры. Каждое значение передаётся одним буквальным аргументом.")
         alert.accessoryView = form.view
         alert.addButton(withTitle: L10n.text("Продолжить")); alert.addButton(withTitle: L10n.text("Отмена"))
         alert.window.initialFirstResponder = form.fields.first
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        return form.values
+        let values = form.values
+        for input in inputs {
+            if let name = input.historyName, let value = values[input.identifier] { history.record(value, for: name) }
+        }
+        return values
     }
 }
 

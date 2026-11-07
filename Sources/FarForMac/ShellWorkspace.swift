@@ -15,6 +15,20 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     private(set) var terminalView: NSView!
     var context: () -> UserCommandContext
     var navigate: (URL) -> Void
+    var navigateMenuDirectory: ((URL, Bool, @escaping (Bool) -> Void) -> Void)?
+    var navigateInternalDirectory: ((URL, Bool, Bool, @escaping (Bool) -> Void) -> Void)?
+    var executePluginCommand: ((String, String, URL) -> Bool)?
+    var pluginCommandBusy: (() -> Bool)?
+    var pluginCommandFailure: (() -> String?)?
+    var cancelPluginCommand: (() -> Void)?
+    var executeFarCommand: ((InternalFarCommand) -> Bool)?
+    var setCommandTitle: ((String?) -> Void)?
+    var exitFromCommand: ((Int32) -> Void)?
+    var showUserMenuHelp: (() -> Void)?
+    var showUserMenuPlugins: (() -> Void)?
+    var promptNetworkPath: (() -> String?)?
+    var farCmdsEnvironment: [String: String] { commandState.environment }
+    func appendFarCmdsOutput(_ data: Data) { screen.append(data); scheduleTerminalRender() }
     /// URL, passive side, preserve the original history position.
     var navigateHistoryFolder: ((URL, Bool, Bool) -> Void)?
     var openFile: (URL, Bool) -> Void
@@ -38,8 +52,33 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     private var smokeShellTrace: [String] = []
     private var shellDirectory: URL?
     private var pendingCommand: String?
+    private var pendingCommandEcho = true
+    private var appliedEnvironmentOverrides: [String: String] = [:]
+    private var appliedEnvironmentRemovals: Set<String> = []
+    private var commandState = InternalCommandState()
+    private var navigatingInternalCommand = false
     private var preparedRunning: PreparedUserCommand?
     private var preparedDraft: PreparedUserCommand?
+    private var preparedPlugin: PreparedUserCommand?
+    private var pluginWait: Task<Void, Never>?
+    private struct ApplySequence {
+        let template: String
+        var files: ArraySlice<URL>
+        var executingFile: URL?
+        let onProcessed: (URL) -> Void
+    }
+    private struct MenuSequence {
+        let id = UUID()
+        let context: UserCommandContext
+        let title: String
+        var remaining: ArraySlice<String>
+        var directory: URL
+        var previousDirectory: URL?
+        var hasTerminalOutput = false
+        var variables: [String: String] = [:]
+        var application: ApplySequence?
+    }
+    private var menuSequence: MenuSequence?
     private let persistentMode = NSButton(checkboxWithTitle: L10n.text("Сохранять состояние shell"), target: nil, action: nil)
     private lazy var panelToShell = button(L10n.text("Папка панели → shell"), #selector(usePanelDirectory))
     private lazy var shellToPanel = button(L10n.text("Папка shell → панель"), #selector(useShellDirectory))
@@ -48,6 +87,8 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     private var history = CommandHistory()
     private var historyPosition = -1
     private var historyDraft = ""
+    private var historyPrefix: String?
+    private var historyPrefixIndex = 0
     private var suppressFileHistoryPath: String?
     private var separateTerminals: [SeparateCommandTerminal] = []
     private var previousDirectory: URL?
@@ -57,7 +98,12 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     private var columns = 100
     private var rows = 30
     private var completionGeneration = 0
-    private var completing = false
+    private var completionWork: DispatchWorkItem?
+    private let completionQueue = DispatchQueue(label: "FarForMac.command-completion", qos: .userInitiated)
+    private let completionList = ShellCompletionList()
+    private var completionSettings = ShellCompletionSettings()
+    private var promptFormat = "$p$g"
+    private var customPromptEnabled = false
     private var historyWritable = true
     private let historyQueue = DispatchQueue(label: "FarForMac.history", qos: .utility)
     var isRunning: Bool { session?.isRunning == true }
@@ -71,6 +117,11 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         self.showTerminal = showTerminal; self.togglePanels = togglePanels
         self.refreshPanels = refreshPanels; self.report = report
         super.init()
+        if let data = AppPreferences.defaults.data(forKey: "command.completion"), data.count <= 4096,
+           let settings = try? JSONDecoder().decode(ShellCompletionSettings.self, from: data) { completionSettings = settings }
+        if let format = AppPreferences.defaults.string(forKey: "command.prompt"), format.utf8.count <= 4096 { promptFormat = format }
+        customPromptEnabled = AppPreferences.defaults.bool(forKey: "command.customPrompt")
+        completionList.onChoose = { [weak self] command in self?.setCommand(command) }
         if loadHistory {
             do { history = try CommandHistory.load(from: AppRuntime.historyURL) }
             catch { historyWritable = false; report("История не загружена; исходный файл сохранён: \(error.localizedDescription)") }
@@ -79,6 +130,8 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         input.setAccessibilityLabel("Командная строка")
         input.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
         input.delegate = self; input.target = self; input.action = #selector(runInput)
+        directoryLabel.maximumNumberOfLines = 1
+        directoryLabel.lineBreakMode = .byTruncatingMiddle
         let run = button("Выполнить", #selector(runInput))
         let historyButton = button("История…", #selector(commandHistory))
         let shell = button("Shell", #selector(interactiveShell))
@@ -90,15 +143,19 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         terminalText.backgroundColor = Palette.background; terminalText.textColor = Palette.text
         // Input is forwarded by TerminalTextView; native Paste must remain enabled.
         terminalText.isEditable = true; terminalText.isSelectable = true
-        terminalText.isRichText = true; terminalText.isHorizontallyResizable = true
+        terminalText.isRichText = true; terminalText.isHorizontallyResizable = false
+        terminalText.isVerticallyResizable = true
+        terminalText.textContainerInset = NSSize(width: 1, height: 4)
         terminalText.textContainer?.widthTracksTextView = false
         terminalText.textContainer?.containerSize = NSSize(width: 100_000, height: CGFloat.greatestFiniteMagnitude)
         terminalText.autoresizingMask = [.width]
         terminalText.setAccessibilityLabel(L10n.text("Вывод терминала"))
         terminalText.onInput = { [weak self] data in self?.send(data) }
+        terminalText.onReport = { [weak self] data in self?.sendTerminalReport(data) }
         terminalText.onToggle = { [weak self] in self?.togglePanels() }
+        terminalText.onCompositionEnd = { [weak self] in self?.scheduleTerminalRender() }
         terminalScroll.documentView = terminalText
-        terminalScroll.hasVerticalScroller = true; terminalScroll.hasHorizontalScroller = true
+        terminalScroll.hasVerticalScroller = true
         terminalScroll.drawsBackground = false
         let controls = horizontal([terminalStatus, NSView(), button("Ctrl+C Прервать", #selector(interrupt)), button("Остановить", #selector(stop)), button("Ctrl+O Панели", #selector(panels))], spacing: 8)
         let content = vertical([inset(controls, x: 10, y: 7), terminalScroll])
@@ -111,16 +168,136 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     private func button(_ title: String, _ action: Selector) -> NSButton { NSButton(title: title, target: self, action: action) }
     func updateDirectory(record: Bool = false) {
         let url = context().activeDirectory
-        completionGeneration += 1
-        if lastDirectory != url { previousDirectory = lastDirectory; lastDirectory = url }
-        input.placeholderString = L10n.text(persistentMode.state == .on ? "Команда в папке shell · Enter — выполнить · Tab — путь" : "Команда в активной папке · Enter — выполнить · Tab — путь")
-        if persistentMode.state == .on {
-            directoryLabel.stringValue = "zsh: " + (shellDirectory?.path ?? url.path) + "  ·  " + L10n.text("Папка панели синхронизируется кнопками")
-        } else {
-            directoryLabel.stringValue = "\(url.path) >  ·  " + L10n.text("каждая команда — отдельный shell; cd меняет панель")
+        if lastDirectory != url {
+            completionGeneration += 1
+            completionWork?.cancel()
+            completionList.dismiss()
+            previousDirectory = lastDirectory
+            lastDirectory = url
         }
+        input.placeholderString = L10n.text(persistentMode.state == .on ? "Команда в папке shell · Enter — выполнить · Tab — путь" : "Команда в активной папке · Enter — выполнить · Tab — путь")
+        refreshPrompt()
         if record { recordActivity(.folder, value: url.path) }
     }
+    func refreshPrompt() {
+        let directory = commandDirectory
+        let prompt = ShellPrompt.render(customPromptEnabled ? promptFormat : "$p$g", directory: directory,
+            environment: customPromptEnabled ? commandState.environment : [:], stackDepth: commandState.directoryStack.count,
+            networkPath: promptNetworkPath?(), isAdministrator: geteuid() == 0,
+            administratorLabel: L10n.text("Администратор"))
+        let font = NSFont.monospacedSystemFont(ofSize: UIPreferences.fontSize(11), weight: .regular)
+        let availableWidth = commandBar?.bounds.width ?? 0
+        let cellWidth = max(1, ("M" as NSString).size(withAttributes: [.font: font]).width)
+        let columns = availableWidth > 0 ? max(1, Int(availableWidth / cellWidth)) : 100
+        let text = NSMutableAttributedString(string: "")
+        func color(_ value: TerminalColor?) -> NSColor? {
+            guard let (red, green, blue) = value?.rgbComponents else { return nil }
+            return NSColor(srgbRed: CGFloat(red) / 255, green: CGFloat(green) / 255, blue: CGFloat(blue) / 255, alpha: 1)
+        }
+        for segment in prompt.fitted(to: columns) {
+            let style = segment.style, names = style.styles
+            var traits: NSFontTraitMask = []
+            if names.contains("bold") { traits.insert(.boldFontMask) }
+            if names.contains("italic") { traits.insert(.italicFontMask) }
+            var foreground = color(style.foreground) ?? Palette.muted
+            var background = color(style.background)
+            if names.contains("inverse") { (foreground, background) = (background ?? Palette.background, foreground) }
+            if names.contains("invisible") { foreground = background ?? Palette.background }
+            if names.contains("faint") { foreground = foreground.blended(withFraction: 0.5, of: background ?? Palette.background) ?? foreground }
+            var attributes: [NSAttributedString.Key: Any] = [.font: traits.isEmpty ? font : NSFontManager.shared.convert(font, toHaveTrait: traits),
+                                                           .foregroundColor: foreground]
+            if let background { attributes[.backgroundColor] = background }
+            if names.contains("strikeout") { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+            let underline: NSUnderlineStyle
+            if names.contains("underline_double") { underline = .double }
+            else if names.contains("underline_dot") { underline = [.single, .patternDot] }
+            else if names.contains("underline_dash") { underline = [.single, .patternDash] }
+            else if names.contains("underline") || names.contains("underline_curly") { underline = .single }
+            else { underline = [] }
+            if !underline.isEmpty { attributes[.underlineStyle] = underline.rawValue }
+            if let tint = color(style.underlineColor) { attributes[.underlineColor] = tint }
+            text.append(NSAttributedString(string: segment.text, attributes: attributes))
+        }
+        let detail = persistentMode.state == .on ? L10n.text("Папка панели синхронизируется кнопками") : L10n.text("каждая команда — отдельный shell; cd меняет панель")
+        if !customPromptEnabled { text.append(NSAttributedString(string: "  ·  " + detail, attributes: [.font: font, .foregroundColor: Palette.muted])) }
+        directoryLabel.attributedStringValue = text
+    }
+
+    func configureCommandLine() {
+        let prompt = NSTextField(string: promptFormat)
+        prompt.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        prompt.setAccessibilityLabel("Формат приглашения")
+        prompt.widthAnchor.constraint(equalToConstant: 440).isActive = true
+        let enabled = NSButton(checkboxWithTitle: "Свой формат приглашения", target: nil, action: nil)
+        enabled.state = customPromptEnabled ? .on : .off
+        let automatic = NSButton(checkboxWithTitle: "Дополнять автоматически", target: nil, action: nil)
+        automatic.state = completionSettings.automatic ? .on : .off
+        let stack = NSStackView(views: [automatic, enabled, prompt,
+            NSTextField(labelWithString: "$P — путь · $W — папка · $T — время · $+ — стек · $#nn — ширина")])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.frame = NSRect(x: 0, y: 0, width: 460, height: 116)
+        let alert = NSAlert()
+        alert.messageText = "Настройки командной строки"
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Сохранить")
+        alert.addButton(withTitle: "Отмена")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard prompt.stringValue.utf8.count <= 4096 else { report("Формат приглашения превышает 4 КиБ."); return }
+        customPromptEnabled = enabled.state == .on
+        promptFormat = prompt.stringValue
+        completionSettings.automatic = automatic.state == .on
+        saveCompletionSettings()
+        AppPreferences.defaults.set(customPromptEnabled, forKey: "command.customPrompt")
+        AppPreferences.defaults.set(promptFormat, forKey: "command.prompt")
+        refreshPrompt()
+    }
+
+    func configureAutoCompletion() {
+        let list = NSButton(checkboxWithTitle: "Показывать список", target: nil, action: nil)
+        let modal = NSButton(checkboxWithTitle: "Модальный список по Ctrl+Пробел", target: nil, action: nil)
+        let append = NSButton(checkboxWithTitle: "Добавлять первый вариант", target: nil, action: nil)
+        for (button, value) in [(list, completionSettings.showList), (modal, completionSettings.modalList), (append, completionSettings.appendFirst)] {
+            button.state = value ? .on : .off
+        }
+        let modes: [ShellCompletionMode] = [.automatic, .manualOnly, .disabled]
+        let popups = ShellCompletionSource.allCases.map { source in
+            let popup = NSPopUpButton()
+            popup.addItems(withTitles: ["Автоматически и вручную", "Только вручную", "Выключено"])
+            popup.selectItem(at: modes.firstIndex(of: completionSettings.sources[source] ?? .automatic) ?? 0)
+            popup.setAccessibilityLabel(ShellCompletionList.title(source))
+            return popup
+        }
+        let rows: [[NSView]] = zip(ShellCompletionSource.allCases, popups).map {
+            [NSTextField(labelWithString: ShellCompletionList.title($0)), $1]
+        }
+        let grid = NSGridView(views: rows)
+        grid.rowSpacing = 7
+        let stack = NSStackView(views: [list, modal, append, grid])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.frame = NSRect(x: 0, y: 0, width: 430, height: 235)
+        let alert = NSAlert()
+        alert.messageText = "Настройки автодополнения"
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Сохранить")
+        alert.addButton(withTitle: "Отмена")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        completionSettings.showList = list.state == .on
+        completionSettings.modalList = modal.state == .on
+        completionSettings.appendFirst = append.state == .on
+        for (source, popup) in zip(ShellCompletionSource.allCases, popups) {
+            completionSettings.sources[source] = modes[max(0, popup.indexOfSelectedItem)]
+        }
+        saveCompletionSettings()
+    }
+
+    private func saveCompletionSettings() {
+        AppPreferences.defaults.set(try? JSONEncoder().encode(completionSettings), forKey: "command.completion")
+    }
+
     func recordActivity(_ kind: ActivityHistoryKind, value: String, directory: String? = nil) {
         guard (kind != .view && kind != .edit) || suppressFileHistoryPath != value else { return }
         do { try history.record(kind: kind, value: value, directory: directory); saveHistory() }
@@ -128,64 +305,163 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     }
     func applyInterfacePreferences() {
         updateDirectory(); resizeTerminal()
-        terminalText.textStorage?.setAttributedString(TerminalRenderer.render(screen, font: .monospacedSystemFont(ofSize: UIPreferences.fontSize(13), weight: .regular)))
+        TerminalRenderer.applyHostColors(to: &screen)
+        renderTerminal()
     }
     func focusCommand() { input.window?.makeFirstResponder(input) }
     func focusTerminal() { terminalText.window?.makeFirstResponder(terminalText); resizeTerminal() }
     @objc private func panels() { togglePanels() }
     @objc private func runInput() {
+        if completionList.chooseSelected() { return }
         let command = input.stringValue
         guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         if execute(command, directory: context().activeDirectory, recordHistory: preparedDraft?.isEphemeral != true) {
-            preparedRunning = preparedDraft; preparedDraft = nil
-            input.stringValue = ""; historyPosition = -1
-            if !isRunning { preparedRunning?.cleanup(); preparedRunning = nil }
+            if pluginWait != nil { preparedPlugin = preparedDraft }
+            else if isRunning && (integration == nil || !shellReady) { preparedRunning = preparedDraft }
+            else { preparedDraft?.cleanup() }
+            preparedDraft = nil
+            clearCommand(focus: false)
         }
     }
     @discardableResult
-    func execute(_ command: String, directory: URL, recordHistory: Bool = true) -> Bool {
-        if persistentMode.state == .on {
-            do {
-                _ = try PersistentShellIntegration.submission(command)
-                if isRunning {
-                    guard integration != nil, shellReady else { report(L10n.text("Shell занят. Завершите ввод или программу в терминале.")); showTerminal(); return false }
-                    try submitPersistent(command)
-                } else {
-                    pendingCommand = command
-                    try start(command: nil, directory: directory)
-                }
-                if recordHistory { recordActivity(.command, value: command, directory: shellDirectory?.path ?? directory.path) }
-                return true
-            } catch { pendingCommand = nil; report(error.localizedDescription); return false }
+    func execute(_ command: String, directory: URL, recordHistory: Bool = true, menuLine: Bool = false) -> Bool {
+        guard !navigatingInternalCommand, pluginWait == nil else { report("Выполняется предыдущая команда."); return false }
+        guard menuLine || menuSequence == nil else { report("Выполняется последовательность команд меню."); return false }
+        guard !isRunning || (persistentMode.state == .on && integration != nil && shellReady) else {
+            report(L10n.text("Shell занят. Завершите ввод или программу в терминале."))
+            showTerminal()
+            return false
         }
-        guard !isRunning else { report("Сначала завершите текущую PTY-сессию."); showTerminal(); return false }
+
         do {
-            if let destination = try ShellCommand.directoryChange(in: command, currentDirectory: directory, previousDirectory: previousDirectory) {
-                if recordHistory { recordActivity(.command, value: command, directory: directory.path) }; navigate(destination); return true
+            let previous = menuLine ? menuSequence?.previousDirectory : previousDirectory
+            let evaluationDirectory = menuLine ? directory : (shellDirectory ?? directory)
+            let dispatch = try commandState.dispatch(command, currentDirectory: evaluationDirectory, previousDirectory: previous)
+            let statusDirectory = shellDirectory?.path ?? directory.path
+            switch dispatch.action {
+            case .shell(let command):
+                try runShellCommand(command, directory: directory, echo: dispatch.echo, menuLine: menuLine)
+            case .plugin(let prefix, let arguments):
+                if executePluginCommand?(prefix, arguments, evaluationDirectory) == true {
+                    try awaitPluginCompletion(menuLine: menuLine)
+                } else {
+                    try runShellCommand(dispatch.command, directory: directory, echo: dispatch.echo, menuLine: menuLine)
+                }
+            case .far(let command):
+                guard executeFarCommand?(command) == true else {
+                    throw UserCommandError("Эта команда far: недоступна в текущем контексте.")
+                }
+                if menuLine { scheduleNextMenuLine() }
+            case .directory(let destination, let closeProvider, let stack):
+                try changeInternalDirectory(to: destination, from: evaluationDirectory, closeProvider: closeProvider,
+                                            stack: stack, menuLine: menuLine)
+            case .skip:
+                if try !applyEnvironmentToPersistentShell(), menuLine { scheduleNextMenuLine() }
+            case .output(let output):
+                showTerminal()
+                let safe = String(output.unicodeScalars.map { scalar in
+                    if scalar == "\n" { return "\r\n" }
+                    if scalar == "\t" { return "\t" }
+                    return CharacterSet.controlCharacters.contains(scalar) ? "�" : String(scalar)
+                }.joined())
+                receive(Data(safe.utf8))
+                if menuLine { menuSequence?.hasTerminalOutput = true; scheduleNextMenuLine() }
+            case .clearScreen:
+                showTerminal()
+                receive(Data("\u{1b}[2J\u{1b}[3J\u{1b}[H".utf8))
+                if menuLine { menuSequence?.hasTerminalOutput = true; scheduleNextMenuLine() }
+            case .title(let title):
+                if let setCommandTitle { setCommandTitle(title) }
+                else { input.window?.title = title ?? "FarForMac" }
+                if menuLine { scheduleNextMenuLine() }
+            case .exit(let status):
+                if let exitFromCommand {
+                    if menuLine { finishMenuSequence() }
+                    exitFromCommand(status)
+                } else {
+                    try runShellCommand(dispatch.command, directory: directory, echo: dispatch.echo, menuLine: menuLine)
+                }
             }
-            try start(command: command, directory: directory)
-            if recordHistory { recordActivity(.command, value: command, directory: directory.path) }
+            if recordHistory { recordActivity(.command, value: command, directory: statusDirectory) }
+            refreshPrompt()
             return true
-        } catch { report(error.localizedDescription); return false }
+        } catch {
+            pendingCommand = nil
+            report(error.localizedDescription)
+            return false
+        }
     }
+
+    private func awaitPluginCompletion(menuLine: Bool) throws {
+        guard pluginCommandBusy?() == true else {
+            if let failure = pluginCommandFailure?() { throw UserCommandError(failure) }
+            if menuLine { scheduleNextMenuLine() }
+            return
+        }
+        let sequenceID = menuSequence?.id
+        pluginWait = Task { [weak self] in
+            while !Task.isCancelled, self?.pluginCommandBusy?() == true {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.pluginWait = nil
+            self.preparedPlugin?.cleanup()
+            self.preparedPlugin = nil
+            guard !menuLine || self.menuSequence?.id == sequenceID else { return }
+            if let failure = self.pluginCommandFailure?() {
+                self.report(failure)
+                if menuLine { self.finishMenuSequence() }
+            } else if menuLine {
+                self.scheduleNextMenuLine()
+            }
+        }
+    }
+
     @discardableResult
-    private func executePrepared(_ prepared: PreparedUserCommand, directory: URL) -> Bool {
-        guard execute(prepared.command, directory: directory, recordHistory: !prepared.isEphemeral) else { return false }
-        if isRunning { preparedRunning = prepared }
+    func cancelCommandSequence() -> Bool {
+        guard menuSequence != nil || pluginWait != nil else { return false }
+        if pluginWait != nil || !isRunning { cancelMenuSequence() }
+        else { interrupt() }
+        return true
+    }
+
+    private func runShellCommand(_ command: String, directory: URL, echo: Bool, menuLine: Bool) throws {
+        if persistentMode.state == .on {
+            _ = try PersistentShellIntegration.submission(command, echo: echo)
+            if isRunning { try submitPersistent(command, echo: echo) }
+            else {
+                pendingCommand = command
+                pendingCommandEcho = echo
+                try start(command: nil, directory: directory, echo: echo)
+            }
+        } else {
+            try start(command: command, directory: directory, keepingOutput: menuLine && menuSequence?.hasTerminalOutput == true, echo: echo)
+        }
+        if menuLine { menuSequence?.hasTerminalOutput = true }
+    }
+
+    @discardableResult
+    private func executePrepared(_ prepared: PreparedUserCommand, directory: URL, menuLine: Bool = false, recordHistory: Bool = true) -> Bool {
+        let previousSession = sessionID
+        guard execute(prepared.command, directory: directory, recordHistory: recordHistory && !prepared.isEphemeral, menuLine: menuLine) else { return false }
+        if pluginWait != nil { preparedPlugin = prepared }
+        else if sessionID != previousSession || (isRunning && integration != nil && !shellReady) { preparedRunning = prepared }
         else { prepared.cleanup() }
         return true
     }
     @objc func interactiveShell() {
+        guard menuSequence == nil || isRunning else { return }
         showTerminal()
         if !isRunning { do { try start(command: nil, directory: context().activeDirectory) } catch { report(error.localizedDescription) } }
         focusTerminal()
     }
-    private func start(command: String?, directory: URL) throws {
+    private func start(command: String?, directory: URL, keepingOutput: Bool = false, echo: Bool = true) throws {
         let id = UUID(); sessionID = id
+        let sequenceID = menuSequence?.id
         cancelManagedInterrupt()
         integration?.cleanup(); integration = nil; shellReady = false; shellDirectory = nil; terminalDraft = false; awaitingInitialPrompt = false
         promptActive = false; pendingPromptClears = 0; awaitingTypedCommand = false; commandPhase = .entering
-        let configuration: TerminalSession.Configuration
+        var configuration: TerminalSession.Configuration
         if persistentMode.state == .on {
             let bridge = try PersistentShellIntegration(); integration = bridge; awaitingInitialPrompt = true
             configuration = bridge.configuration(directory: directory, columns: columns, rows: rows)
@@ -193,15 +469,32 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
             configuration = .init(command: command, directory: directory, columns: columns, rows: rows,
                                   environmentOverrides: ["TERM": "xterm-256color", "COLORTERM": "truecolor"])
         }
-        screen = TerminalScreen(columns: columns, rows: rows)
-        terminalText.string = ""; terminalStatus.stringValue = "PTY · \(directory.path) · \(command ?? "интерактивный shell")"
+        appliedEnvironmentOverrides = commandState.environmentOverrides
+        appliedEnvironmentRemovals = commandState.environmentRemovals
+        let integrationDirectory = integration?.directory.path
+        configuration.environmentOverrides.merge(appliedEnvironmentOverrides) { _, value in value }
+        for name in appliedEnvironmentRemovals { configuration.environmentOverrides.removeValue(forKey: name) }
+        if let integrationDirectory { configuration.environmentOverrides["ZDOTDIR"] = integrationDirectory }
+        configuration.environmentRemovals = appliedEnvironmentRemovals.subtracting(configuration.environmentOverrides.keys)
+        if keepingOutput { screen.continueWithNewProcess() }
+        else { screen = TerminalScreen(columns: columns, rows: rows); terminalText.string = "" }
+        TerminalRenderer.applyHostColors(to: &screen)
+        terminalText.updateTerminalModes(screen)
+        scheduleTerminalRender()
+        terminalStatus.stringValue = "PTY · " + directory.path
+        if echo { terminalStatus.stringValue += " · " + (command ?? "интерактивный shell") }
         let next = TerminalSession(configuration: configuration, onOutput: { [weak self] data in
             guard let self, self.sessionID == id else { return }; self.receive(data)
         }, onExit: { [weak self] result in
             guard let self, self.sessionID == id else { return }
             self.cancelManagedInterrupt()
-            self.input.isEnabled = true; self.persistentMode.isEnabled = true
-            self.shellReady = false; self.pendingCommand = nil; self.shellDirectory = nil
+            self.screen.finishProcess()
+            self.terminalText.hasActiveProcess = false
+            self.terminalText.updateTerminalModes(self.screen)
+            self.scheduleTerminalRender()
+            self.input.isEnabled = true
+            self.persistentMode.isEnabled = self.menuSequence == nil
+            self.shellReady = false; self.awaitingInitialPrompt = false; self.pendingCommand = nil; self.shellDirectory = nil
             self.promptActive = false; self.pendingPromptClears = 0; self.awaitingTypedCommand = false; self.terminalDraft = false
             self.integration?.cleanup(); self.integration = nil
             self.preparedRunning?.cleanup(); self.preparedRunning = nil
@@ -209,14 +502,26 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
             self.updateDirectory()
             let outcome = result.signal.map { "сигнал \($0)" } ?? "код \(result.code ?? -1)"
             self.terminalStatus.stringValue = "PTY завершён: \(outcome) · Ctrl+O — вернуться к панелям"
-            self.refreshPanels()
+            if configuration.command != nil, result.signal == nil,
+               let sequenceID, self.menuSequence?.id == sequenceID {
+                self.runNextMenuLine()
+            } else {
+                if configuration.command == nil || self.menuSequence?.id == sequenceID { self.menuSequence = nil }
+                if self.menuSequence == nil {
+                    self.persistentMode.isEnabled = true
+                    self.refreshPanels()
+                }
+            }
         })
         session = next
         do { try next.start() } catch { session = nil; integration?.cleanup(); integration = nil; throw error }
+        terminalText.hasActiveProcess = true
         persistentMode.isEnabled = false
         input.isEnabled = false; showTerminal(); focusTerminal()
     }
     private func receive(_ data: Data) {
+        var completedMenuLine = false
+        let displayData = integration?.filterCommandEcho(data) ?? data
         if let integration {
             for state in integration.consume(data) {
                 traceShellStateForSmoke(state.clearedDraft ? "cleared" : state.ready ? "ready" : state.continuation ? "continuation" : "busy")
@@ -236,13 +541,16 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
                 input.isEnabled = shellReady; panelToShell.isEnabled = shellReady; shellToPanel.isEnabled = shellReady && shellDirectory != nil
                 if state.ready, pendingCommand == nil, !state.clearedDraft {
                     preparedRunning?.cleanup(); preparedRunning = nil
+                    completedMenuLine = menuSequence != nil && pluginWait == nil && !navigatingInternalCommand
                 }
                 if shellReady {
                     terminalStatus.stringValue = "zsh · " + (shellDirectory?.path ?? "") + " · " + L10n.text("Код завершения") + ": \(state.exitCode ?? 0)"
-                    updateDirectory(); refreshPanels()
+                    updateDirectory()
+                    if menuSequence == nil { refreshPanels() }
                     if let command = pendingCommand {
                         pendingCommand = nil
-                        do { try submitPersistent(command) } catch { report(error.localizedDescription) }
+                        do { try submitPersistent(command, echo: pendingCommandEcho) }
+                        catch { preparedRunning?.cleanup(); preparedRunning = nil; menuSequence = nil; report(error.localizedDescription) }
                     }
                 } else if promptActive && terminalDraft {
                     terminalStatus.stringValue = L10n.text("Есть ввод в терминале · Ctrl+C — очистить строку и включить командную строку")
@@ -250,39 +558,73 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
             }
             if promptActive, managedInterrupt != nil { finishManagedInterrupt() }
         }
-        screen.append(data)
+        screen.append(displayData)
         let responses = screen.takeResponses()
         if !responses.isEmpty { try? session?.send(responses) }
-        terminalText.applicationCursorKeys = screen.applicationCursorKeys
-        terminalText.bracketedPasteEnabled = screen.bracketedPasteEnabled
+        terminalText.updateTerminalModes(screen)
+        if completedMenuLine, let id = menuSequence?.id {
+            if shellReady { DispatchQueue.main.async { [weak self] in
+                guard let self, self.menuSequence?.id == id else { return }
+                self.runNextMenuLine()
+            } }
+            else { menuSequence = nil }
+        }
+        scheduleTerminalRender()
+    }
+    private func sendTerminalReport(_ data: Data) {
+        guard isRunning, managedInterrupt == nil else { return }
+        try? session?.send(data)
+    }
+    private var terminalFont: NSFont { .monospacedSystemFont(ofSize: UIPreferences.fontSize(13), weight: .regular) }
+    private func scheduleTerminalRender() {
         guard !renderScheduled else { return }
         renderScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
             guard let self else { return }; self.renderScheduled = false
-            self.terminalText.textStorage?.setAttributedString(TerminalRenderer.render(self.screen, font: .monospacedSystemFont(ofSize: UIPreferences.fontSize(13), weight: .regular)))
-            self.terminalText.insertionPointColor = self.screen.cursorVisible ? Palette.text : .clear
-            let cursor = NSRange(location: min(self.screen.cursorOffset, (self.terminalText.string as NSString).length), length: 0)
-            self.terminalText.setSelectedRange(cursor)
-            self.terminalText.scrollRangeToVisible(cursor)
+            self.renderTerminal()
+        }
+    }
+    private func renderTerminal() {
+        guard !terminalText.hasMarkedText() else { return }
+        let font = terminalFont
+        let geometry = TerminalRenderer.geometry(font: font)
+        let clip = terminalScroll.contentView
+        let selection = terminalText.selectedRange()
+        let wasAtBottom = terminalText.bounds.maxY <= clip.bounds.maxY + geometry.lineHeight
+        terminalText.updateTerminalGeometry(screen, geometry: geometry)
+        TerminalRenderer.update(terminalText, screen: screen, font: font)
+        let length = (terminalText.string as NSString).length
+        if !screen.isAlternateScreen, selection.length > 0, NSMaxRange(selection) <= length {
+            terminalText.setSelectedRange(selection)
+        } else {
+            let cursor = NSRange(location: min(screen.cursorOffset, length), length: 0)
+            terminalText.setSelectedRange(cursor)
+            if screen.isAlternateScreen {
+                clip.scroll(to: .zero)
+                terminalScroll.reflectScrolledClipView(clip)
+            } else if wasAtBottom {
+                terminalText.scrollRangeToVisible(cursor)
+            }
         }
     }
     private func resizeTerminal() {
         let size = terminalScroll.contentSize
         guard size.width > 40, size.height > 40 else { return }
-        let font = NSFont.monospacedSystemFont(ofSize: UIPreferences.fontSize(13), weight: .regular)
-        let width = ("M" as NSString).size(withAttributes: [.font: font]).width
-        let lineHeight = terminalText.layoutManager?.defaultLineHeight(for: font) ?? font.pointSize * 1.2
-        let newColumns = max(10, min(400, Int((size.width - 12) / width)))
-        let newRows = max(3, min(200, Int((size.height - 8) / lineHeight)))
+        let geometry = TerminalRenderer.geometry(font: terminalFont)
+        let newColumns = max(10, min(400, Int((size.width - terminalText.horizontalTextInset) / geometry.cellWidth)))
+        let newRows = max(3, min(200, Int((size.height - terminalText.verticalTextInset) / geometry.lineHeight)))
         guard newColumns != columns || newRows != rows else { return }
         columns = newColumns; rows = newRows; screen.resize(columns: columns, rows: rows)
+        scheduleTerminalRender()
         if isRunning { do { try session?.resize(columns: columns, rows: rows) } catch { report(error.localizedDescription) } }
     }
     private func send(_ data: Data) {
+        let interruptKey = data == Data([3])
+        if interruptKey { cancelMenuSequence() }
         guard isRunning else { return }
         if integration != nil {
-            guard !awaitingInitialPrompt else { NSSound.beep(); return }
-            if data == Data([3]) {
+            guard !awaitingInitialPrompt else { if !interruptKey { NSSound.beep() }; return }
+            if interruptKey {
                 let foreground = session?.foregroundProcessGroup
                 if promptActive || managedInterrupt != nil || commandPhase != .busy || foreground == nil
                     || (foreground == session?.processID && session?.interruptKeyIsInput != true) {
@@ -314,9 +656,33 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         }
         do { try session?.send(data) } catch { report(error.localizedDescription) }
     }
-    private func submitPersistent(_ command: String) throws {
+    private func environmentUpdatesForPersistentShell() throws -> [String] {
+        var updates: [String] = []
+        for name in commandState.environmentRemovals.subtracting(appliedEnvironmentRemovals).sorted()
+            where InternalCommandState.validShellName(name) {
+            updates.append("builtin unset -- " + name)
+        }
+        for (name, value) in commandState.environmentOverrides.sorted(by: { $0.key < $1.key })
+            where appliedEnvironmentOverrides[name] != value && InternalCommandState.validShellName(name) {
+            updates.append("builtin export " + name + "=" + (try ShellCommand.quoteArgument(value)))
+        }
+        return updates
+    }
+
+    private func applyEnvironmentToPersistentShell() throws -> Bool {
+        guard isRunning, integration != nil, try !environmentUpdatesForPersistentShell().isEmpty else { return false }
+        try submitPersistent("", echo: false)
+        return true
+    }
+
+    private func submitPersistent(_ command: String, echo: Bool = true) throws {
         guard shellReady else { throw TerminalSession.SessionError.notRunning }
-        try session?.sendToForegroundShell(PersistentShellIntegration.submission(command))
+        var lines = try environmentUpdatesForPersistentShell()
+        if !command.isEmpty { lines.append(command) }
+        try session?.sendToForegroundShell(PersistentShellIntegration.submission(lines.joined(separator: "; "), echo: echo))
+        if !echo { integration?.suppressNextCommandEcho() }
+        appliedEnvironmentOverrides = commandState.environmentOverrides
+        appliedEnvironmentRemovals = commandState.environmentRemovals
         promptActive = false; awaitingTypedCommand = true; commandPhase = .entering
         shellReady = false; input.isEnabled = false; panelToShell.isEnabled = false; shellToPanel.isEnabled = false
         showTerminal(); focusTerminal()
@@ -326,15 +692,16 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         updateDirectory()
     }
     @objc private func usePanelDirectory() {
-        guard shellReady else { return }
+        guard shellReady, menuSequence == nil else { return }
         do { try submitPersistent("builtin cd -- " + ShellCommand.quoteArgument(context().activeDirectory.path)) }
         catch { report(error.localizedDescription) }
     }
     @objc private func useShellDirectory() {
-        guard shellReady, let directory = shellDirectory else { return }
+        guard shellReady, menuSequence == nil, let directory = shellDirectory else { return }
         navigate(directory)
     }
     @objc private func interrupt() {
+        cancelMenuSequence()
         do {
             // Clear through ZLE in input order; SIGINT may flush queued bytes.
             if integration == nil {
@@ -414,12 +781,20 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         if smokeShellTrace.count == 24 { smokeShellTrace.removeFirst() }
         smokeShellTrace.append("\(event) shell=\(session?.processID ?? -1) fg=\(session?.foregroundProcessGroup ?? -1)")
     }
-    @objc private func stop() { session?.stop() }
+    @objc private func stop() { cancelMenuSequence(); session?.stop() }
     func stopForExit() {
+        if pluginWait != nil { cancelPluginCommand?() }
+        pluginWait?.cancel()
+        pluginWait = nil
+        preparedPlugin?.cleanup()
+        preparedPlugin = nil
+        completionGeneration += 1
+        completionWork?.cancel()
+        completionList.dismiss()
         cancelManagedInterrupt()
         configWindow?.finalizeClose()
         for terminal in separateTerminals { terminal.workspace?.stopForExit() }
-        session?.forceStop(); integration?.cleanup(); pendingCommand = nil
+        session?.forceStop(); integration?.cleanup(); pendingCommand = nil; menuSequence = nil
         preparedRunning?.cleanup(); preparedRunning = nil; preparedDraft?.cleanup(); preparedDraft = nil
         historyQueue.sync {}
     }
@@ -434,43 +809,165 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         switch commandSelector {
         case #selector(NSResponder.insertTab(_:)): completePath(); return true
-        case #selector(NSResponder.moveUp(_:)): previousCommand(backward: true); return true
-        case #selector(NSResponder.moveDown(_:)): previousCommand(backward: false); return true
-        case #selector(NSResponder.cancelOperation(_:)): input.stringValue = ""; preparedDraft?.cleanup(); preparedDraft = nil; return true
+        case #selector(NSResponder.moveUp(_:)):
+            if completionList.isShown { completionList.move(backward: true) }
+            else { previousCommand(backward: true) }
+            return true
+        case #selector(NSResponder.moveDown(_:)):
+            if completionList.isShown { completionList.move(backward: false) }
+            else { previousCommand(backward: false) }
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            if completionList.isShown { completionList.dismiss() }
+            else { clearCommand() }
+            return true
         default: return false
         }
     }
     func previousCommand(backward: Bool) {
         let commands = history.filtered(kind: .command)
         if historyPosition == -1 { historyDraft = input.stringValue }
-        historyPosition = max(-1, min(commands.count - 1, historyPosition + (backward ? 1 : -1)))
-        input.stringValue = historyPosition < 0 ? historyDraft : commands[historyPosition].value
-        focusCommand()
+        let next = max(-1, min(commands.count - 1, historyPosition + (backward ? 1 : -1)))
+        setCommand(next < 0 ? historyDraft : commands[next].value)
+        historyPosition = next
     }
+
+    func clearCommand(focus: Bool = true) {
+        setCommand("", focus: focus)
+    }
+
+    func copyCommandOrPanelSelection(to pasteboard: NSPasteboard = .general) {
+        let command = input.stringValue as NSString
+        let value: String
+        if command.length == 0 {
+            let ctx = context()
+            let files = ctx.markedFiles.isEmpty ? ctx.currentFile.map { [$0] } ?? [] : ctx.markedFiles
+            guard !files.isEmpty else { return }
+            value = files.map(\.lastPathComponent).joined(separator: "\n")
+        } else if let selected = input.currentEditor()?.selectedRange, selected.length > 0, NSMaxRange(selected) <= command.length {
+            value = command.substring(with: selected)
+        } else {
+            value = String(command)
+        }
+        pasteboard.clearContents()
+        pasteboard.setString(value, forType: .string)
+    }
+
+    @discardableResult
+    func runSeparateInput() -> Bool {
+        let command = input.stringValue
+        guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        if runSeparateCommand(command, prepared: preparedDraft) {
+            preparedDraft = nil
+            clearCommand(focus: false)
+        }
+        return true
+    }
+
+    @discardableResult
+    func completeHistoryPrefix() -> Bool {
+        let command = input.stringValue
+        if let editor = input.currentEditor(), NSMaxRange(editor.selectedRange) != command.utf16.count { return false }
+        let prefix = historyPrefix ?? command
+        let candidates = history.completions(for: prefix)
+        guard !candidates.isEmpty else { return true }
+        let index = historyPrefixIndex % candidates.count
+        let choice = candidates[index]
+        setCommand(choice)
+        historyPrefix = prefix
+        historyPrefixIndex = index + 1
+        let start = min(prefix.utf16.count, choice.utf16.count)
+        input.currentEditor()?.selectedRange = NSRange(location: start, length: choice.utf16.count - start)
+        return true
+    }
+
+    func insertPanelValue(_ insertion: ShellPanelInsertion) {
+        do {
+            guard let value = try ShellCommand.panelInsertion(insertion, context: context()) else { return }
+            let current = input.stringValue as NSString
+            let selection = input.currentEditor()?.selectedRange ?? NSRange(location: current.length, length: 0)
+            guard NSMaxRange(selection) <= current.length else { return }
+            setCommand(current.replacingCharacters(in: selection, with: value))
+            input.currentEditor()?.selectedRange = NSRange(location: selection.location + value.utf16.count, length: 0)
+            historyPosition = -1
+        } catch { report(error.localizedDescription) }
+    }
+
     func completePath() {
-        guard !completing else { report("Дополнение пути ещё выполняется."); return }
-        completing = true
-        let value = input.stringValue, directory = commandDirectory
-        completionGeneration += 1; let token = completionGeneration
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = Result { try ShellCommand.completePath(in: value, currentDirectory: directory) }
+        if input.currentEditor() == nil { focusCommand() }
+        requestCompletion(manual: true)
+    }
+
+    private var macrosSuppressCompletion: Bool {
+        FarLuaWorkspace.shared.isRecording || FarLuaWorkspace.shared.isRunning ||
+            CommandWorkspace.shared.macros.isRecording || CommandWorkspace.shared.macros.isPlaying
+    }
+
+    private func requestCompletion(manual: Bool) {
+        guard input.isEnabled, manual || (completionSettings.automatic && !macrosSuppressCompletion) else { return }
+        let editor = input.currentEditor() as? NSTextView
+        let value = editor?.string ?? input.stringValue
+        guard manual || !value.isEmpty else { completionList.dismiss(); return }
+        if let editor {
+            guard !editor.hasMarkedText(), NSMaxRange(editor.selectedRange()) == value.utf16.count else { return }
+        }
+        completionWork?.cancel()
+        let directory = commandDirectory, settings = completionSettings
+        let entries = history.completions(for: value), environment = commandState.environment
+        completionGeneration += 1
+        let token = completionGeneration
+        let work = DispatchWorkItem { [weak self] in
+            let result = Result {
+                try ShellCommand.completeLine(value, currentDirectory: directory, history: entries,
+                    environment: environment, settings: settings, manual: manual)
+            }
             DispatchQueue.main.async {
-                guard let self else { return }; self.completing = false
-                guard self.completionGeneration == token, self.input.stringValue == value, self.commandDirectory == directory else { return }
-                do {
-                    let completion = try result.get()
-                    guard !completion.candidates.isEmpty else { self.report(completion.isTruncated ? "Достигнут предел просмотра папки. Уточните путь." : "Нет дополнений пути."); return }
-                    if completion.candidates.count == 1 && !completion.isTruncated { self.setCommand(completion.candidates[0].commandLine); return }
-                    let alert = NSAlert(); alert.messageText = "Дополнить путь"
-                    alert.informativeText = completion.isTruncated ? "Показана ограниченная часть совпадений. Уточните путь при необходимости." : "Выберите путь; команда не будет выполнена."
-                    let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 480, height: 26))
-                    popup.addItems(withTitles: completion.candidates.map(\.path)); alert.accessoryView = popup
-                    alert.addButton(withTitle: "Вставить"); alert.addButton(withTitle: "Отмена")
-                    if alert.runModal() == .alertFirstButtonReturn { self.setCommand(completion.candidates[popup.indexOfSelectedItem].commandLine) }
-                } catch { self.report(error.localizedDescription) }
+                guard let self, self.completionGeneration == token,
+                      ((self.input.currentEditor() as? NSTextView)?.string ?? self.input.stringValue) == value,
+                      self.commandDirectory == directory, manual || !self.macrosSuppressCompletion else { return }
+                self.completionWork = nil
+                do { self.showCompletion(try result.get(), original: value, manual: manual) }
+                catch { if manual { self.report(error.localizedDescription) } }
             }
         }
+        completionWork = work
+        completionQueue.asyncAfter(deadline: .now() + (manual ? 0 : 0.16), execute: work)
     }
+
+    private func showCompletion(_ completion: ShellCompletion, original: String, manual: Bool) {
+        guard let first = completion.candidates.first else {
+            completionList.dismiss()
+            if manual { report(completion.isTruncated ? "Достигнут предел поиска дополнений." : "Нет дополнений команды.") }
+            return
+        }
+        if manual, completion.candidates.count == 1, !completion.isTruncated {
+            setCommand(first.command)
+            return
+        }
+        if completionSettings.appendFirst,
+           first.command.range(of: original, options: [.anchored, .caseInsensitive]) != nil {
+            setCommand(first.command)
+            let start = min(original.utf16.count, first.command.utf16.count)
+            input.currentEditor()?.selectedRange = NSRange(location: start, length: first.command.utf16.count - start)
+        }
+        guard completionSettings.showList else { return }
+        if manual, completionSettings.modalList {
+            let menu = PanelListMenu(title: "Дополнить команду", hint: completion.isTruncated
+                ? "Показана ограниченная часть совпадений · Enter — вставить" : "Enter — вставить · Esc — отменить")
+            menu.macroArea = "ShellAutoCompletion"
+            menu.replaceRows(completion.candidates.map {
+                .init(title: ShellCompletionList.title($0.source) + " · " + $0.command.replacingOccurrences(of: "\n", with: "↵"))
+            })
+            var selected: String?
+            menu.onActivate = { [weak menu] row in selected = completion.candidates[row].command; menu?.dismiss() }
+            menu.run(relativeTo: input.window)
+            if let selected { setCommand(selected) }
+        } else {
+            completionList.show(completion.candidates, at: input, selectFirst: manual)
+            if manual, completion.isTruncated { report("Показана ограниченная часть совпадений.") }
+        }
+    }
+
     @objc private func commandHistory() { showHistory(.command) }
     private enum HistoryAction: Equatable { case open, shiftedOpen, insert, passiveFolder, view, edit }
     func showHistory(_ kind: ActivityHistoryKind, smokeKey: PanelListMenu.SmokeKey? = nil) {
@@ -566,8 +1063,9 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         switch entry.kind {
         case .command:
             setCommand(entry.value)
-            if action == .shiftedOpen { runSeparateHistoryCommand(entry.value) }
-            else { runInput() }
+            if action == .shiftedOpen {
+                if runSeparateCommand(entry.value) { clearCommand(focus: false) }
+            } else { runInput() }
         case .folder:
             let url = URL(fileURLWithPath: entry.value)
             if let navigateHistoryFolder { navigateHistoryFolder(url, action == .passiveFolder, action == .shiftedOpen) }
@@ -580,8 +1078,24 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         }
     }
 
-    private func runSeparateHistoryCommand(_ command: String) {
+    private func runSeparateCommand(_ command: String, prepared: PreparedUserCommand? = nil) -> Bool {
+        guard menuSequence == nil, pluginWait == nil, !navigatingInternalCommand else {
+            report("Выполняется предыдущая последовательность команд.")
+            return false
+        }
         let current = context(), directory = current.activeDirectory
+        let conditioned: String
+        do {
+            guard let value = try commandState.conditionallyExecutable(command, currentDirectory: directory) else {
+                prepared?.cleanup()
+                if prepared?.isEphemeral != true { recordActivity(.command, value: command, directory: directory.path) }
+                return true
+            }
+            conditioned = value
+        } catch { report(error.localizedDescription); return false }
+        let trimmed = conditioned.drop(while: \.isWhitespace)
+        let echo = !trimmed.hasPrefix("@")
+        let executable = echo ? conditioned : String(trimmed.drop(while: { $0 == "@" }).drop(while: \.isWhitespace))
         let terminal = SeparateCommandTerminal()
         let shell = ShellWorkspace(context: { current }, navigate: { _ in }, openFile: { _, _ in },
             showTerminal: { [weak terminal] in terminal?.showWindow(nil) },
@@ -591,11 +1105,13 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         terminal.window?.contentView = shell.terminalView
         terminal.onClose = { [weak self, weak terminal] in self?.separateTerminals.removeAll { $0 === terminal } }
         do {
-            try shell.start(command: command, directory: directory)
+            shell.commandState = commandState
+            try shell.start(command: executable, directory: directory, echo: echo)
+            shell.preparedRunning = prepared
             separateTerminals.append(terminal)
-            recordActivity(.command, value: command, directory: directory.path)
-            input.stringValue = ""; historyPosition = -1
-        } catch { report(error.localizedDescription) }
+            if prepared?.isEphemeral != true { recordActivity(.command, value: command, directory: directory.path) }
+            return true
+        } catch { report(error.localizedDescription); return false }
     }
     private func saveHistory() {
         guard historyWritable else { return }
@@ -605,58 +1121,236 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
             do { try snapshot.save(to: historyURL) } catch { let message = error.localizedDescription; DispatchQueue.main.async { self?.report(message) } }
         }
     }
-    func controlTextDidChange(_ notification: Notification) { historyPosition = -1 }
-    private func setCommand(_ value: String, prepared: PreparedUserCommand? = nil) {
+    func controlTextDidChange(_ notification: Notification) {
+        historyPosition = -1
+        historyPrefix = nil; historyPrefixIndex = 0
+        requestCompletion(manual: false)
+    }
+    private func setCommand(_ value: String, prepared: PreparedUserCommand? = nil, focus: Bool = true) {
+        completionGeneration += 1
+        completionWork?.cancel()
+        completionList.dismiss()
+        historyPrefix = nil; historyPrefixIndex = 0
         if let prepared { preparedDraft?.cleanup(); preparedDraft = prepared }
         else if let draft = preparedDraft, !draft.listFiles.values.contains(where: { value.contains($0.path) }) {
             draft.cleanup(); preparedDraft = nil
         }
-        input.stringValue = value; historyPosition = -1; focusCommand()
+        input.stringValue = value; historyPosition = -1
+        if focus { focusCommand() }
     }
     func showUserMenu(store: UserCommandStore? = nil, smokeKey: PanelListMenu.SmokeKey? = nil) {
         do {
+            let store = store ?? AppRuntime.commandStore
             let ctx = context()
-            let menu = try UserMenuOverlay(store: store ?? AppRuntime.commandStore, directory: ctx.activeDirectory)
+            let menu = try UserMenuOverlay(store: store, context: ctx)
+            menu.onHelp = showUserMenuHelp
+            menu.onPlugins = showUserMenuPlugins
             switch menu.run(relativeTo: input.window, smokeKey: smokeKey) {
-            case .command(let template, let title):
-                guard let prepared = try prepareUserCommand(template, title: title, context: ctx) else { return }
-                executePrepared(prepared, directory: ctx.activeDirectory)
-            case .editFile(let url):
-                showCommandConfiguration(UserCommandStore(globalURL: url))
+            case .command(let entry, let title):
+                guard let template = entry.command else { return }
+                if entry.farSyntax == true { startMenuSequence(template, title: title, context: ctx) }
+                else if let prepared = try prepareUserCommand(template, title: title, context: ctx) {
+                    executePrepared(prepared, directory: ctx.activeDirectory)
+                }
+            case .editFile(let loaded):
+                if loaded.isFarMenu { showCommandConfiguration(store, farMenu: loaded) }
+                else { showCommandConfiguration(UserCommandStore(globalURL: loaded.source)) }
             case nil: break
             }
         } catch { report(error.localizedDescription) }
     }
-    private func prepareUserCommand(_ template: String, title: String, context ctx: UserCommandContext) throws -> PreparedUserCommand? {
-        guard persistentMode.state != .on || !isRunning || shellDirectory?.standardizedFileURL == ctx.activeDirectory.standardizedFileURL else {
+    private func checkMenuDirectory(_ directory: URL) -> Bool {
+        guard persistentMode.state != .on || !isRunning || shellDirectory?.standardizedFileURL == directory.standardizedFileURL else {
             report(L10n.text("Для меню и ассоциаций сначала нажмите «Папка панели → shell»: команды относятся к файлам активной панели."))
-            return nil
+            return false
         }
-        let parameters = try UserCommandExpander.inputs(in: template)
-        guard let values = UserCommandParameterForm.collect(parameters, title: title) else { return nil }
-        return try UserCommandExpander.prepare(template, context: ctx, inputValues: values)
+        return true
     }
-    private func previewCommand(_ template: String, title: String, source: String, overrideContext: UserCommandContext? = nil) {
-        do {
-            let ctx = overrideContext ?? context()
-            guard let prepared = try prepareUserCommand(template, title: title, context: ctx) else { return }
-            let expanded = prepared.command
-            let runDirectory = ctx.activeDirectory
-            let alert = NSAlert(); alert.messageText = title
-            alert.informativeText = "Источник: \(source)\nКаталог: \(runDirectory.path)\n\n\(expanded)"
-            alert.addButton(withTitle: "Выполнить"); alert.addButton(withTitle: "Вставить в строку"); alert.addButton(withTitle: "Отмена")
-            switch alert.runModal() {
-            case .alertFirstButtonReturn:
-                executePrepared(prepared, directory: runDirectory)
-            case .alertSecondButtonReturn: setCommand(expanded, prepared: prepared)
-            default: break
+    func applyCommand(onBegin: () -> Void, onProcessed: @escaping (URL) -> Void) {
+        guard menuSequence == nil, pluginWait == nil else { report("Выполняется предыдущая последовательность команд."); return }
+        let ctx = context()
+        let files = ctx.markedFiles.isEmpty ? ctx.currentFile.map { [$0] } ?? [] : ctx.markedFiles
+        guard !files.isEmpty, files.allSatisfy(\.isFileURL), checkMenuDirectory(ctx.activeDirectory) else { return }
+        let key = "ApplyCmd"
+        let previous = history.parameterHistory.values(for: key)
+        let field = NSComboBox(frame: NSRect(x: 0, y: 0, width: 470, height: 26))
+        field.addItems(withObjectValues: previous)
+        field.stringValue = previous.first ?? ""
+        field.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        field.setAccessibilityLabel("Команда для выбранных файлов")
+        let dialog = NSAlert()
+        dialog.messageText = "Применить команду"
+        dialog.informativeText = "Введите команду для выбранных файлов."
+        dialog.accessoryView = field
+        dialog.addButton(withTitle: "Выполнить")
+        dialog.addButton(withTitle: "Отмена")
+        dialog.window.initialFirstResponder = field
+        guard dialog.runModal() == .alertFirstButtonReturn else { return }
+        let template = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !template.isEmpty, template.utf8.count <= 16_384,
+              !template.utf8.contains(0), !template.contains(where: \.isNewline) else {
+            report("Команда для применения должна быть одной непустой строкой до 16 КиБ.")
+            return
+        }
+        history.parameterHistory.record(template, for: key)
+        saveHistory()
+        onBegin()
+        startApplySequence(template, files: files, context: ctx, onProcessed: onProcessed)
+    }
+
+    private func startApplySequence(_ template: String, files: [URL], context: UserCommandContext,
+                                    onProcessed: @escaping (URL) -> Void) {
+        let application = ApplySequence(template: template, files: files[...], onProcessed: onProcessed)
+        menuSequence = MenuSequence(context: context, title: "Применить команду", remaining: [],
+            directory: context.activeDirectory, previousDirectory: previousDirectory, application: application)
+        persistentMode.isEnabled = false
+        runNextMenuLine()
+    }
+
+    private func startMenuSequence(_ block: String, title: String, context: UserCommandContext) {
+        guard menuSequence == nil else { report("Выполняется последовательность команд меню."); return }
+        guard checkMenuDirectory(context.activeDirectory) else { return }
+        menuSequence = MenuSequence(context: context, title: title, remaining: FarMenuImporter.commandLines(in: block)[...],
+                                    directory: context.activeDirectory, previousDirectory: previousDirectory)
+        persistentMode.isEnabled = false
+        runNextMenuLine()
+    }
+    private func changeInternalDirectory(to destination: URL, from directory: URL, closeProvider: Bool,
+                                         stack: InternalDirectoryStackChange?, menuLine: Bool) throws {
+        let sequenceID = menuSequence?.id
+        let isLeft = menuSequence?.context.activePanelIsLeft ?? context().activePanelIsLeft
+        let completion: (Bool) -> Void = { [weak self] changed in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.navigatingInternalCommand = false
+                guard !menuLine || self.menuSequence?.id == sequenceID else { return }
+                if changed {
+                    if let stack { self.commandState.commit(stack) }
+                    self.refreshPrompt()
+                    if menuLine {
+                        self.menuSequence?.previousDirectory = directory
+                        self.menuSequence?.directory = destination
+                    }
+                }
+                do {
+                    if self.isRunning, self.integration != nil {
+                        if changed && menuLine {
+                            try self.submitPersistent("builtin cd -- " + ShellCommand.quoteArgument(destination.path))
+                            return
+                        }
+                        if try self.applyEnvironmentToPersistentShell() { return }
+                    }
+                    if menuLine { self.scheduleNextMenuLine() }
+                } catch {
+                    self.report(error.localizedDescription)
+                    if menuLine { self.finishMenuSequence() }
+                }
             }
-        } catch { report(error.localizedDescription) }
+        }
+        if let navigateInternalDirectory {
+            navigatingInternalCommand = true
+            navigateInternalDirectory(destination, isLeft, closeProvider, completion)
+        } else if let navigateMenuDirectory {
+            navigatingInternalCommand = true
+            navigateMenuDirectory(destination, isLeft, completion)
+        } else {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                throw UserCommandError("Не удалось открыть папку \(destination.path).")
+            }
+            navigate(destination)
+            if let stack { commandState.commit(stack) }
+            if menuLine {
+                menuSequence?.previousDirectory = directory
+                menuSequence?.directory = destination
+                scheduleNextMenuLine()
+            }
+        }
+    }
+
+    private func scheduleNextMenuLine() {
+        guard let id = menuSequence?.id else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.menuSequence?.id == id else { return }
+            self.runNextMenuLine()
+        }
+    }
+    private func cancelMenuSequence() {
+        if pluginWait != nil { cancelPluginCommand?() }
+        guard menuSequence != nil else { return }
+        menuSequence = nil
+        if !isRunning { persistentMode.isEnabled = true }
+        if awaitingInitialPrompt {
+            pendingCommand = nil
+            preparedRunning?.cleanup(); preparedRunning = nil
+        }
+    }
+    private func finishMenuSequence() {
+        let refresh = menuSequence?.hasTerminalOutput == true
+        menuSequence = nil
+        if !isRunning { persistentMode.isEnabled = true }
+        if refresh { refreshPanels() }
+    }
+    private func runNextMenuLine() {
+        guard var sequence = menuSequence else { return }
+        let line: String
+        let context: UserCommandContext
+        if var application = sequence.application {
+            if let completed = application.executingFile { application.onProcessed(completed) }
+            guard menuSequence?.id == sequence.id else { return }
+            guard let file = application.files.popFirst() else { finishMenuSequence(); return }
+            let usesMarks = ["!&", "!@", "!$"].contains { application.template.contains($0) }
+            let remainingMarks = usesMarks && !sequence.context.markedFiles.isEmpty ? [file] + application.files : nil
+            context = sequence.context.replacingCurrentFile(file, directory: sequence.directory, markedFiles: remainingMarks)
+            line = application.template
+            application.executingFile = file
+            sequence.application = application
+        } else {
+            guard let next = sequence.remaining.popFirst() else { finishMenuSequence(); return }
+            line = next
+            context = sequence.context.replacingCurrentFile(sequence.context.currentFile, directory: sequence.directory)
+        }
+        menuSequence = sequence
+        do {
+            let template = try FarMenuMetasymbols.command(line, context: context, variables: sequence.variables, variablesArePrivate: true)
+            let prepared = try prepareUserCommand(template, title: sequence.title, context: context, checkDirectory: false)
+            guard menuSequence?.id == sequence.id else { return }
+            if let prepared, executePrepared(prepared, directory: sequence.directory, menuLine: true, recordHistory: sequence.application == nil) {
+                return
+            }
+        } catch {
+            report(error.localizedDescription)
+        }
+        finishMenuSequence()
+    }
+    private func prepareUserCommand(_ template: String, title: String, context ctx: UserCommandContext,
+                                    checkDirectory: Bool = true) throws -> PreparedUserCommand? {
+        guard !checkDirectory || checkMenuDirectory(ctx.activeDirectory) else { return nil }
+        let parameters = try UserCommandExpander.inputs(in: template)
+        var parameterHistory = history.parameterHistory
+        guard let values = UserCommandParameterForm.collect(parameters, title: title, history: &parameterHistory) else { return nil }
+        let prepared = try UserCommandExpander.prepare(template, context: ctx, inputValues: values)
+        if parameterHistory != history.parameterHistory {
+            history.parameterHistory = parameterHistory
+            saveHistory()
+        }
+        if !checkDirectory, menuSequence?.application == nil {
+            for parameter in parameters {
+                guard let name = parameter.variableName, let value = values[parameter.identifier],
+                      menuSequence?.variables.keys.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) != true else { continue }
+                menuSequence?.variables[name] = value
+            }
+        }
+        return prepared
     }
     @objc func configureCommands() { showCommandConfiguration(AppRuntime.commandStore) }
-    private func showCommandConfiguration(_ store: UserCommandStore) {
-        if let configWindow, configWindow.window?.isVisible == true { configWindow.showWindow(nil); return }
-        configWindow = UserCommandsWindow(store: store); configWindow?.showWindow(nil)
+    private func showCommandConfiguration(_ store: UserCommandStore, farMenu: LoadedUserMenu? = nil) {
+        if let configWindow, configWindow.window?.isVisible == true {
+            if configWindow.sourceURL == (farMenu?.source ?? store.globalURL) { configWindow.showWindow(nil); return }
+            configWindow.window?.performClose(nil)
+            if configWindow.window?.isVisible == true { return }
+        }
+        configWindow = UserCommandsWindow(store: store, farMenu: farMenu); configWindow?.showWindow(nil)
     }
     /// Exercises the same asynchronous prompt/state path as the command bar.
     static func runUISmokeChecks() async throws -> [String] {
@@ -680,16 +1374,42 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
                 try await Task.sleep(nanoseconds: 10_000_000)
             }
         }
+        let canceledMarker = root.appendingPathComponent("commandx-canceled-" + UUID().uuidString)
+        let canceledBlock = "printf canceled > " + (try ShellCommand.quoteArgument(canceledMarker.path))
+        workspace.startMenuSequence(canceledBlock, title: "Cancel before prompt", context: workspace.context())
+        guard workspace.awaitingInitialPrompt, workspace.pendingCommand != nil else {
+            throw NetworkError.io("CommandX fixture must queue its first line before the initial prompt")
+        }
+        workspace.send(Data([3]))
+        try await wait("initial prompt after CommandX Ctrl+C") { workspace.shellReady }
+        guard workspace.menuSequence == nil, !FileManager.default.fileExists(atPath: canceledMarker.path) else {
+            throw NetworkError.io("Ctrl+C before the initial prompt must cancel the queued CommandX line")
+        }
         guard workspace.execute("export FAR_UI_SMOKE_VALUE=retained; cd -- " + (try ShellCommand.quoteArgument(child.path)), directory: root) else { throw NetworkError.io("Could not start managed shell") }
         try await wait("prompt after initial command") { workspace.shellReady }
         guard navigation == nil, workspace.shellDirectory?.resolvingSymlinksInPath() == child.resolvingSymlinksInPath(), workspace.input.isEnabled,
               workspace.input.placeholderString == L10n.text("Команда в папке shell · Enter — выполнить · Tab — путь") else { throw NetworkError.io("Shell cwd must not move panels automatically") }
-        workspace.previewCommand("printf '%s' {name}", title: "fixture", source: "smoke")
+        let rejected = try workspace.prepareUserCommand("printf '%s' {name}", title: "fixture", context: workspace.context())
+        guard rejected == nil else { throw NetworkError.io("Unexpected command accepted in another shell directory") }
         guard messages.count == 1 else { throw NetworkError.io("Menu command must refuse a different shell directory") }
         workspace.useShellDirectory()
         guard navigation?.resolvingSymlinksInPath() == child.resolvingSymlinksInPath() else { throw NetworkError.io("Explicit shell-to-panel navigation failed") }
         workspace.usePanelDirectory(); try await wait("prompt after panel directory sync") { workspace.shellReady }
         guard workspace.shellDirectory?.resolvingSymlinksInPath() == root.resolvingSymlinksInPath() else { throw NetworkError.io("Explicit panel-to-shell cd failed") }
+        guard workspace.execute("set FAR_MANAGED_INTERNAL=retained", directory: root) else {
+            throw NetworkError.io("The managed shell rejected FAR SET")
+        }
+        try await wait("managed FAR environment update") { workspace.shellReady }
+        // Interactive zsh can pass a trailing # token to printf as an argument.
+        // Use a no-op to put the marker only in the typed command's echo.
+        guard workspace.execute(#"@if defined FAR_MANAGED_INTERNAL : hidden-echo-fixture; printf 'FAR_INTERNAL:%s\n' "$FAR_MANAGED_INTERNAL""#, directory: root) else {
+            throw NetworkError.io("The managed shell rejected FAR conditional execution")
+        }
+        try await wait("managed FAR conditional") { workspace.shellReady }
+        guard workspace.screen.plainText.contains("FAR_INTERNAL:retained"),
+              !workspace.screen.plainText.contains("hidden-echo-fixture") else {
+            throw NetworkError.io("Managed FAR command did not inherit SET or suppress its echo\n" + workspace.screen.plainText.suffix(2_000))
+        }
         workspace.send(Data("printf partial".utf8))
         guard !workspace.input.isEnabled, !workspace.panelToShell.isEnabled else { throw NetworkError.io("Partial terminal input must disable command-bar submissions") }
         workspace.interrupt(); try await wait("prompt after clearing partial input") { workspace.shellReady }
@@ -749,6 +1469,15 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         guard workspace.execute("exit", directory: root) else { throw NetworkError.io("Shell exit rejected") }
         try await wait("shell exit") { workspace.integration == nil && !workspace.isRunning }
         guard workspace.shellDirectory == nil, workspace.persistentMode.isEnabled else { throw NetworkError.io("Shell exit must clear cwd and reenable mode") }
+        workspace.startMenuSequence(canceledBlock, title: "Cancel before prompt", context: workspace.context())
+        guard workspace.awaitingInitialPrompt, workspace.pendingCommand != nil else {
+            throw NetworkError.io("CommandX fixture must queue its first line in the new shell")
+        }
+        workspace.interrupt()
+        try await wait("initial prompt after CommandX interrupt button") { workspace.shellReady }
+        guard workspace.menuSequence == nil, !FileManager.default.fileExists(atPath: canceledMarker.path) else {
+            throw NetworkError.io("The interrupt button must cancel the queued CommandX line before the initial prompt")
+        }
         guard workspace.execute("printf 'NEW:%s\\n' \"${FAR_UI_SMOKE_VALUE-unset}\"", directory: root) else { throw NetworkError.io("New shell rejected") }
         try await wait("prompt in a fresh shell") { workspace.shellReady }
         guard workspace.screen.plainText.contains("NEW:unset") else { throw NetworkError.io("New shell leaked old state") }
@@ -761,13 +1490,18 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         guard workspace.screen.plainText.contains("fixture.txt"), !FileManager.default.fileExists(atPath: listURL.path), workspace.preparedRunning == nil else {
             throw NetworkError.io("Prepared list file must survive command execution and be cleaned at the next shell prompt")
         }
+        workspace.startMenuSequence("export FAR_MENU_SMOKE=retained\nprintf 'MENU_STATE:%s' \"$FAR_MENU_SMOKE\"", title: "Managed sequence", context: workspace.context())
+        try await wait("managed CommandX sequence") { workspace.menuSequence == nil && workspace.shellReady }
+        guard workspace.screen.plainText.contains("MENU_STATE:retained") else {
+            throw NetworkError.io("Managed CommandX must wait for the prompt and preserve shell state between its lines")
+        }
         let draft = try UserCommandExpander.prepare("cat {list0}", context: workspace.context())
         let draftURL = draft.listFiles["list0"]!
         workspace.setCommand(draft.command, prepared: draft)
         guard FileManager.default.fileExists(atPath: draftURL.path) else { throw NetworkError.io("Inserted list command lost its resources") }
         workspace.setCommand("printf replacement")
         guard !FileManager.default.fileExists(atPath: draftURL.path) else { throw NetworkError.io("Replacing an inserted command must clean unused list files") }
-        return ["List files survive managed shell execution and are removed at prompt; replacing a draft releases its files", "Managed shell command bar preserves state without implicit panel navigation", "Shell directory sync is explicit and menu commands reject directory mismatch", "Partial terminal input blocks command bar and Ctrl+C restores prompt", "Rapid and repeated Ctrl+C preserve new input through job handoff, continuation and quoted Enter", "Raw programs sharing the shell group receive the Ctrl+C byte", "Shell exit clears cwd and a new session starts without old variables"] + (try await runMenuSmoke(in: root))
+        return ["List files survive managed shell execution and are removed at prompt; replacing a draft releases its files", "Managed shell command bar preserves state without implicit panel navigation", "Shell directory sync is explicit and menu commands reject directory mismatch", "Partial terminal input blocks command bar and Ctrl+C restores prompt", "Rapid and repeated Ctrl+C preserve new input through job handoff, continuation and quoted Enter", "Raw programs sharing the shell group receive the Ctrl+C byte", "CommandX Ctrl+C and interrupt cancel the first queued line before the managed shell prompt", "Shell exit clears cwd and a new session starts without old variables"] + (try await runMenuSmoke(in: root))
     }
 
     private static func runMenuSmoke(in root: URL) async throws -> [String] {
@@ -811,7 +1545,7 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         workspace.showHistory(.command, smokeKey: .init(code: 36))
         try await waitForOutput { workspace.screen.plainText.contains("HISTORY_ENTER") && !workspace.isRunning }
 
-        try workspace.history.record(kind: .command, value: "printf 'HISTORY_%s' SEPARATE")
+        try workspace.history.record(kind: .command, value: "printf 'HISTORY_%s' SEPARATE", directory: directory.path)
         workspace.showHistory(.command, smokeKey: .init(code: 36, modifiers: .shift))
         guard let separate = workspace.separateTerminals.last, separate.window?.isVisible == true else {
             throw NetworkError.io("Alt+F8 Shift+Enter must open a separate terminal")
@@ -822,6 +1556,17 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         }
         separate.close()
         owner.makeKeyAndOrderFront(nil)
+        workspace.input.stringValue = "draft"
+        workspace.previousCommand(backward: true)
+        let newest = workspace.input.stringValue
+        workspace.previousCommand(backward: true)
+        let older = workspace.input.stringValue
+        workspace.previousCommand(backward: false)
+        workspace.previousCommand(backward: false)
+        guard newest.contains("SEPARATE"), older.contains("ENTER"), workspace.input.stringValue == "draft" else {
+            throw NetworkError.io("Command history must cycle and restore the untouched draft.")
+        }
+        workspace.clearCommand(focus: false)
 
         let file = directory.appendingPathComponent("fixture.txt")
         try Data("Fixture".utf8).write(to: file)
@@ -851,9 +1596,143 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         try store.saveGlobalText(String(decoding: JSONEncoder().encode(configuration), as: UTF8.self))
         workspace.showUserMenu(store: store, smokeKey: .init(code: 36))
         try await waitForOutput { workspace.screen.plainText.contains("F2_EXECUTED") && !workspace.isRunning }
+
+        let nested = directory.appendingPathComponent("working", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: false)
+        let panel = PanelView(directory: directory, key: "commandx-" + UUID().uuidString)
+        var directoryChanges: [Bool] = []
+        workspace.refreshPanels = { panel.load() }
+        workspace.navigateMenuDirectory = { url, _, completion in
+            panel.navigateHistory(to: url.path, focus: false) { committed in
+                directoryChanges.append(committed)
+                completion(committed)
+            }
+        }
+        let native = directory.appendingPathComponent(UserCommandStore.farMenuFilename)
+        let nativeText = """
+        F4: CommandX
+          REM skipped !unsupported
+          printf 'COMMANDX_%s' FIRST
+          false
+          pushd working
+          cd missing
+          set FAR_COMMANDX_TEST=retained
+          @if defined FAR_COMMANDX_TEST printf 'COMMANDX_%s:' LAST; basename "$PWD"
+          popd
+        """
+        // PUSHD and POPD use asynchronous panel navigation. The failed CD
+        // leaves the successful destination in place for the conditional step.
+        try Data(nativeText.utf8).write(to: native)
+        workspace.showUserMenu(store: store, smokeKey: .init(code: 118, characters: String(UnicodeScalar(Int(NSF4FunctionKey))!), modifiers: .function))
+        try await waitForOutput {
+            workspace.screen.plainText.contains("COMMANDX_LAST:working") && !workspace.isRunning && workspace.menuSequence == nil
+        }
+        guard workspace.screen.plainText.contains("COMMANDX_FIRST") else {
+            throw NetworkError.io("Native F2 lost the transcript of the first CommandX step")
+        }
+        guard directoryChanges == [true, false, true], panel.directory.resolvingSymlinksInPath() == directory.resolvingSymlinksInPath(),
+              workspace.commandState.directoryStack.isEmpty else {
+            throw NetworkError.io("CommandX must commit PUSHD, continue after failed CD and return through POPD")
+        }
+        workspace.showUserMenu(store: store, smokeKey: .init(code: 118, characters: String(UnicodeScalar(Int(NSF4FunctionKey))!), modifiers: [.function, .option]))
+        guard workspace.configWindow?.sourceURL == native, workspace.configWindow?.window?.isVisible == true else {
+            throw NetworkError.io("Alt+F4 should edit the actual source of the native F2 menu")
+        }
+        workspace.configWindow?.window?.performClose(nil)
+        owner.makeKeyAndOrderFront(nil)
+
+        let one = UserFileAssociation(title: "Single", mask: "*.txt", alternateView: "printf 'ASSOCIATION_%s' SINGLE")
+        let two = UserFileAssociation(title: "Multiple", mask: "*.txt", alternateView: "printf 'ASSOCIATION_%s' SECOND")
+        func installAssociations(_ associations: [UserFileAssociation]) throws {
+            let data = try JSONEncoder().encode(UserCommandConfiguration(associations: associations))
+            try store.saveGlobalText(String(decoding: data, as: UTF8.self))
+        }
+        try installAssociations([one])
+        guard workspace.association(for: file, action: .alternateView, store: store) else {
+            throw NetworkError.io("Single association was not consumed")
+        }
+        try await waitForOutput { workspace.screen.plainText.contains("ASSOCIATION_SINGLE") && !workspace.isRunning }
+        try installAssociations([two, one])
+        guard workspace.association(for: file, action: .alternateView, store: store, smokeKey: .init(code: 36)) else {
+            throw NetworkError.io("Multiple matching associations did not open a choice")
+        }
+        try await waitForOutput { workspace.screen.plainText.contains("ASSOCIATION_SECOND") && !workspace.isRunning }
+
+        let another = directory.appendingPathComponent("name with a space.txt")
+        try Data().write(to: another)
+        let files = [file, another]
+        let applicationContext = UserCommandContext(currentFile: file, markedFiles: files, activeDirectory: directory, passiveDirectory: directory)
+        var processed: [URL] = []
+        workspace.startApplySequence(#"printf 'APPLY:%s\n' !.!.bak"#, files: files, context: applicationContext) { processed.append($0) }
+        try await waitForOutput { workspace.menuSequence == nil && !workspace.isRunning }
+        guard processed == files, workspace.screen.plainText.contains("APPLY:fixture.txt.bak"),
+              workspace.screen.plainText.contains("APPLY:name with a space.txt.bak") else {
+            throw NetworkError.io("Apply command must substitute and execute once for each file in selection order.")
+        }
+
+        let help = HlfViewerWorkspace()
+        let helpFile = directory.appendingPathComponent("sample.hlf")
+        try ".Language=English\n@Contents\nExample".write(to: helpFile, atomically: true, encoding: .utf8)
+        workspace.executePluginCommand = { help.executePrefix($0, $1, directory: $2) }
+        workspace.pluginCommandFailure = { help.lastFailure }
+        workspace.startMenuSequence("hlf: sample.hlf @Missing\nprintf 'HLF_%s' SENTINEL", title: "HLF CommandX", context: applicationContext)
+        let expectedHelpError = FarHelpError.missingTopic("Missing").localizedDescription
+        guard help.lastFailure == expectedHelpError, workspace.menuSequence == nil, !workspace.isRunning,
+              !workspace.screen.plainText.contains("HLF_SENTINEL") else {
+            throw NetworkError.io("A missing HLF topic must stop CommandX before its next line.")
+        }
+        processed.removeAll()
+        help.clearFailure()
+        workspace.startApplySequence("hlf: sample.hlf @Missing", files: files, context: applicationContext) { processed.append($0) }
+        guard help.lastFailure == expectedHelpError, workspace.menuSequence == nil, !workspace.isRunning, processed.isEmpty else {
+            throw NetworkError.io("Apply must keep the first file marked after an HLF error.")
+        }
+
+        var busy = false, lists: [URL] = [], failure: String?
+        workspace.pluginCommandBusy = { busy }
+        workspace.pluginCommandFailure = { failure }
+        workspace.cancelPluginCommand = { busy = false }
+        workspace.executePluginCommand = { prefix, arguments, actualDirectory in
+            guard prefix == "fixture", actualDirectory.path == directory.path else { return false }
+            let quoted = arguments.trimmingCharacters(in: .whitespaces)
+            guard quoted.hasPrefix("'"), quoted.hasSuffix("'") else { return false }
+            lists.append(URL(fileURLWithPath: String(quoted.dropFirst().dropLast())))
+            busy = true
+            return true
+        }
+        processed.removeAll()
+        workspace.startApplySequence("fixture: !@F!", files: files, context: applicationContext) { processed.append($0) }
+        guard let firstList = lists.first, FileManager.default.fileExists(atPath: firstList.path), processed.isEmpty else {
+            throw NetworkError.io("Apply released a plugin list or advanced selection while the plugin was busy.")
+        }
+        busy = false
+        try await waitForOutput { lists.count == 2 }
+        guard processed == [file], !FileManager.default.fileExists(atPath: firstList.path),
+              FileManager.default.fileExists(atPath: lists[1].path) else {
+            throw NetworkError.io("Apply must release each plugin list after completion and prepare the next one afterwards.")
+        }
+        failure = "fixture plugin failed"; busy = false
+        try await waitForOutput { workspace.menuSequence == nil && workspace.pluginWait == nil }
+        guard processed == [file], !FileManager.default.fileExists(atPath: lists[1].path) else {
+            throw NetworkError.io("A failing plugin must stop Apply and preserve the unprocessed mark.")
+        }
+        failure = nil
+        workspace.startApplySequence("fixture: !@F!", files: files, context: applicationContext) { processed.append($0) }
+        guard let lastList = lists.last, workspace.cancelCommandSequence() else {
+            throw NetworkError.io("Apply must expose cancellation while an asynchronous plugin runs.")
+        }
+        try await waitForOutput { workspace.pluginWait == nil }
+        guard processed == [file], lists.count == 3, !FileManager.default.fileExists(atPath: lastList.path) else {
+            throw NetworkError.io("Cancel must preserve pending marks and clean the plugin list without dispatching another file.")
+        }
         return ["History menu delivers Enter, Ctrl+Enter and Shift+Enter to the correct command modes",
                 "Combined view/edit history and passive folder navigation receive menu keyboard actions",
-                "F2 command runs after Enter without an intermediate preview"]
+                "F2 command runs after Enter without an intermediate preview",
+                "Native FarMenu.ini dispatches CommandX lines, continues past nonzero status, honors cd and opens its own source",
+                "One association runs directly and multiple matches use the keyboard menu",
+                "A missing HLF topic stops CommandX and leaves Apply marks intact",
+                "Apply command substitutes each marked filename and waits for async plugin completion before cleanup and advancing",
+                "Apply plugin failure and cancellation preserve pending marks and remove temporary files"]
     }
     func alternativeAssociation(action: UserCommandAction) {
         guard let file = context().currentFile else { report(L10n.text("Выберите файл для альтернативной ассоциации.")); return }
@@ -864,24 +1743,34 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
         case .alternateExecute, .execute: NSWorkspace.shared.open(file)
         }
     }
-    func association(for file: URL, action: UserCommandAction) -> Bool {
+    func association(for file: URL, action: UserCommandAction, store: UserCommandStore? = nil,
+                     smokeKey: PanelListMenu.SmokeKey? = nil) -> Bool {
         do {
-            let entries = try AppRuntime.commandStore.loadGlobal().matchingAssociations(for: file.lastPathComponent, action: action)
-            guard !entries.isEmpty else { return false }
-            let alert = NSAlert(); alert.messageText = "Ассоциация: \(file.lastPathComponent)"
-            let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 480, height: 26)); popup.addItems(withTitles: entries.map(\.title)); alert.accessoryView = popup
-            alert.addButton(withTitle: "Выбрать"); alert.addButton(withTitle: "Стандартное действие"); alert.addButton(withTitle: "Отмена")
-            switch alert.runModal() {
-            case .alertFirstButtonReturn:
-                if let template = entries[popup.indexOfSelectedItem].command(for: action) {
-                    let ctx = context()
-                    let explicit = UserCommandContext(currentFile: file, markedFiles: ctx.markedFiles, activeDirectory: ctx.activeDirectory, passiveDirectory: ctx.passiveDirectory, passiveCurrentFile: ctx.passiveCurrentFile, passiveMarkedFiles: ctx.passiveMarkedFiles)
-                    previewCommand(template, title: entries[popup.indexOfSelectedItem].title, source: UserCommandStore.defaultGlobalURL.path, overrideContext: explicit)
-                }
-                return true
-            case .alertSecondButtonReturn: return false
-            default: return true
+            let ctx = context()
+            let explicit = UserCommandContext(currentFile: file, markedFiles: ctx.markedFiles, activeDirectory: ctx.activeDirectory,
+                passiveDirectory: ctx.passiveDirectory, passiveCurrentFile: ctx.passiveCurrentFile, passiveMarkedFiles: ctx.passiveMarkedFiles,
+                activePanelIsLeft: ctx.activePanelIsLeft, activeDescriptionEncoding: ctx.activeDescriptionEncoding,
+                passiveDescriptionEncoding: ctx.passiveDescriptionEncoding)
+            let resolution = try (store ?? AppRuntime.commandStore).loadGlobal().resolveAssociations(
+                for: file.lastPathComponent, action: action, context: explicit, commands: commandState)
+            let entries = resolution.candidates
+            guard let first = entries.first else { return resolution.hasMatchingAction }
+            let selected: UserAssociationCandidate
+            if entries.count == 1 {
+                selected = first
+            } else {
+                let menu = PanelListMenu(title: "Ассоциации · \(file.lastPathComponent)", hint: "Enter — выполнить · Esc — отменить")
+                menu.replaceRows(entries.map { .init(title: $0.title) })
+                var index: Int?
+                menu.onActivate = { [weak menu] row in index = row; menu?.dismiss() }
+                menu.run(relativeTo: input.window, smokeKey: smokeKey)
+                guard let index else { return true }
+                selected = entries[index]
             }
+            if let prepared = try prepareUserCommand(selected.template, title: selected.title, context: explicit) {
+                executePrepared(prepared, directory: explicit.activeDirectory)
+            }
+            return true
         } catch { report(error.localizedDescription); return true }
     }
 }
@@ -889,40 +1778,6 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
 @MainActor private final class TerminalHostView: NSView {
     var onLayout: (() -> Void)?
     override func layout() { super.layout(); onLayout?() }
-}
-
-@MainActor final class TerminalTextView: NSTextView {
-    var onInput: ((Data) -> Void)?
-    var onToggle: (() -> Void)?
-    var applicationCursorKeys = false
-    var bracketedPasteEnabled = false
-    override func keyDown(with event: NSEvent) {
-        let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
-        if flags.contains(.command) { super.keyDown(with: event); return }
-        if flags == .control, event.keyCode == 31 { onToggle?(); return }
-        if flags.contains(.control) {
-            let codes: [UInt16: UInt8] = [0:1,11:2,8:3,2:4,14:5,3:6,5:7,4:8,34:9,38:10,40:11,37:12,46:13,45:14,31:15,35:16,12:17,15:18,1:19,17:20,32:21,9:22,13:23,7:24,16:25,6:26,33:27,42:28,30:29]
-            if let byte = codes[event.keyCode] { onInput?(Data([byte])); return }
-        }
-        let keys: [UInt16:String] = [36:"\r",76:"\r",51:"\u{7f}",117:"\u{1b}[3~",48:"\t",53:"\u{1b}",123:"\u{1b}[D",124:"\u{1b}[C",125:"\u{1b}[B",126:"\u{1b}[A",115:"\u{1b}[H",119:"\u{1b}[F",116:"\u{1b}[5~",121:"\u{1b}[6~"]
-        if let sequence = keys[event.keyCode] {
-            let translated = applicationCursorKeys && [123,124,125,126,115,119].contains(event.keyCode) ? sequence.replacingOccurrences(of: "\u{1b}[", with: "\u{1b}O") : sequence
-            onInput?(Data(translated.utf8)); return
-        }
-        interpretKeyEvents([event])
-    }
-    override func insertText(_ insertString: Any, replacementRange: NSRange) {
-        let text = (insertString as? NSAttributedString)?.string ?? (insertString as? String) ?? ""
-        onInput?(Data(text.utf8))
-    }
-    override func paste(_ sender: Any?) {
-        if let value = NSPasteboard.general.string(forType: .string) { pasteText(value) }
-    }
-    func pasteText(_ value: String) {
-            // Escape cannot terminate a bracketed paste and inject a second command.
-            let clean = value.replacingOccurrences(of: "\u{1b}", with: "")
-            onInput?(Data((bracketedPasteEnabled ? "\u{1b}[200~" + clean + "\u{1b}[201~" : clean).utf8))
-    }
 }
 
 @MainActor private final class SeparateCommandTerminal: NSWindowController, NSWindowDelegate {
@@ -944,5 +1799,14 @@ final class ShellWorkspace: NSObject, NSTextFieldDelegate {
     func windowWillClose(_ notification: Notification) {
         workspace?.stopForExit()
         onClose?()
+    }
+}
+
+extension ShellWorkspace {
+    func luaEnvironment(_ name: String) -> String? { commandState.environmentValue(name) }
+    func luaSetEnvironment(_ name: String, _ value: String?) throws {
+        guard !name.isEmpty, !name.contains("="), !name.contains("\0"), !(value?.contains("\0") ?? false) else { throw ExtensionAPIError("Недопустимое имя или значение переменной окружения") }
+        commandState.setEnvironment(name, value: value)
+        refreshPrompt()
     }
 }

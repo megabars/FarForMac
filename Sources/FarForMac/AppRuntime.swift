@@ -28,7 +28,14 @@ enum AppRuntime {
         try Data("smoke fixture\n".utf8).write(to: files.appendingPathComponent("sample.txt"))
         try Data("{\"smoke\":true}\n".utf8).write(to: files.appendingPathComponent("Имя"))
     }
-    static var commandStore: UserCommandStore { UserCommandStore(globalURL: smokeStateDirectory?.appendingPathComponent("commands.json") ?? UserCommandStore.defaultGlobalURL) }
+    static var commandStore: UserCommandStore {
+        if let smokeStateDirectory {
+            return UserCommandStore(globalURL: smokeStateDirectory.appendingPathComponent("commands.json"))
+        }
+        let bundleURL = Bundle.main.bundleURL
+        let installationDirectory = bundleURL.pathExtension == "app" ? bundleURL.deletingLastPathComponent() : nil
+        return UserCommandStore(installationMenuDirectory: installationDirectory)
+    }
     static var recoveryStore: EditorRecoveryStore { EditorRecoveryStore(directory: smokeStateDirectory?.appendingPathComponent("Recovery")) }
     static var historyURL: URL { smokeStateDirectory?.appendingPathComponent("history.json") ?? CommandHistory.defaultFileURL }
     static func smokeProgress(_ message: String) {

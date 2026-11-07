@@ -34,6 +34,55 @@ public enum CommandHistoryError: Error, LocalizedError, Equatable {
     }
 }
 
+/// Dialog history is separated from executable history and keyed by the FAR field name.
+public struct CommandParameterHistory: Codable, Equatable, Sendable {
+    private struct Entry: Codable, Equatable, Sendable {
+        let name: String
+        let value: String
+    }
+    private var entries: [Entry] = []
+
+    public init() {}
+
+    public func values(for name: String) -> [String] {
+        entries.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }.map(\.value)
+    }
+
+    public mutating func record(_ value: String, for name: String) {
+        let entry = Entry(name: name, value: value)
+        guard Self.valid(entry) else { return }
+        entries.removeAll { $0.name.caseInsensitiveCompare(name) == .orderedSame && $0.value == value }
+        entries.insert(entry, at: 0)
+        trim()
+    }
+
+    fileprivate var reservedBytes: Int {
+        entries.reduce(256) { $0 + ($1.name.utf8.count + $1.value.utf8.count) * 6 + 64 }
+    }
+
+    private static func valid(_ entry: Entry) -> Bool {
+        !entry.name.isEmpty && entry.name.utf8.count <= 256 && !entry.name.utf8.contains(0) &&
+        !entry.value.isEmpty && entry.value.utf8.count <= 4_096 && !entry.value.utf8.contains(0)
+    }
+
+    private mutating func trim() {
+        var counts: [String: Int] = [:]
+        entries = Array(entries.filter { entry in
+            guard Self.valid(entry) else { return false }
+            let key = entry.name.lowercased()
+            counts[key, default: 0] += 1
+            return counts[key, default: 0] <= 12
+        }.prefix(100))
+    }
+
+    private enum CodingKeys: String, CodingKey { case entries }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        entries = try container.decodeIfPresent([Entry].self, forKey: .entries) ?? []
+        trim()
+    }
+}
+
 /// Bounded, newest-first activity history. Loading is data-only and never runs a
 /// command or navigates a panel. UI can persist the Codable value in defaults,
 /// or use the private atomic file store below. Callers surface persistence errors.
@@ -43,6 +92,7 @@ public struct CommandHistory: Codable, Sendable {
     public static let maximumStoredBytes = 8 * 1_024 * 1_024
     public private(set) var entries: [ActivityHistoryEntry]
     public let capacity: Int
+    public var parameterHistory = CommandParameterHistory() { didSet { trim() } }
 
     public init(capacity: Int = maximumCapacity) {
         self.capacity = max(1, min(capacity, Self.maximumCapacity))
@@ -66,6 +116,16 @@ public struct CommandHistory: Codable, Sendable {
             (kind == nil || entry.kind == kind) && (query.isEmpty ||
                 entry.value.localizedCaseInsensitiveContains(query) ||
                 (entry.directory?.localizedCaseInsensitiveContains(query) ?? false))
+        }
+    }
+
+    public func completions(for prefix: String) -> [String] {
+        var seen = Set<String>()
+        return entries.compactMap { entry in
+            guard entry.kind == .command,
+                  entry.value.range(of: prefix, options: [.anchored, .caseInsensitive]) != nil || prefix.isEmpty,
+                  seen.insert(entry.value).inserted else { return nil }
+            return entry.value
         }
     }
 
@@ -121,14 +181,14 @@ public struct CommandHistory: Codable, Sendable {
             }
         }
         guard fsync(descriptor) == 0, rename(stage.path, url.path) == 0 else { throw Self.ioError() }
-        let parent = open(directory.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        let parent = open(directory.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
         if parent >= 0 { _ = fsync(parent); close(parent) }
     }
 
     /// Missing store is empty; corrupt/oversized stores throw and are retained.
     public static func load(from url: URL = defaultFileURL, capacity: Int? = nil) throws -> CommandHistory {
         guard url.isFileURL else { throw CommandHistoryError.invalidFile }
-        let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
         if descriptor < 0, errno == ENOENT { return CommandHistory(capacity: capacity ?? maximumCapacity) }
         guard descriptor >= 0 else { throw ioError() }
         defer { close(descriptor) }
@@ -149,6 +209,7 @@ public struct CommandHistory: Codable, Sendable {
         guard let capacity else { return stored }
         var resized = CommandHistory(capacity: capacity)
         resized.entries = stored.entries
+        resized.parameterHistory = stored.parameterHistory
         resized.trim()
         return resized
     }
@@ -156,7 +217,7 @@ public struct CommandHistory: Codable, Sendable {
     private mutating func trim() {
         // Reserve JSON escaping overhead. This also keeps in-memory/defaults
         // histories bounded when every submitted command is near 64 KiB.
-        var bytes = 0, kept = Set<UUID>()
+        var bytes = parameterHistory.reservedBytes, kept = Set<UUID>()
         for entry in entries.filter(\.isLocked) + entries.filter({ !$0.isLocked }) {
             let size = entry.value.utf8.count * 6 + (entry.directory?.utf8.count ?? 0) * 6 + 512
             guard kept.count < capacity, size <= Self.maximumStoredBytes - bytes else { break }
@@ -175,7 +236,7 @@ public struct CommandHistory: Codable, Sendable {
         return entry.kind == .command || (entry.value.hasPrefix("/") && entry.value.utf8.count <= 16_384)
     }
     private static func ioError() -> CommandHistoryError { .io(String(cString: strerror(errno))) }
-    private enum CodingKeys: String, CodingKey { case capacity, entries }
+    private enum CodingKeys: String, CodingKey { case capacity, entries, parameterHistory }
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let storedCapacity = try container.decodeIfPresent(Int.self, forKey: .capacity) ?? Self.maximumCapacity
@@ -188,6 +249,7 @@ public struct CommandHistory: Codable, Sendable {
             let key = (try? JSONEncoder().encode([entry.kind.rawValue, entry.value, entry.directory ?? ""])) ?? Data()
             return ids.insert(entry.id).inserted && activities.insert(key.base64EncodedString()).inserted
         }
+        parameterHistory = try container.decodeIfPresent(CommandParameterHistory.self, forKey: .parameterHistory) ?? CommandParameterHistory()
         trim()
     }
 }

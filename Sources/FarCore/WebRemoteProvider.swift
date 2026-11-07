@@ -1,7 +1,7 @@
 import Foundation
 
 /// WebDAV with validated TLS, no redirects, bounded XML, and streaming transfers.
-public final class WebRemoteProvider: RemoteConditionalDownloadProvider, RemoteSearchDownloadProvider, RemoteBoundedDownloadProvider {
+public final class WebRemoteProvider: RemoteConditionalDownloadProvider, RemoteSearchDownloadProvider, RemoteBoundedDownloadProvider, RemoteExclusiveUploadProvider {
     public let connection: NetworkConnection
     private let password: String?
     public init(connection: NetworkConnection, password: String?) {
@@ -88,6 +88,25 @@ public final class WebRemoteProvider: RemoteConditionalDownloadProvider, RemoteS
                         cancellation: cancellation, progress: progress)
     }
 
+    func uploadNew(from: URL, to: String, cancellation: TransferCancellation,
+                   progress: @escaping (NetworkProgress) -> Void) throws {
+        _ = try request("PUT", path: to, headers: ["Content-Type": "application/octet-stream", "If-None-Match": "*"], upload: from,
+                        cancellation: cancellation, progress: progress)
+    }
+
+    func conditionalRemoveFile(path: String, expectedVersion: String, cancellation: TransferCancellation) throws {
+        guard try webRemotePath(path) != "/" else { throw WebRemoteError("The connection root cannot be removed.") }
+        try validateStrongETag(expectedVersion)
+        do {
+            let result = try request("DELETE", path: path, headers: ["If-Match": expectedVersion], cancellation: cancellation)
+            guard [200, 204].contains(result.response.statusCode) else {
+                throw WebRemoteError("WebDAV не подтвердил завершение удаления (HTTP \(result.response.statusCode)). Обновите панель перед повтором.")
+            }
+        } catch let error as DAVStatusError where error.code == 412 {
+            throw NetworkError.conflict(path)
+        }
+    }
+
     /// Saves an edited resource only while its strong entity tag still matches.
     /// A 412 response leaves the server's current resource untouched.
     public func conditionalUpload(from: URL, to: String, expectedVersion: String, cancellation: TransferCancellation,
@@ -97,10 +116,14 @@ public final class WebRemoteProvider: RemoteConditionalDownloadProvider, RemoteS
                         cancellation: cancellation, progress: progress)
     }
 
+    static func isStrongETag(_ version: String?) -> Bool {
+        guard let version, version.hasPrefix("\""), version.hasSuffix("\""), version.count >= 2 else { return false }
+        return !version.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) &&
+            !version.dropFirst().dropLast().contains("\"")
+    }
+
     private func validateStrongETag(_ expectedVersion: String) throws {
-        guard expectedVersion.hasPrefix("\""), expectedVersion.hasSuffix("\""), expectedVersion.count >= 2,
-              !expectedVersion.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
-              !expectedVersion.dropFirst().dropLast().contains("\"") else {
+        guard Self.isStrongETag(expectedVersion) else {
             throw NetworkError.unsupported("WebDAV conditional transfers require a strong ETag from the server.")
         }
     }

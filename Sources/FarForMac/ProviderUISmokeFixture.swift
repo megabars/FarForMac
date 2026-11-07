@@ -3,13 +3,14 @@ import FarCore
 
 /// Used only by the opt-in isolated AppKit diagnostics; never by a connection window.
 final class ProviderUISmokeFixture: RemoteSearchDownloadProvider, RemoteNonRecursiveDirectoryRemoval, RemoteNoReplaceRenameProvider {
-    let connection = NetworkConnection(kind: .sftp, host: "ui-smoke.invalid", username: "fixture")
+    let connection: NetworkConnection
     private(set) var downloads = 0
     var waitForCancellation = false
     var allowsRemoval = false
     private var values: [String: RemoteEntry] = [:]
     private var data: [String: Data] = [:]
-    init() {
+    init(name: String = "") {
+        connection = NetworkConnection(name: name, kind: .sftp, host: "ui-smoke.invalid", username: "fixture")
         for path in ["/", "/docs", "/target"] {
             values[path] = RemoteEntry(path: path, isDirectory: true, size: 0, version: path)
         }

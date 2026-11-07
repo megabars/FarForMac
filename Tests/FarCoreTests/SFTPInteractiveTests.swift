@@ -148,12 +148,33 @@ extension SFTPPasswordTests {
 
     @Test func unansweredInputHonorsDeadlineAndFinishesDialog() throws {
         let observed = LockedValues<SFTPAuthenticationChallenge>()
-        let process = try SFTPProcess(executable: "/bin/sh", arguments: ["-p", "-c", #"exec "$SSH_ASKPASS" 'OTP:'"#],
-            cancellation: TransferCancellation(), timeout: 0.25, authenticationEndpoint: endpoint, authenticationHandler: { observed.append($0) })
+        let workspace = try RemoteWorkspace()
+        defer { workspace.cleanup() }
+        let ready = workspace.directory.appendingPathComponent("challenge-presented")
+        let timeout = 0.25
+        // Pump the real askpass transport with a startup budget until the
+        // callback observes the prompt. Only then time the unanswered request.
+        let process = try SFTPProcess(executable: "/bin/sh", arguments: ["-p", "-c", #"""
+            "$SSH_ASKPASS" 'OTP:' &
+            while [ ! -e "$1" ]; do /bin/sleep 0.01; done
+            printf R
+            wait
+            """#, "challenge-timeout", ready.path], cancellation: TransferCancellation(), timeout: timeout,
+            startupTimeout: 5, authenticationEndpoint: endpoint, authenticationHandler: {
+                observed.append($0)
+                try? Data().write(to: ready)
+            })
         defer { process.stop() }
+        #expect(try process.read(1) == Data("R".utf8))
+        let challenge = try #require(observed.values.first)
+        #expect(challenge.isPending)
+        let started = ProcessInfo.processInfo.systemUptime
+        process.beginRequest()
         #expect(throws: SFTPError.timedOut) { _ = try process.read(1) }
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        #expect(elapsed >= timeout && elapsed < 2)
         #expect(observed.values.count == 1)
-        #expect(observed.values.allSatisfy { !$0.isPending })
+        #expect(!challenge.isPending)
     }
 
     @Test func cancellationAndUserCancellationFinishDialog() throws {

@@ -264,6 +264,12 @@ public final class RemoteWorkspace: @unchecked Sendable {
 /// Publication uses a sibling remote stage and checked rename. FTP/SFTP have no compare-
 /// and-swap primitive: independent writers can race the final check. No delete-before-
 /// rename fallback is permitted. Cancellation retains originals and completed copies.
+/// Publishes a new ordinary file with a server-enforced no-replacement precondition.
+protocol RemoteExclusiveUploadProvider: RemoteProvider {
+    func uploadNew(from: URL, to: String, cancellation: TransferCancellation,
+                   progress: @escaping (NetworkProgress) -> Void) throws
+}
+
 public enum RemoteTransferEngine {
     public static func download(provider: RemoteProvider, path: String, to destination: URL,
                                 replace: Bool = false, move: Bool = false,
@@ -271,10 +277,16 @@ public enum RemoteTransferEngine {
                                 progress: @escaping (NetworkProgress) -> Void = { _ in }) throws {
         try check(cancellation); try validPath(path)
         let original = try LocalRemoteStamp.optional(destination)
+        if move && original != nil {
+            throw RemoteTransferError.unsupported("При переносе с сервера выберите новое локальное имя: существующий файл может совпадать с источником.")
+        }
         let entry = try required(provider, path, cancellation)
         if original?.directory == true { throw RemoteTransferError.unsupported("Укажите новое имя назначения; загрузка поверх локальной папки недоступна.") }
         if original?.link == true { throw RemoteTransferError.unsupported("Символическую ссылку назначения нельзя заменять сетевой копией.") }
         if move && entry.isDirectory { throw RemoteTransferError.unsupported("Перемещение сетевых папок пока недоступно; используйте копирование и явное удаление.") }
+        if move && provider is WebRemoteProvider && !WebRemoteProvider.isStrongETag(entry.version) {
+            throw RemoteTransferError.unsupported("Перенос файла с WebDAV требует сильного ETag для условного удаления источника.")
+        }
         let workspace = try RemoteWorkspace()
         let local = workspace.nextURL("download")
         var budget = RemoteTreeBudget()
@@ -300,7 +312,12 @@ public enum RemoteTransferEngine {
                   try remoteHash(provider, entry, workspace, cancellation) == hash,
                   try LocalRemoteStamp(destination) == receipt else { throw RemoteTransferError.conflict(path) }
             try check(cancellation)
-            try provider.remove(path: path, isDirectory: false, cancellation: cancellation)
+            if let web = provider as? WebRemoteProvider, let version = entry.version {
+                try web.conditionalRemoveFile(path: path, expectedVersion: version, cancellation: cancellation)
+            } else {
+                guard try required(provider, path, cancellation) == entry else { throw RemoteTransferError.conflict(path) }
+                try provider.remove(path: path, isDirectory: false, cancellation: cancellation)
+            }
             } catch {
                 throw RemoteTransferError.local("Копия сохранена в «\(destination.path)». Удаление исходника «\(path)» не завершено: \(error.localizedDescription)")
             }
@@ -312,12 +329,18 @@ public enum RemoteTransferEngine {
                               cancellation: TransferCancellation = TransferCancellation(),
                               progress: @escaping (NetworkProgress) -> Void = { _ in }) throws {
         try check(cancellation); try validPath(path)
+        if move && provider is FTPRemoteProvider {
+            throw RemoteTransferError.unsupported("FTP/FTPS не гарантирует запрет замены при переносе. Используйте копирование.")
+        }
         let original = try LocalRemoteStamp(source)
         if move && original.directory { throw RemoteTransferError.unsupported("Перемещение папок на сервер пока недоступно; используйте копирование и явное удаление.") }
         var budget = RemoteTreeBudget()
         try scanLocal(source, cancellation, depth: 0, budget: &budget)
         let workspace = try RemoteWorkspace()
         let expected = try provider.stat(path: path, cancellation: cancellation)
+        if move && expected != nil {
+            throw RemoteTransferError.unsupported("При переносе на сервер выберите новое имя: существующий файл может совпадать с источником.")
+        }
         if expected != nil && !replace { throw RemoteTransferError.conflict(path) }
         if original.directory && expected != nil { throw RemoteTransferError.unsupported("Загрузка папки требует нового имени назначения; замена и слияние сетевых папок недоступны.") }
         let expectedHash = try expected.map { entry -> String in
@@ -347,6 +370,14 @@ public enum RemoteTransferEngine {
                 throw RemoteTransferError.local("Копия сохранена на сервере в «\(path)». Удаление исходника «\(source.path)» не завершено: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// The directory worker owns this already verified private snapshot.
+    static func uploadFrozenTree(provider: RemoteProvider, from source: URL, to path: String,
+                                 cancellation: TransferCancellation,
+                                 progress: @escaping (NetworkProgress) -> Void) throws {
+        try publish(provider, source, path, expected: nil, expectedHash: nil, workspace: RemoteWorkspace(),
+                    cancellation: cancellation, progress: progress)
     }
 
     /// Directory conflict decisions must retain the reviewed expectation rather
@@ -387,7 +418,7 @@ public enum RemoteTransferEngine {
         try validPath(path); try check(cancellation)
         guard path != "/" else { throw RemoteTransferError.invalidPath }
         if let web = provider as? WebRemoteProvider, let expected, let expectedHash,
-           let version = expected.version, version.hasPrefix("\""), version.hasSuffix("\""),
+           let version = expected.version, WebRemoteProvider.isStrongETag(version),
            !(try LocalRemoteStamp(local)).directory {
             guard try provider.stat(path: path, cancellation: cancellation) == expected,
                   try remoteHash(provider, expected, workspace, cancellation) == expectedHash else {
@@ -463,6 +494,8 @@ public enum RemoteTransferEngine {
             for child in try FileManager.default.contentsOfDirectory(at: local, includingPropertiesForKeys: nil) {
                 try stageTree(provider, child, path + "/" + child.lastPathComponent, workspace, cancellation, progress, depth: depth + 1)
             }
+        } else if let exclusive = provider as? RemoteExclusiveUploadProvider {
+            try exclusive.uploadNew(from: local, to: path, cancellation: cancellation, progress: progress)
         } else {
             try provider.upload(from: local, to: path, cancellation: cancellation, progress: progress)
         }
@@ -483,7 +516,7 @@ public enum RemoteTransferEngine {
             for child in localChildren { try verifyTree(provider, child, path + "/" + child.lastPathComponent, workspace, cancellation, depth: depth + 1) }
         } else {
             guard stamp.size == remote.size,
-                  try remoteHash(provider, remote, workspace, cancellation) == RemoteDigest.hash(local) else {
+                  try remoteHash(provider, remote, workspace, cancellation) == RemoteDigest.hash(local, cancellation: cancellation) else {
                 throw RemoteTransferError.verification("Проверка байтов сетевой копии не пройдена: «\(path)».")
             }
         }
@@ -506,7 +539,7 @@ public enum RemoteTransferEngine {
         let file = workspace.nextURL("verification")
         defer { try? FileManager.default.removeItem(at: file) }
         try fetch(provider, entry, file, cancellation, { _ in })
-        return try RemoteDigest.hash(file)
+        return try RemoteDigest.hash(file, cancellation: cancellation)
     }
     fileprivate static func regular(_ entry: RemoteEntry) throws {
         guard !entry.isDirectory && !entry.isSymbolicLink, entry.size >= 0 else {

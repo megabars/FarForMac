@@ -235,3 +235,41 @@ final class ArchivePanelView: NSView, NSTableViewDataSource, NSTableViewDelegate
         return field
     }
 }
+
+extension ArchivePanelView {
+    var luaPanelProperties: FarLuaValue { luaPanel.properties }
+
+    func luaPanelCall(_ name: String, _ arguments: [FarLuaValue], left: Bool = false) throws -> [FarLuaValue] {
+        try luaPanel.call(name, arguments, left: left)
+    }
+
+    func luaApplyMarkChanges(_ changes: [FarLuaPanelMarkChange]) {
+        var affected = IndexSet()
+        for (row, marked) in changes where row > 0 && rows.indices.contains(row - 1) {
+            let path = rows[row - 1].path
+            let changed = marked ? marks.insert(path).inserted : marks.remove(path) != nil
+            if changed { affected.insert(row) }
+        }
+        guard !affected.isEmpty else { return }
+        table.reloadData(forRowIndexes: affected, columnIndexes: IndexSet(integersIn: 0..<table.numberOfColumns))
+        updateSummary()
+    }
+
+    private var luaPanel: FarLuaBuiltinPanel {
+        let host = frameDisplayPath ?? snapshot.sourceURL.path
+        return FarLuaBuiltinPanel(table: table, active: active, path: currentDirectory,
+            fullPath: host + " !/" + currentDirectory, root: currentDirectory.isEmpty,
+            format: snapshot.format.displayName, hostFile: host, prefix: nil, sortMode: 2,
+            directoriesFirst: true, ascending: true, selectedFirst: false, filtered: false, parentRow: true,
+            markedRows: { [self] in rows.indices.filter { marks.contains(rows[$0].path) }.map { $0 + 1 } },
+            item: { [self] row in
+                if row == 0 { return .init(name: "..", directory: true) }
+                guard row > 0, rows.indices.contains(row - 1) else { return nil }
+                let item = rows[row - 1]
+                return .init(name: item.name, directory: item.directory, size: item.size,
+                             encrypted: item.encrypted, marked: marks.contains(item.path))
+            },
+            move: select,
+            mark: luaApplyMarkChanges)
+    }
+}

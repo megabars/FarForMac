@@ -400,3 +400,223 @@ extension WebRemoteProviderTests {
         #expect(try p.stat(path: "/new name.txt", cancellation: token)?.size == source.size)
     }
 }
+
+
+extension SFTPPasswordTests {
+    @Test func copiesSFTPTreeIntoWebDAVAndMovesBothDirections() throws {
+        let sshFixture = try PasswordSSHFixture(); defer { sshFixture.stop() }; try sshFixture.trust()
+        let webFixture = try WebRemoteFixture(); defer { webFixture.stop() }
+        let ssh = sshFixture.provider
+        defer { ssh.closeConnection() }
+        let web = WebRemoteProvider(connection: webFixture.connection(.webdav), password: "memory-only-secret")
+        let token = TransferCancellation()
+        let file = webFixture.root.appendingPathComponent("cross-payload")
+        let bytes = Data("binary content \0 α 🐈".utf8)
+        try bytes.write(to: file)
+        try ssh.makeDirectory(path: "/bundle", cancellation: token)
+        try ssh.makeDirectory(path: "/bundle/empty", cancellation: token)
+        try ssh.upload(from: file, to: "/bundle/Привет", cancellation: token, progress: { _ in })
+        let tree = try #require(try ssh.stat(path: "/bundle", cancellation: token))
+        let copy = try RemoteDirectoryTransfer.prepareRemote(source: ssh, destination: web, entries: [tree], into: "/",
+            policy: .requireNew, move: false)
+        let report = try RemoteDirectoryTransfer.copy(provider: web, plan: copy, sourceProvider: ssh)
+        #expect(report.completed.map(\.destination) == ["/bundle"])
+        #expect(try ssh.stat(path: "/bundle/Привет", cancellation: token) != nil)
+        #expect(try web.stat(path: "/bundle/empty", cancellation: token)?.isDirectory == true)
+        try web.download(path: "/bundle/Привет", to: file, resumeOffset: 0, cancellation: token, progress: { _ in })
+        #expect(try Data(contentsOf: file) == bytes)
+
+        try web.makeDirectory(path: "/moved", cancellation: token)
+        let move = try RemoteDirectoryTransfer.prepareRemote(source: ssh, destination: web, entries: [tree], into: "/moved",
+            policy: .requireNew, move: true)
+        let moved = try RemoteDirectoryTransfer.copy(provider: web, plan: move, move: true, sourceProvider: ssh)
+        #expect(Set(moved.removedSources) == ["/bundle", "/bundle/empty", "/bundle/Привет"])
+        #expect(try ssh.stat(path: "/bundle", cancellation: token) == nil)
+        let davTree = try #require(try web.stat(path: "/moved/bundle", cancellation: token))
+        webExpectThrows(try RemoteDirectoryTransfer.prepareRemote(source: web, destination: ssh, entries: [davTree],
+            into: "/", policy: .requireNew, move: true))
+
+        let davFile = try #require(try web.stat(path: "/moved/bundle/Привет", cancellation: token))
+        let returnMove = try RemoteDirectoryTransfer.prepareRemote(source: web, destination: ssh, entries: [davFile],
+            into: "/", policy: .requireNew, move: true)
+        let returned = try RemoteDirectoryTransfer.copy(provider: ssh, plan: returnMove, move: true, sourceProvider: web)
+        #expect(returned.removedSources == ["/moved/bundle/Привет"])
+        #expect(try web.stat(path: "/moved/bundle/Привет", cancellation: token) == nil)
+        try ssh.download(path: "/Привет", to: file, resumeOffset: 0, cancellation: token, progress: { _ in })
+        #expect(try Data(contentsOf: file) == bytes)
+    }
+
+    @Test func crossConnectionRejectsStaleEndpointsAndCancelsBeforeSourceDeletion() throws {
+        let sshFixture = try PasswordSSHFixture(); defer { sshFixture.stop() }; try sshFixture.trust()
+        let webFixture = try WebRemoteFixture(); defer { webFixture.stop() }
+        let ssh = sshFixture.provider
+        defer { ssh.closeConnection() }
+        let web = WebRemoteProvider(connection: webFixture.connection(.webdav), password: "memory-only-secret")
+        let token = TransferCancellation()
+        let file = webFixture.root.appendingPathComponent("race-data")
+        let source = "/candidate.txt"
+        func preview(_ entry: RemoteEntry) throws -> RemoteDirectoryTransferPlan {
+            try RemoteDirectoryTransfer.prepareRemote(source: ssh, destination: web, entries: [entry], into: "/",
+                policy: .requireNew, move: true)
+        }
+        try Data("old".utf8).write(to: file)
+        try ssh.upload(from: file, to: source, cancellation: token, progress: { _ in })
+        let original = try #require(try ssh.stat(path: source, cancellation: token))
+        let stale = try preview(original)
+        // Model an independent writer in the fixture's backing directory. Its
+        // SFTP server intentionally does not advertise POSIX overwrite rename.
+        try Data("changed source".utf8).write(to: sshFixture.root.appendingPathComponent(original.name))
+        #expect(try ssh.stat(path: source, cancellation: token)?.size != original.size)
+        webExpectThrows(try RemoteDirectoryTransfer.copy(provider: web, plan: stale, move: true, sourceProvider: ssh)) {
+            #expect(($0 as? RemoteDirectoryTransferFailure)?.outcomeUnknown == false)
+        }
+        #expect(try web.stat(path: source, cancellation: token) == nil)
+        let entry = try #require(try ssh.stat(path: source, cancellation: token))
+        let plan = try preview(entry)
+        let swappedProvider = sshFixture.provider
+        webExpectThrows(try RemoteDirectoryTransfer.copy(provider: web, plan: plan, move: true, sourceProvider: swappedProvider))
+        try Data("new target".utf8).write(to: file)
+        try web.upload(from: file, to: source, cancellation: token, progress: { _ in })
+        webExpectThrows(try RemoteDirectoryTransfer.copy(provider: web, plan: plan, move: true, sourceProvider: ssh))
+        try web.download(path: source, to: file, resumeOffset: 0, cancellation: token, progress: { _ in })
+        #expect(try Data(contentsOf: file) == Data("new target".utf8))
+        #expect(try ssh.stat(path: source, cancellation: token) == entry)
+
+        try web.remove(path: source, isDirectory: false, cancellation: token)
+        let cancel = TransferCancellation()
+        let cancellationPlan = try preview(entry)
+        webExpectThrows(try RemoteDirectoryTransfer.copy(provider: web, plan: cancellationPlan, move: true, sourceProvider: ssh,
+            cancellation: cancel, progress: { update in
+                if update.path.hasPrefix("Скопировано поддеревьев") { cancel.cancel() }
+            })) { error in
+                let partial = error as? RemoteDirectoryTransferFailure
+                #expect(partial?.report.completed.map(\.destination) == [source])
+                #expect(partial?.report.removedSources.isEmpty == true)
+                #expect(partial?.outcomeUnknown == false)
+            }
+        #expect(try ssh.stat(path: source, cancellation: token) == entry)
+        try web.download(path: source, to: file, resumeOffset: 0, cancellation: token, progress: { _ in })
+        #expect(try Data(contentsOf: file) == Data("changed source".utf8))
+    }
+
+    @Test func crossConnectionPreservesSourceWhenDestinationAcknowledgmentIsLost() throws {
+        let sshFixture = try PasswordSSHFixture(); defer { sshFixture.stop() }; try sshFixture.trust()
+        let webFixture = try WebRemoteFixture(); defer { webFixture.stop() }
+        let ssh = sshFixture.provider
+        defer { ssh.closeConnection() }
+        let web = WebRemoteProvider(connection: webFixture.connection(.webdav), password: "memory-only-secret")
+        let token = TransferCancellation()
+        let path = "/lost-move-ack.txt"
+        let payload = webFixture.root.appendingPathComponent("upload")
+        try Data("published bytes".utf8).write(to: payload)
+        try ssh.upload(from: payload, to: path, cancellation: token, progress: { _ in })
+        let entry = try #require(try ssh.stat(path: path, cancellation: token))
+        let plan = try RemoteDirectoryTransfer.prepareRemote(source: ssh, destination: web, entries: [entry],
+            into: "/", policy: .requireNew, move: true)
+        webExpectThrows(try RemoteDirectoryTransfer.copy(provider: web, plan: plan, move: true, sourceProvider: ssh)) {
+            let error = $0 as? RemoteDirectoryTransferFailure
+            #expect(error?.outcomeUnknown == true)
+            #expect(error?.report.completed.isEmpty == true)
+            #expect(error?.report.removedSources.isEmpty == true)
+        }
+        #expect(try ssh.stat(path: path, cancellation: token) == entry)
+        #expect(try web.stat(path: path, cancellation: token)?.size == entry.size)
+        let requests = webFixture.root.appendingPathComponent("lost-move-requests")
+        #expect(try String(contentsOf: requests, encoding: .utf8) == "MOVE\n")
+    }
+}
+
+extension WebRemoteProviderTests {
+    @Test func conditionalWebDAVDeletePendingIsReportedAsUnknownWithoutRetry() throws {
+        let webFixture = try WebRemoteFixture(); defer { webFixture.stop() }
+        let web = WebRemoteProvider(connection: webFixture.connection(.webdav), password: "memory-only-secret")
+        let token = TransferCancellation()
+        let payload = webFixture.root.appendingPathComponent("payload")
+        let path = "/pending-delete.txt", bytes = Data("pending server deletion".utf8)
+        try bytes.write(to: payload)
+        try web.upload(from: payload, to: path, cancellation: token, progress: { _ in })
+        let entry = try #require(try web.stat(path: path, cancellation: token))
+        let local = webFixture.root.resolvingSymlinksInPath().appendingPathComponent("copies")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: false)
+        let plan = try RemoteDirectoryTransfer.prepareDownload(provider: web, entries: [entry], into: local, policy: .requireNew, move: true)
+        let report = try RemoteDirectoryTransfer.move(provider: web, plan: plan)
+        #expect(report.completed.count == 1 && report.removedSources.isEmpty)
+        #expect(report.failedSourceRemovals.contains { $0.source == path && $0.outcomeUnknown && $0.reason.contains("202") })
+        #expect(try web.stat(path: path, cancellation: token) == entry)
+        #expect(try Data(contentsOf: local.appendingPathComponent(entry.name)) == bytes)
+        let log = webFixture.root.appendingPathComponent("pending-delete-requests")
+        let version = try #require(entry.version)
+        #expect(try String(contentsOf: log, encoding: .utf8) == version + "\n")
+
+        let single = local.appendingPathComponent("single")
+        webExpectThrows(try RemoteTransferEngine.download(provider: web, path: path, to: single, move: true)) {
+            #expect($0.localizedDescription.contains("202"))
+        }
+        #expect(try Data(contentsOf: single) == bytes)
+        #expect(try String(contentsOf: log, encoding: .utf8) == version + "\n" + version + "\n")
+    }
+
+    @Test func crossConnectionAliasPermitsOnlyNewNamesAndPreservesTheSource() throws {
+        let fixture = try WebRemoteFixture(); defer { fixture.stop() }
+        let source = WebRemoteProvider(connection: fixture.connection(.webdav), password: "memory-only-secret")
+        var alternate = fixture.connection(.webdav); alternate.host = "localhost"
+        let target = WebRemoteProvider(connection: alternate, password: "memory-only-secret")
+        let token = TransferCancellation(), path = "/hello space.txt"
+        let entry = try #require(try source.stat(path: path, cancellation: token))
+        let preview = try RemoteDirectoryTransfer.prepareRemote(source: source, destination: target, entries: [entry], into: "/",
+            policy: .mergeSkippingExisting, move: false)
+        #expect(preview.conflicts.first?.canReplace == false)
+        webExpectThrows(try RemoteDirectoryTransfer.resolve(provider: target, plan: preview, decisions: [path: .append], sourceProvider: source))
+        let renamed = try RemoteDirectoryTransfer.resolve(provider: target, plan: preview,
+            decisions: [path: .rename("alias-copy.txt")], sourceProvider: source)
+        let report = try RemoteDirectoryTransfer.copy(provider: target, plan: renamed, sourceProvider: source)
+        #expect(report.completed.map(\.destination) == ["/alias-copy.txt"])
+        #expect(try source.stat(path: path, cancellation: token) == entry)
+        #expect(try target.stat(path: "/alias-copy.txt", cancellation: token)?.size == entry.size)
+    }
+
+    @Test func localToWebDAVResolvesAppendResumeNewerAndVerifiesPrefixBeforeAnyWrite() throws {
+        let webFixture = try WebRemoteFixture(); defer { webFixture.stop() }
+        let web = WebRemoteProvider(connection: webFixture.connection(.webdav), password: "memory-only-secret")
+        let token = TransferCancellation()
+        let file = webFixture.root.appendingPathComponent("conflict-data")
+        let folder = webFixture.root.resolvingSymlinksInPath().appendingPathComponent("local-sources")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        let paths = ["/append", "/resume", "/newer", "/wrong-prefix"]
+        let files = paths.map { folder.appendingPathComponent(String($0.dropFirst())) }
+        for (path, data) in zip(paths, ["existing ", "source ", "older data", "bad"]) {
+            try Data(data.utf8).write(to: file)
+            try web.upload(from: file, to: path, cancellation: token, progress: { _ in })
+        }
+        for source in files { try Data("source contents".utf8).write(to: source) }
+        let preview = try RemoteDirectoryTransfer.prepareUpload(provider: web, sources: files, into: "/", policy: .mergeSkippingExisting)
+        // The conflict editor keys its decisions by the reviewed source path,
+        // which normalizes system aliases such as /var to /private/var.
+        let sources = Dictionary(uniqueKeysWithValues: preview.conflicts.map { ($0.mapping.destination, $0.mapping.source) })
+        let append = try #require(sources["/append"])
+        let resume = try #require(sources["/resume"])
+        let newer = try #require(sources["/newer"])
+        let wrongPrefix = try #require(sources["/wrong-prefix"])
+        let rejected = try RemoteDirectoryTransfer.resolve(provider: web, plan: preview,
+            decisions: [append: .append, wrongPrefix: .resume])
+        webExpectThrows(try RemoteDirectoryTransfer.copy(provider: web, plan: rejected)) {
+            guard let failure = $0 as? RemoteDirectoryTransferFailure,
+                  case .verification? = failure.cause as? RemoteTransferError else {
+                Issue.record("Expected a prefix verification failure: \($0)")
+                return
+            }
+            #expect(failure.report.completed.isEmpty)
+        }
+        try web.download(path: "/append", to: file, resumeOffset: 0, cancellation: token, progress: { _ in })
+        #expect(try Data(contentsOf: file) == Data("existing ".utf8))
+        let reviewed = try RemoteDirectoryTransfer.resolve(provider: web, plan: preview,
+            decisions: [append: .append, resume: .resume, newer: .newer])
+        let result = try RemoteDirectoryTransfer.copy(provider: web, plan: reviewed)
+        #expect(result.completed.count == 3)
+        #expect(result.skipped.map(\.source) == [wrongPrefix])
+        for (path, expected) in zip(paths, ["existing source contents", "source contents", "source contents", "bad"]) {
+            try web.download(path: path, to: file, resumeOffset: 0, cancellation: token, progress: { _ in })
+            #expect(try Data(contentsOf: file) == Data(expected.utf8))
+        }
+    }
+}

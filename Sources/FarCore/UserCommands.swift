@@ -16,9 +16,11 @@ public struct UserMenuEntry: Codable, Equatable, Sendable {
     public var children: [UserMenuEntry]?
     public var key: String?
     public var separator: Bool?
-    public init(title: String, command: String? = nil, children: [UserMenuEntry]? = nil, key: String? = nil, separator: Bool = false) {
+    public var farSyntax: Bool?
+    public init(title: String, command: String? = nil, children: [UserMenuEntry]? = nil, key: String? = nil, separator: Bool = false, farSyntax: Bool = false) {
         self.title = title; self.command = command; self.children = children; self.key = key
         self.separator = separator ? true : nil
+        self.farSyntax = farSyntax ? true : nil
     }
 }
 
@@ -31,10 +33,13 @@ public struct UserFileAssociation: Codable, Equatable, Sendable {
     public var alternateExecute: String?
     public var alternateView: String?
     public var alternateEdit: String?
+    public var farSyntax: Bool?
     public init(title: String, mask: String, execute: String? = nil, view: String? = nil, edit: String? = nil,
-                alternateExecute: String? = nil, alternateView: String? = nil, alternateEdit: String? = nil) {
+                alternateExecute: String? = nil, alternateView: String? = nil, alternateEdit: String? = nil,
+                farSyntax: Bool = false) {
         self.title = title; self.mask = mask; self.execute = execute; self.view = view; self.edit = edit
         self.alternateExecute = alternateExecute; self.alternateView = alternateView; self.alternateEdit = alternateEdit
+        self.farSyntax = farSyntax ? true : nil
     }
     public func command(for action: UserCommandAction) -> String? {
         switch action {
@@ -42,6 +47,17 @@ public struct UserFileAssociation: Codable, Equatable, Sendable {
         case .alternateExecute: return alternateExecute; case .alternateView: return alternateView; case .alternateEdit: return alternateEdit
         }
     }
+}
+
+public struct UserAssociationCandidate: Equatable, Sendable {
+    public let association: UserFileAssociation
+    public let title: String
+    public let template: String
+}
+
+public struct UserAssociationResolution: Equatable, Sendable {
+    public let hasMatchingAction: Bool
+    public let candidates: [UserAssociationCandidate]
 }
 
 public struct UserCommandConfiguration: Codable, Equatable, Sendable {
@@ -96,14 +112,14 @@ public struct UserCommandConfiguration: Codable, Equatable, Sendable {
         func menu(_ value: Any) throws {
             guard let entries = value as? [Any] else { throw UserCommandError("Поле menu/children должно быть массивом.") }
             for entry in entries {
-                let object = try keys(entry, allowed: ["title", "command", "children", "key", "separator"])
+                let object = try keys(entry, allowed: ["title", "command", "children", "key", "separator", "farSyntax"])
                 if let children = object["children"] { try menu(children) }
             }
         }
         let root = try keys(value, allowed: ["version", "menu", "associations"])
         if let entries = root["menu"] { try menu(entries) }
         if let entries = root["associations"] as? [Any] {
-            for entry in entries { _ = try keys(entry, allowed: ["title", "mask", "execute", "view", "edit", "alternateExecute", "alternateView", "alternateEdit"]) }
+            for entry in entries { _ = try keys(entry, allowed: ["title", "mask", "execute", "view", "edit", "alternateExecute", "alternateView", "alternateEdit", "farSyntax"]) }
         }
     }
 
@@ -122,7 +138,7 @@ public struct UserCommandConfiguration: Codable, Equatable, Sendable {
             for entry in values {
                 count += 1
                 guard count <= 512 else { throw UserCommandError("В меню допустимо не более 512 пунктов.") }
-                try title(entry.title)
+                if entry.farSyntax != true || entry.separator != true || !entry.title.isEmpty { try title(entry.title) }
                 if entry.separator == true {
                     guard entry.command == nil, entry.children == nil, entry.key == nil else {
                         throw UserCommandError("Разделитель меню не может содержать команду, подменю или клавишу.")
@@ -134,12 +150,19 @@ public struct UserCommandConfiguration: Codable, Equatable, Sendable {
                 }
                 if let key = entry.key {
                     let characterKey = key.count == 1 && key.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) }
+                    let farKey = entry.farSyntax == true && key.count == 1 && !key.unicodeScalars.contains(where: {
+                        CharacterSet.controlCharacters.contains($0) || CharacterSet.whitespacesAndNewlines.contains($0)
+                    })
                     let functionKey = key.uppercased().hasPrefix("F") && Int(key.dropFirst()).map { (1...24).contains($0) && "F\($0)" == key.uppercased() } == true
-                    guard characterKey || functionKey, usedKeys.insert(key.lowercased()).inserted else {
+                    guard characterKey || functionKey || farKey,
+                          entry.farSyntax == true || usedKeys.insert(key.lowercased()).inserted else {
                         throw UserCommandError("Клавиша пункта должна быть одной буквой/цифрой или F1–F24 и не повторяться в этом меню.")
                     }
                 }
-                if let command = entry.command { try UserCommandExpander.validate(command) }
+                if let command = entry.command {
+                    if entry.farSyntax == true { try FarMenuImporter.validateCommandBlock(command) }
+                    else { try UserCommandExpander.validate(command) }
+                }
                 if let children = entry.children, !children.isEmpty {
                     try entries(children, depth: depth + 1)
                 }
@@ -148,15 +171,65 @@ public struct UserCommandConfiguration: Codable, Equatable, Sendable {
         try entries(menu, depth: 1)
         guard associations.count <= 256 else { throw UserCommandError("Допустимо не более 256 ассоциаций.") }
         for association in associations {
-            try title(association.title)
+            if association.farSyntax != true || !association.title.isEmpty { try title(association.title) }
             _ = try FileMask(association.mask)
             guard UserCommandAction.allCases.contains(where: { association.command(for: $0) != nil }) else {
                 throw UserCommandError("Ассоциация «\(association.title)» не содержит команд.")
             }
             for action in UserCommandAction.allCases {
-                if let command = association.command(for: action) { try UserCommandExpander.validate(command) }
+                guard let command = association.command(for: action) else { continue }
+                if association.farSyntax == true {
+                    try FarMenuImporter.validateCommandBlock(command)
+                    guard !command.contains(where: \.isNewline) else {
+                        throw UserCommandError("Ассоциация FAR должна содержать одну команду.")
+                    }
+                } else {
+                    try UserCommandExpander.validate(FarMenuMetasymbols.associationTemplate(command,
+                        captures: FarMenuMetasymbols.referencedCaptures(in: command)))
+                }
             }
         }
+    }
+
+    /// FAR consumes a matching association action even when all conditions are false.
+    public func resolveAssociations(for filename: String, action: UserCommandAction,
+                                    context: UserCommandContext, commands: InternalCommandState) throws -> UserAssociationResolution {
+        var matched = false
+        var candidates: [UserAssociationCandidate] = []
+        for association in associations {
+            guard let source = association.command(for: action),
+                  let captures = try FileMask(association.mask).associationCaptures(filename) else { continue }
+            matched = true
+            let isFar = association.farSyntax == true
+            let template = try isFar
+                ? FarMenuMetasymbols.command(source, context: context, variables: captures)
+                : FarMenuMetasymbols.associationTemplate(source, captures: captures)
+            let potentialCondition = template.drop(while: { $0.isWhitespace || $0 == "@" })
+            let firstWord = potentialCondition.prefix(while: { !$0.isWhitespace })
+            let commandTitle: String?
+            if firstWord.lowercased() == "if" {
+                let preview = try UserCommandExpander.preview(template, context: context)
+                guard let command = try commands.conditionallyExecutable(preview, currentDirectory: context.activeDirectory) else { continue }
+                commandTitle = command
+            } else {
+                commandTitle = nil
+            }
+            let title: String
+            if association.title.isEmpty {
+                title = commandTitle ?? (isFar ? FarMenuMetasymbols.title(source, context: context, variables: captures) : source)
+            } else if isFar {
+                title = FarMenuMetasymbols.title(association.title, context: context, variables: captures)
+            } else {
+                title = association.title
+            }
+            candidates.append(UserAssociationCandidate(association: association, title: title, template: template))
+        }
+        return UserAssociationResolution(hasMatchingAction: matched, candidates: candidates)
+    }
+
+    public func associationCandidates(for filename: String, action: UserCommandAction,
+                                      context: UserCommandContext, commands: InternalCommandState) throws -> [UserAssociationCandidate] {
+        try resolveAssociations(for: filename, action: action, context: context, commands: commands).candidates
     }
 
     public func matchingAssociations(for filename: String, action: UserCommandAction) throws -> [UserFileAssociation] {
@@ -175,31 +248,52 @@ public struct UserCommandContext: Sendable {
     public let passiveDirectory: URL
     public let passiveCurrentFile: URL?
     public let passiveMarkedFiles: [URL]
+    public let activePanelIsLeft: Bool
+    public let activeDescriptionEncoding: FileDescriptionEncoding
+    public let passiveDescriptionEncoding: FileDescriptionEncoding
     public init(currentFile: URL?, markedFiles: [URL], activeDirectory: URL, passiveDirectory: URL,
-                passiveCurrentFile: URL? = nil, passiveMarkedFiles: [URL] = []) {
+                passiveCurrentFile: URL? = nil, passiveMarkedFiles: [URL] = [], activePanelIsLeft: Bool = true,
+                activeDescriptionEncoding: FileDescriptionEncoding = .utf8, passiveDescriptionEncoding: FileDescriptionEncoding = .utf8) {
         self.currentFile = currentFile; self.markedFiles = markedFiles
         self.activeDirectory = activeDirectory; self.passiveDirectory = passiveDirectory
         self.passiveCurrentFile = passiveCurrentFile; self.passiveMarkedFiles = passiveMarkedFiles
+        self.activePanelIsLeft = activePanelIsLeft
+        self.activeDescriptionEncoding = activeDescriptionEncoding
+        self.passiveDescriptionEncoding = passiveDescriptionEncoding
     }
+    public func replacingCurrentFile(_ file: URL?, directory: URL, markedFiles: [URL]? = nil) -> Self {
+        Self(currentFile: file, markedFiles: markedFiles ?? self.markedFiles, activeDirectory: directory, passiveDirectory: passiveDirectory,
+             passiveCurrentFile: passiveCurrentFile, passiveMarkedFiles: passiveMarkedFiles, activePanelIsLeft: activePanelIsLeft,
+             activeDescriptionEncoding: activeDescriptionEncoding, passiveDescriptionEncoding: passiveDescriptionEncoding)
+    }
+
 }
 
 public struct LoadedUserMenu: Sendable {
+    public enum Location: Equatable, Sendable { case local, installation, profile }
     public let entries: [UserMenuEntry]
     public let source: URL
-    public let isLocal: Bool
-    fileprivate let configuration: UserCommandConfiguration
+    public let location: Location
+    public var isLocal: Bool { location == .local }
+    public var isFarMenu: Bool { configuration == nil }
+    fileprivate let configuration: UserCommandConfiguration?
     fileprivate let originalData: Data?
 }
 
 /// Reads are explicit: constructing the store or changing panel directory performs no I/O or execution.
 public struct UserCommandStore: Sendable {
     public static let localFilename = ".farformac-menu.json"
+    public static let farMenuFilename = "FarMenu.ini"
     public static var defaultGlobalURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("FarForMac", isDirectory: true).appendingPathComponent("commands.json")
     }
     public let globalURL: URL
-    public init(globalURL: URL = Self.defaultGlobalURL) { self.globalURL = globalURL }
+    public let installationMenuDirectory: URL?
+    public init(globalURL: URL = Self.defaultGlobalURL, installationMenuDirectory: URL? = nil) {
+        self.globalURL = globalURL
+        self.installationMenuDirectory = installationMenuDirectory
+    }
     public func loadGlobal() throws -> UserCommandConfiguration {
         guard let data = try read(globalURL) else { return UserCommandConfiguration() }
         return try UserCommandConfiguration.decode(data)
@@ -214,38 +308,96 @@ public struct UserCommandStore: Sendable {
         return try loadMainMenu()
     }
     public func loadLocalMenu(in directory: URL) throws -> LoadedUserMenu? {
+        if let native = try loadFarMenu(in: directory, location: .local) { return native }
         let url = directory.appendingPathComponent(Self.localFilename)
         guard let data = try read(url) else { return nil }
         let config = try UserCommandConfiguration.decode(data)
-        return LoadedUserMenu(entries: config.menu, source: url, isLocal: true, configuration: config, originalData: data)
+        return LoadedUserMenu(entries: config.menu, source: url, location: .local, configuration: config, originalData: data)
     }
     public func loadMainMenu() throws -> LoadedUserMenu {
+        if let installationMenuDirectory, let installation = try loadFarMenu(in: installationMenuDirectory, location: .installation) {
+            return installation
+        }
+        return try loadProfileMenu()
+    }
+    public func loadProfileMenu() throws -> LoadedUserMenu {
+        if let native = try loadFarMenu(in: globalURL.deletingLastPathComponent(), location: .profile) { return native }
         let data = try read(globalURL)
         let config = try data.map(UserCommandConfiguration.decode) ?? UserCommandConfiguration()
-        return LoadedUserMenu(entries: config.menu, source: globalURL, isLocal: false, configuration: config, originalData: data)
+        return LoadedUserMenu(entries: config.menu, source: globalURL, location: .profile, configuration: config, originalData: data)
+    }
+    public func loadParentMenu(of menu: LoadedUserMenu) throws -> LoadedUserMenu {
+        guard menu.isLocal else { return try loadProfileMenu() }
+        var current = menu.source.deletingLastPathComponent()
+        while current.path != "/" {
+            current.deleteLastPathComponent()
+            if let parent = try loadLocalMenu(in: current) { return parent }
+        }
+        return try loadMainMenu()
+    }
+    public func nextMenu(after menu: LoadedUserMenu, in directory: URL) throws -> LoadedUserMenu {
+        switch menu.location {
+        case .local: return try loadMainMenu()
+        case .installation: return try loadProfileMenu()
+        case .profile: return try loadMenu(in: directory)
+        }
+    }
+    private func loadFarMenu(in directory: URL, location: LoadedUserMenu.Location) throws -> LoadedUserMenu? {
+        let url = directory.appendingPathComponent(Self.farMenuFilename)
+        guard let data = try read(url) else { return nil }
+        return try farMenu(from: data, at: url, location: location)
+    }
+    private func farMenu(from data: Data, at url: URL, location: LoadedUserMenu.Location) throws -> LoadedUserMenu {
+        let entries = try FarMenuImporter.parseNative(data).menu
+        return LoadedUserMenu(entries: entries, source: url, location: location, configuration: nil, originalData: data)
+    }
+    public func farMenuText(_ original: LoadedUserMenu) throws -> String {
+        guard original.isFarMenu, let data = original.originalData else {
+            throw UserCommandError("Ожидается текстовый источник FarMenu.ini.")
+        }
+        return try FarMenuImporter.decodeText(data)
+    }
+    @discardableResult
+    public func saveFarMenuText(_ text: String, replacing original: LoadedUserMenu) throws -> LoadedUserMenu {
+        guard original.isFarMenu, original.source.lastPathComponent == Self.farMenuFilename else {
+            throw UserCommandError("Ожидается текстовый источник FarMenu.ini.")
+        }
+        let data = try FarMenuImporter.encodeText(text, original: original.originalData)
+        let updated = try farMenu(from: data, at: original.source, location: original.location)
+        try saveMenuData(data, replacing: original)
+        return updated
     }
     public func saveMenu(_ entries: [UserMenuEntry], replacing original: LoadedUserMenu) throws -> LoadedUserMenu {
+        if original.isFarMenu {
+            let oldText = try farMenuText(original)
+            let eol = oldText.contains("\r\n") ? "\r\n" : oldText.contains("\r") ? "\r" : "\n"
+            try UserCommandConfiguration(menu: entries).validate()
+            return try saveFarMenuText(FarMenuImporter.serialize(entries, lineEnding: eol), replacing: original)
+        }
         guard original.isLocal ? original.source.lastPathComponent == Self.localFilename : original.source == globalURL else {
             throw UserCommandError("Неизвестный источник пользовательского меню.")
         }
-        var config = original.configuration
+        guard var config = original.configuration else { throw UserCommandError("Отсутствует конфигурация JSON.") }
         config.menu = entries
         try config.validate()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(config)
         _ = try UserCommandConfiguration.decode(data)
+        try saveMenuData(data, replacing: original)
+        return LoadedUserMenu(entries: entries, source: original.source, location: original.location,
+            configuration: config, originalData: data)
+    }
+    private func saveMenuData(_ data: Data, replacing original: LoadedUserMenu) throws {
         try save(data, to: original.source) {
             guard try read(original.source) == original.originalData else {
                 throw UserCommandError("Файл меню изменился. Откройте меню заново.")
             }
         }
-        return LoadedUserMenu(entries: entries, source: original.source, isLocal: original.isLocal,
-            configuration: config, originalData: data)
     }
     public func importFarMenu(at url: URL) throws -> FarMenuImportResult {
         guard let data = try read(url) else { throw UserCommandError("Файл меню не найден.") }
-        return try FarMenuImporter.parse(data)
+        return try FarMenuImporter.parseNative(data)
     }
     private func read(_ url: URL) throws -> Data? {
         let descriptor = open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)

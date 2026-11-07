@@ -6,18 +6,33 @@ public struct MetadataChanges: Equatable, Sendable {
     public var accessed: Date?
     public var modified: Date?
     public var groupID: UInt32?
-    public init(permissions: UInt16? = nil, accessed: Date? = nil, modified: Date? = nil, groupID: UInt32? = nil) {
+    public var created: Date?
+    public var ownerID: UInt32?
+    public var hidden: Bool?
+    public var noDump: Bool?
+    /// macOS's native !#acl text representation. An explicitly empty string clears the ACL.
+    public var aclText: String?
+    public init(permissions: UInt16? = nil, accessed: Date? = nil, modified: Date? = nil, groupID: UInt32? = nil,
+                created: Date? = nil, ownerID: UInt32? = nil, hidden: Bool? = nil, noDump: Bool? = nil,
+                aclText: String? = nil) {
         self.permissions = permissions; self.accessed = accessed; self.modified = modified; self.groupID = groupID
+        self.created = created; self.ownerID = ownerID; self.hidden = hidden; self.noDump = noDump; self.aclText = aclText
     }
     fileprivate func validate() throws {
-        guard permissions != nil || accessed != nil || modified != nil || groupID != nil,
+        guard permissions != nil || accessed != nil || modified != nil || groupID != nil || created != nil ||
+              ownerID != nil || hidden != nil || noDump != nil || aclText != nil,
               permissions.map({ $0 <= 0o7777 }) ?? true else { throw MetadataMutation.Error("Выберите корректные изменения свойств.") }
+        if let ownerID {
+            guard geteuid() == 0, ownerID != uid_t.max else {
+                throw MetadataMutation.Error("Смена UID доступна с правами root и требует допустимого номера владельца.")
+            }
+        }
         if let groupID {
             guard try MetadataOwnership.availableGroups().contains(where: { $0.id == groupID }) else {
                 throw MetadataMutation.Error("Можно выбрать только группу текущего пользователя.")
             }
         }
-        for date in [accessed, modified].compactMap({ $0 }) {
+        for date in [accessed, modified, created].compactMap({ $0 }) {
             guard date.timeIntervalSince1970.isFinite, (-62_135_596_800...253_402_300_799).contains(date.timeIntervalSince1970) else {
                 throw MetadataMutation.Error("Дата должна находиться между 1 и 9999 годом.")
             }
@@ -34,6 +49,9 @@ public struct MetadataMutationEntry: Sendable {
     public let previousGroupID: UInt32
     public let previousAccessed: Date
     public let previousModified: Date
+    public let previousCreated: Date
+    public let previousFlags: UInt32
+    public let previousACLText: String?
     fileprivate let components: [String]
     fileprivate let stamp: MetadataStamp
 }
@@ -68,22 +86,27 @@ fileprivate struct MetadataStamp: Sendable {
     let modifiedNanos: Int
     let changedSeconds: Int
     let changedNanos: Int
+    let birthSeconds: Int
+    let birthNanos: Int
+    let flags: UInt32
     init(_ info: stat) {
         device = info.st_dev; inode = info.st_ino; kind = info.st_mode & S_IFMT
         permissions = UInt16(info.st_mode & 0o7777)
         owner = info.st_uid; group = info.st_gid; size = info.st_size; links = info.st_nlink
         modifiedSeconds = info.st_mtimespec.tv_sec; modifiedNanos = info.st_mtimespec.tv_nsec
         changedSeconds = info.st_ctimespec.tv_sec; changedNanos = info.st_ctimespec.tv_nsec
+        birthSeconds = info.st_birthtimespec.tv_sec; birthNanos = info.st_birthtimespec.tv_nsec; flags = info.st_flags
     }
     func matches(_ info: stat) -> Bool {
         device == info.st_dev && inode == info.st_ino && kind == info.st_mode & S_IFMT &&
         permissions == UInt16(info.st_mode & 0o7777) && modifiedSeconds == info.st_mtimespec.tv_sec && modifiedNanos == info.st_mtimespec.tv_nsec
         && owner == info.st_uid && group == info.st_gid && size == info.st_size && links == info.st_nlink
         && changedSeconds == info.st_ctimespec.tv_sec && changedNanos == info.st_ctimespec.tv_nsec
+        && birthSeconds == info.st_birthtimespec.tv_sec && birthNanos == info.st_birthtimespec.tv_nsec && flags == info.st_flags
     }
 }
 
-/// Reviewed local metadata changes. No link traversal, ACL editing or privilege escalation.
+/// Reviewed local metadata changes with descriptor-based mutation and ordinary OS permissions.
 public enum MetadataMutation {
     public struct Error: LocalizedError {
         public let errorDescription: String?
@@ -92,11 +115,29 @@ public enum MetadataMutation {
     public static let maximumEntries = 100_000
     public static let maximumDepth = 128
 
+    public static func aclText(url: URL) throws -> String {
+        let item = try FileTools.metadata(url)
+        let parent = try openDirectory(item.url.deletingLastPathComponent())
+        defer { close(parent) }
+        let fd = openat(parent, item.url.lastPathComponent, O_EVTONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard fd >= 0 else { throw system("Открыть ACL", item.url) }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFDIR || info.st_mode & S_IFMT == S_IFREG else {
+            throw Error("ACL доступны только для обычных файлов и папок.")
+        }
+        return try readACL(fd, item.url)
+    }
+
     /// Reads the complete plan without mutations. Every selected field applies to every
     /// reviewed entry. Directories are ordered after children.
     public static func prepare(url: URL, changes: MetadataChanges, recursive: Bool = false,
                                cancellation: FileToolCancellation = FileToolCancellation()) throws -> MetadataMutationPlan {
         try changes.validate()
+        if recursive && changes.aclText != nil { throw Error("ACL редактируется только для выбранного объекта.") }
+        var newACL: acl_t?
+        if let text = changes.aclText { newACL = try parseACL(text) }
+        defer { if let newACL { acl_free(UnsafeMutableRawPointer(newACL)) } }
         let root = try FileTools.metadata(url).url
         let parent = try openDirectory(root.deletingLastPathComponent())
         defer { close(parent) }
@@ -126,6 +167,10 @@ public enum MetadataMutation {
             var opened = stat()
             let stamp = MetadataStamp(info)
             guard fstat(fd, &opened) == 0, stamp.matches(opened) else { throw Error("Объект изменился: \(path.path)") }
+            var previousACL: String?
+            if newACL != nil {
+                previousACL = try readACL(fd, path)
+            }
             if recursive && kind == S_IFDIR {
                 try children(fd) { child in
                     var value = stat()
@@ -137,6 +182,7 @@ public enum MetadataMutation {
                 previousPermissions: UInt16(info.st_mode & 0o7777), hardLinkCount: Int(info.st_nlink),
                 previousOwnerID: info.st_uid, previousGroupID: info.st_gid,
                 previousAccessed: date(info.st_atimespec), previousModified: date(info.st_mtimespec),
+                previousCreated: date(info.st_birthtimespec), previousFlags: info.st_flags, previousACLText: previousACL,
                 components: components, stamp: stamp))
         }
         try visit(parent: parent, name: root.lastPathComponent, components: [], info: info)
@@ -153,6 +199,9 @@ public enum MetadataMutation {
         var mutationStarted = false
         do {
             try plan.changes.validate()
+            var newACL: acl_t?
+            if let text = plan.changes.aclText { newACL = try parseACL(text) }
+            defer { if let newACL { acl_free(UnsafeMutableRawPointer(newACL)) } }
             if cancellation.isCancelled { report.isCancelled = true; return report }
             let parent = try openDirectory(plan.root.deletingLastPathComponent())
             defer { close(parent) }
@@ -190,10 +239,13 @@ public enum MetadataMutation {
                 if cancellation.isCancelled { report.isCancelled = true; return report }
                 let fd = try openEntry(entry); defer { close(fd) }; try verify(fd, entry)
                 mutationStarted = true
-                if let groupID = plan.changes.groupID, groupID != entry.previousGroupID {
-                    // chown may clear set-ID bits. A group-only edit never silently
-                    // restores executable privilege bits; the UI warns explicitly.
-                    guard fchown(fd, uid_t.max, gid_t(groupID)) == 0 else { throw system("Изменить группу", entry.url) }
+                let owner = plan.changes.ownerID.flatMap { $0 == entry.previousOwnerID ? nil : $0 }
+                let group = plan.changes.groupID.flatMap { $0 == entry.previousGroupID ? nil : $0 }
+                if owner != nil || group != nil {
+                    guard fchown(fd, owner ?? uid_t.max, group ?? gid_t.max) == 0 else { throw system("Изменить владельца или группу", entry.url) }
+                }
+                if let created = plan.changes.created {
+                    try setCreationDate(fd, timestamp(created), entry.url)
                 }
                 if plan.changes.accessed != nil || plan.changes.modified != nil {
                     var times = [timestamp(plan.changes.accessed), timestamp(plan.changes.modified)]
@@ -202,11 +254,49 @@ public enum MetadataMutation {
                 if let permissions = plan.changes.permissions {
                     guard fchmod(fd, mode_t(permissions)) == 0 else { throw system("Изменить права", entry.url) }
                 }
+                var flags = entry.previousFlags
+                for (enabled, bit) in [(plan.changes.hidden, UInt32(UF_HIDDEN)), (plan.changes.noDump, UInt32(UF_NODUMP))] {
+                    if let enabled { flags = enabled ? flags | bit : flags & ~bit }
+                }
+                if flags != entry.previousFlags {
+                    guard fchflags(fd, flags) == 0 else { throw system("Изменить флаги BSD", entry.url) }
+                }
+                if let newACL {
+                    guard acl_set_fd_np(fd, newACL, ACL_TYPE_EXTENDED) == 0 else { throw system("Записать ACL", entry.url) }
+                }
                 report.completed += 1
                 progress(report.completed, report.total, entry.url.path)
             }
         } catch { report.error = error.localizedDescription + (mutationStarted ? " Текущий объект мог измениться частично; отката нет." : " Изменений нет.") }
         return report
+    }
+    private static func setCreationDate(_ fd: Int32, _ value: timespec, _ url: URL) throws {
+        var attributes = attrlist()
+        attributes.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+        attributes.commonattr = UInt32(ATTR_CMN_CRTIME)
+        var timestamp = value
+        guard fsetattrlist(fd, &attributes, &timestamp, MemoryLayout<timespec>.size, 0) == 0 else {
+            throw system("Изменить дату создания", url)
+        }
+    }
+    private static func parseACL(_ text: String) throws -> acl_t {
+        guard !text.contains("\0"), text.utf8.count <= 65_536 else { throw Error("ACL превышает 64 КиБ или содержит NUL.") }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let acl = trimmed.isEmpty ? acl_init(0) : acl_from_text(trimmed + "\n")
+        guard let acl else { throw Error("Некорректный текст ACL macOS.") }
+        guard acl_valid(acl) == 0 else { acl_free(UnsafeMutableRawPointer(acl)); throw Error("Некорректный список ACL macOS.") }
+        return acl
+    }
+    private static func readACL(_ fd: Int32, _ url: URL) throws -> String {
+        guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else {
+            if errno == ENOENT { return "" }
+            throw system("Прочитать ACL", url)
+        }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var length = 0
+        guard let text = acl_to_text(acl, &length) else { throw system("Преобразовать ACL в текст", url) }
+        defer { acl_free(text) }
+        return String(cString: text)
     }
     private static func date(_ timestamp: timespec) -> Date {
         Date(timeIntervalSince1970: Double(timestamp.tv_sec) + Double(timestamp.tv_nsec) / 1e9)

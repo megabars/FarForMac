@@ -41,13 +41,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var synchronizingTemporaryPanels = false
     private var keyMonitor: Any?
     private var busy = false
+    private var terminationPending = false
     var settingsWindow: PanelSettingsWindow?
     var groupsWindow: MaskGroupsWindow?
     private var searchWindow: SearchWindow?
     private var toolWindows: [NSWindowController] = []
     var canChangePanelResource: Bool { !busy && !toolMutationPending && !operationQueue.hasPendingOperations }
     private var toolMutationPending: Bool {
-        searchWindow?.isProviderSearching == true || savedPanelRestore.isWorking || virtualOperations.isWorking || network.isWorking || archiveOperations.isWorking || archiveEdits.contains(where: { $0.isWorking }) || toolWindows.contains { ($0 as? FileToolsWindowController)?.hasPendingMutation == true }
+        StockPanelPlugins.shared.isApplyingFileCase || searchWindow?.isProviderSearching == true || savedPanelRestore.isWorking || virtualOperations.isWorking || network.isWorking || archiveOperations.isWorking || archiveEdits.contains(where: { $0.isWorking }) || toolWindows.contains { ($0 as? FileToolsWindowController)?.hasPendingMutation == true }
     }
     private lazy var operationQueue: FileOperationQueue = {
         let queue = FileOperationQueue()
@@ -139,14 +140,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             panel.onArchiveSwitchPanel = { [weak self] in guard let self else { return }; self.activate(self.passive); self.active.focus() }
             panel.onFileOpen = { [weak self, weak panel] entry in
                 guard let self, let panel else { return }
+                if self.shellWorkspace.association(for: entry.url, action: .execute) { return }
                 if ArchivePanelView.isArchiveName(entry.url.lastPathComponent) {
                     self.openArchive(entry.url, in: panel); return
                 }
-                if !self.shellWorkspace.association(for: entry.url, action: .execute) { NSWorkspace.shared.open(entry.url) }
+                NSWorkspace.shared.open(entry.url)
             }
             panel.onContentModeChange = { [weak self] _ in self?.updateAuxiliaryPanels() }
             panel.onSelectionChange = { [weak self] _ in self?.updateAuxiliaryPanels() }
             panel.onDirectoryChange = { [weak self] panel in
+                FarLuaWorkspace.shared.event("FolderChanged", [])
                 guard let self, let shell = self.shellWorkspace else { return }
                 let key = ObjectIdentifier(panel)
                 if self.recordedPanelPaths[key] != panel.directory.path {
@@ -168,10 +171,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         panelsContainer = panelsWrapper
         shellWorkspace = ShellWorkspace(context: { [weak self] in
             guard let self else { return UserCommandContext(currentFile: nil, markedFiles: [], activeDirectory: URL(fileURLWithPath: "/"), passiveDirectory: URL(fileURLWithPath: "/")) }
-            return UserCommandContext(currentFile: self.active.cursorEntry?.url, markedFiles: self.active.markedEntries.map(\.url), activeDirectory: self.active.directory, passiveDirectory: self.passive.directory, passiveCurrentFile: self.passive.cursorEntry?.url, passiveMarkedFiles: self.passive.markedEntries.map(\.url))
+            return UserCommandContext(currentFile: self.active.cursorEntry?.url, markedFiles: self.active.markedEntries.map(\.url), activeDirectory: self.active.directory, passiveDirectory: self.passive.directory, passiveCurrentFile: self.passive.cursorEntry?.url, passiveMarkedFiles: self.passive.markedEntries.map(\.url), activePanelIsLeft: self.active === self.left, activeDescriptionEncoding: DescriptionPreferences.encoding(for: self.active.directory), passiveDescriptionEncoding: DescriptionPreferences.encoding(for: self.passive.directory))
         }, navigate: { [weak self] url in self?.active.navigateHistory(to: url.path) }, openFile: { [weak self] url, editable in
             _ = self?.openDocument(url, editable: editable)
         }, showTerminal: { [weak self] in self?.setTerminalVisible(true) }, togglePanels: { [weak self] in self?.toggleTerminal() }, refreshPanels: { [weak self] in self?.refresh() }, report: { [weak self] text in self?.status.stringValue = text })
+        shellWorkspace.navigateMenuDirectory = { [weak self] url, isLeft, completion in
+            guard let self else { completion(false); return }
+            let panel = isLeft ? self.left! : self.right!
+            panel.navigateHistory(to: url.path, focus: !self.terminalVisible && panel === self.active, completion: completion)
+        }
         shellWorkspace.navigateHistoryFolder = { [weak self] url, passiveSide, preserveOrder in
             guard let self else { return }
             let target = passiveSide ? self.passive : self.active!
@@ -206,15 +214,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if !AppRuntime.isSmoke { DispatchQueue.main.async { [weak self] in self?.offerEditorRecovery(automatic: true) } }
         lastVirtualResults = persistentTemporaryPanels().savedLastMixed.map(SearchMatch.saved)
         configureAutomation()
+        FarLuaWorkspace.shared.configure(app: self)
+        FarLuaPlugins.shared.configure(app: self)
+        FarCmdsWorkspace.shared.configure(app: self)
+        configureLuaCommands()
         installWorkspaceObservers()
         applyInterfacePreferences()
         if AppRuntime.isSmoke { Task { await runUISmoke() } }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, NSApp.keyWindow != nil else { return event }
+            let commandModifiers = event.modifierFlags.intersection([.control, .command, .option, .shift])
+            if self.window.isKeyWindow,
+               (event.keyCode == 53 && commandModifiers.isEmpty || event.keyCode == 8 && commandModifiers == [.control]),
+               self.shellWorkspace.cancelCommandSequence() { return nil }
+            if self.window.isKeyWindow, event.keyCode == 53, StockPanelPlugins.shared.isApplyingFileCase {
+                StockPanelPlugins.shared.cancelFileCase(); return nil
+            }
+            if (NSApp.keyWindow?.windowController as? TextFileWindow)?.drawLineActive == true { return event }
+            if FarLuaWorkspace.shared.handle(event) { return nil }
+            if HlfViewerWorkspace.shared.handleKey(event) { return nil }
+            if event.keyCode == 103, event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+               FarLuaWorkspace.shared.area == "Dialog" { FarLuaPlugins.shared.showMenu(); return nil }
             if NSApp.modalWindow?.windowController is PanelListMenu || event.window?.windowController is PanelListMenu { return event }
             if self.farMainMenu.isPresented, self.window.isKeyWindow {
                 self.farMainMenu.handleKey(event); return nil
             }
+            if let terminal = event.window?.firstResponder as? TerminalTextView, terminal.hasActiveProcess,
+               !event.modifierFlags.contains(.command) { return event }
             if CommandWorkspace.shared.handle(event) { return nil }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if self.window.isKeyWindow, self.terminalVisible, self.shellWorkspace.isRunning,
@@ -242,6 +268,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if modifiers == [.control], event.keyCode == 31 { self.toggleTerminal(); return nil }
             if self.terminalVisible, self.shellWorkspace.isRunning { return event }
             if modifiers == [.command], event.keyCode == 36 { self.shellWorkspace.focusCommand(); return nil }
+            if modifiers.isEmpty, event.keyCode == 103 { FarLuaPlugins.shared.showMenu(); return nil }
+            if modifiers == [.control], event.keyCode == 38 { self.shellWorkspace.insertPanelValue(.activeName); return nil }
+            if modifiers == [.control], [36, 76].contains(event.keyCode) { self.shellWorkspace.insertPanelValue(.activeName); return nil }
+            if modifiers == [.control, .shift], [36, 76].contains(event.keyCode) { self.shellWorkspace.insertPanelValue(.passiveName); return nil }
+            if modifiers == [.control], event.keyCode == 3 { self.shellWorkspace.insertPanelValue(.activeFilePath); return nil }
+            if modifiers == [.control], event.keyCode == 41 { self.shellWorkspace.insertPanelValue(.passiveFilePath); return nil }
+            if modifiers == [.control], event.keyCode == 33 { self.shellWorkspace.insertPanelValue(.leftDirectory); return nil }
+            if modifiers == [.control], event.keyCode == 30 { self.shellWorkspace.insertPanelValue(.rightDirectory); return nil }
+            if modifiers == [.control, .shift], event.keyCode == 33 { self.shellWorkspace.insertPanelValue(.activeDirectory); return nil }
+            if modifiers == [.control, .shift], event.keyCode == 30 { self.shellWorkspace.insertPanelValue(.passiveDirectory); return nil }
+            if modifiers == [.control], event.keyCode == 119, self.shellWorkspace.completeHistoryPrefix() { return nil }
+            if modifiers == [.control], event.keyCode == 16 { self.shellWorkspace.clearCommand(focus: false); return nil }
+            if modifiers == [.control], event.keyCode == 5 { self.applyCommandToSelection(); return nil }
+            if modifiers == [.control], [114, 82].contains(event.keyCode) { self.shellWorkspace.copyCommandOrPanelSelection(); return nil }
+            if modifiers == [.shift], [36, 76].contains(event.keyCode), self.shellWorkspace.runSeparateInput() { return nil }
             if modifiers == [.control], event.keyCode == 49 { self.shellWorkspace.completePath(); return nil }
             if modifiers == [.control], event.keyCode == 14 { self.shellWorkspace.previousCommand(backward: true); return nil }
             if modifiers == [.control], event.keyCode == 7 { self.shellWorkspace.previousCommand(backward: false); return nil }
@@ -583,10 +624,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             switch kind {
             case .connections: titles = [4: "F4  Правка", 5: "F5  Экспорт", 6: "F6", 8: "F8  Удалить"]
             case .localNetwork: titles = [4: "F4  Вход", 5: "F5  Подключить", 6: "F6", 8: "F8  Отключить"]
+            case .plugin: titles = [4: "F4  Правка", 5: "F5  Копия", 6: "F6  Перенос", 8: "F8  Удалить"]
             case .processes: titles = [4: "F4", 5: "F5", 6: "F6", 8: "F8  Завершить"]
             }
-            for (number, title) in titles { archiveFunctionButtons[number]?.title = title; archiveFunctionButtons[number]?.isEnabled = kind == .processes ? number == 8 : number != 6 }
-            folderFunctionButton?.isEnabled = kind == .connections
+            for (number, title) in titles { archiveFunctionButtons[number]?.title = title; archiveFunctionButtons[number]?.isEnabled = kind == .plugin || (kind == .processes ? number == 8 : number != 6) }
+            folderFunctionButton?.isEnabled = kind == .connections || kind == .plugin
             folderFunctionButton?.title = "F7  Папка"
         }
         for button in archiveFunctionButtons.values { button.title = L10n.text(button.title) }
@@ -782,8 +824,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func toggleTerminal() { setTerminalVisible(!terminalVisible) }
     func panelKey(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if !active.isResource, !active.isVirtual, !active.isArchive, !active.isRemote,
+           let entry = active.cursorEntry, !entry.isDirectory {
+            if modifiers == [.control], event.keyCode == 121,
+               shellWorkspace.association(for: entry.url, action: .alternateExecute) { return true }
+            if modifiers == [.option], [99, 118].contains(event.keyCode) {
+                shellWorkspace.alternativeAssociation(action: event.keyCode == 99 ? .alternateView : .alternateEdit)
+                return true
+            }
+            if modifiers == [.control, .shift], [99, 118].contains(event.keyCode) {
+                openText(editable: event.keyCode == 118, bypassAssociations: true)
+                return true
+            }
+        }
         if modifiers == [.control], event.keyCode == 121, !active.isArchive, let entry = active.cursorEntry, !entry.isDirectory { openArchive(entry.url, in: active); return true }
         if active.isResource || active.isVirtual || active.isArchive || active.isRemote { return false }
+        if modifiers == [.control], event.keyCode == 0 { openProperties(); return true }
         if modifiers == [.control], event.keyCode == 116, active.isTemporary { locateTemporaryItem(); return true }
         if modifiers == [.control] || modifiers == [.control, .shift] {
             let digitCodes: [UInt16: Int] = [29: 0, 18: 1, 19: 2, 20: 3, 21: 4, 23: 5, 22: 6, 26: 7, 28: 8, 25: 9]
@@ -1082,6 +1138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case "shell": shellWorkspace.interactiveShell()
         case "toggleTerminal": toggleTerminal()
         case "userCommands": shellWorkspace.configureCommands()
+        case "commandLineSettings": shellWorkspace.configureCommandLine()
         case "commandHistory": shellWorkspace.showHistory(.command)
         case "viewHistory": shellWorkspace.showHistory(.view)
         case "editHistory": shellWorkspace.showHistory(.edit)
@@ -1203,14 +1260,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         return selected
     }
-    func openText(editable: Bool) {
+    func openText(editable: Bool, bypassAssociations: Bool = false) {
         guard let entry = requireCursor() else { return }
         if entry.isDirectory {
             if editable { openProperties() }
             else { retainTool(DirectorySizeWindow(url: entry.url)) }
             return
         }
-        if !shellWorkspace.association(for: entry.url, action: editable ? .edit : .view) {
+        if bypassAssociations || !shellWorkspace.association(for: entry.url, action: editable ? .edit : .view) {
             if editable { _ = openDocument(entry.url, editable: true) }
             else {
                 let urls = active.visible.filter { !$0.isDirectory && !$0.isSymbolicLink }.map(\.url)
@@ -1564,6 +1621,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
     func transfer(move: Bool, cursorOnly: Bool = false) {
+        if let plugin = FarLuaPlugins.shared.pluginPanel(on: passive), plugin.putFiles(from: active, move: move, cursorOnly: cursorOnly) { return }
         if active.isResource { _ = active.resourceFunction?(move ? 6 : 5, cursorOnly); return }
         if passive.isResource {
             if passive.resourceKind == .connections, !move {
@@ -1594,22 +1652,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let sources = selected.map(\.url)
         let searchSnapshots = active.capturedSearchResults(for: selected)
         let sourceDirectory = active.directory
-        let sourceDescription = active.isTemporary
-            ? sources.prefix(5).map(\.path).joined(separator: "\n") + (sources.count > 5 ? "\n…" : "")
-            : sourceDirectory.path
-        let relativeBase = active.isTemporary ? "\nОтносительное назначение отсчитывается от: \(sourceDirectory.path)" : ""
-        let target = cursorOnly ? (move ? selected[0].url.path : passive.directory.appendingPathComponent(selected[0].name).path) : passive.directory.path
-        prompt(move ? "Переместить / переименовать" : "Копировать", detail: "Объектов: \(sources.count)\nИз: \(sourceDescription)\nНазначение: существующая папка или полное новое имя для одного объекта.\(relativeBase)\nКонфликты запросят решение в окне операций. Отмена не откатывает завершённые файлы.", value: target, button: "В очередь") { [weak self] value in
-            guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                self?.inform("Назначение не задано", "Укажите путь папки или новое имя файла."); return
+        LocalTransferDialog.present(on: window, sources: selected, sourceDirectory: sourceDirectory,
+                                    passiveDirectory: passive.directory, move: move, cursorOnly: cursorOnly,
+                                    maskGroups: maskGroups) { [weak self] targets, options in
+            guard let self, !self.toolMutationPending, !self.busy else { return false }
+            try searchSnapshots.forEach { try $0.verifyCurrent() }
+            let requests = targets.map { target in
+                var options = options
+                options.forceDirectory = target.forceDirectory
+                return TransferRequest(sources: sources, destination: target.url, move: move,
+                    propagateDescriptions: DescriptionPreferences.enabled,
+                    descriptionEncodings: DescriptionPreferences.encodings(forSources: sources, destination: target.url),
+                    localOptions: options)
             }
-            let path = (value as NSString).expandingTildeInPath
-            let destination = path.hasPrefix("/") ? URL(fileURLWithPath: path) : sourceDirectory.appendingPathComponent(path)
-            guard let self, !self.toolMutationPending, !self.busy else { return }
-            do { try searchSnapshots.forEach { try $0.verifyCurrent() } }
-            catch { self.showError(error); return }
-            self.operationQueue.enqueue(TransferRequest(sources: sources, destination: destination, move: move, propagateDescriptions: DescriptionPreferences.enabled, descriptionEncodings: DescriptionPreferences.encodings(forSources: sources, destination: destination)))
-            self.status.stringValue = "Добавлено в очередь: \(sources.count) объектов"
+            guard self.operationQueue.enqueueBatch(requests) else { return false }
+            self.status.stringValue = "Добавлено в очередь: \(sources.count) объектов, назначений: \(targets.count)"
+            return true
         }
     }
     func trash() {
@@ -1719,6 +1777,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         contextHelp.present(title: title, text: text)
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if terminationPending { return .terminateLater }
         do { try temporaryPanelsWindow?.persistLinkedPanel(); try persistentPanelsWindow?.persistLinkedPanel() }
         catch { showError(error); return .terminateCancel }
         if searchWindow?.isProviderSearching == true {
@@ -1747,12 +1806,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if !controller.confirmClose() { return .terminateCancel }
         }
         for editor in editors where editor.window?.isVisible == true || editor.retainedArchiveWorkspace != nil || editor.retainedRemoteWorkspace != nil {
-            if let window = editor.window, editor.windowShouldClose(window) == false { return .terminateCancel }
+            if !editor.confirmClose() { return .terminateCancel }
         }
         for session in archiveEdits where session.window?.isVisible == true {
             if !session.confirmClose() { return .terminateCancel }
         }
         if !network.confirmTermination() { return .terminateCancel }
+        guard FarLuaPlugins.shared.confirmCloseEditors() else { return .terminateCancel }
+        terminationPending = true; busy = true
+        Task { @MainActor in
+            do {
+                try await FarLuaPlugins.shared.commitEditorsForTermination()
+                await FarLuaWorkspace.shared.shutdown()
+                await FarCmdsWorkspace.shared.shutdown()
+                await finishApprovedTermination()
+            } catch {
+                terminationPending = false; busy = false
+                showError(error)
+                NSApp.reply(toApplicationShouldTerminate: false)
+            }
+        }
+        return .terminateLater
+    }
+    private func finishApprovedTermination() async {
+        FarLuaWorkspace.shared.stop()
         CommandWorkspace.shared.stopPlayback()
         ExtensionWorkspace.shared.cancel()
         network.finalizeTermination()
@@ -1768,11 +1845,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         viewers.forEach { $0.retainedArchiveWorkspace?.cleanup(); $0.retainedArchiveWorkspace = nil }
         left.persistSession(); right.persistSession()
         left.cancelInspection(); right.cancelInspection()
+        await FarLuaPlugins.shared.shutdown()
         left.leaveResource(focus: false); right.leaveResource(focus: false)
         shellWorkspace?.stopForExit()
-        return .terminateNow
+        NSApp.reply(toApplicationShouldTerminate: true)
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool { NSApp.terminate(nil); return false }
+    func windowDidResize(_ notification: Notification) { shellWorkspace?.refreshPrompt() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         window.makeKeyAndOrderFront(nil); return true
     }
@@ -1815,7 +1894,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if notification.name == NSWorkspace.willSleepNotification {
             left.persistSession(); right.persistSession()
             left.cancelInspection(); right.cancelInspection()
-            CommandWorkspace.shared.stopPlayback(); ExtensionWorkspace.shared.cancel()
+            FarLuaWorkspace.shared.stop()
+        FarLuaPlugins.shared.stop()
+        CommandWorkspace.shared.stopPlayback(); ExtensionWorkspace.shared.cancel()
             refreshAfterWake = true
             return
         }
@@ -1835,7 +1916,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             else { panel.invalidateUnavailableVolume(panel.directory) }
         }
     }
-    private func focusMainWindowForSmoke() async throws {
+    func focusMainWindowForSmoke() async throws {
         guard AppRuntime.isSmoke else { throw PanelSessionError("Missing smoke scope") }
         window.makeKeyAndOrderFront(nil); active.focus()
         NSApp.activate(ignoringOtherApps: true)
@@ -1848,6 +1929,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         } while (!NSApp.isActive || !window.isKeyWindow || left.loading || right.loading) && Date() < deadline
         guard NSApp.isActive, window.isKeyWindow, !left.loading, !right.loading else {
             throw PanelSessionError("Smoke main window not ready: app=\(NSApp.isActive), key=\(window.isKeyWindow), leftLoading=\(left.loading), rightLoading=\(right.loading)")
+        }
+    }
+    func focusSmokeWindow(_ target: NSWindow) async throws {
+        guard AppRuntime.isSmoke else { throw PanelSessionError("Missing smoke scope") }
+        target.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        let deadline = Date().addingTimeInterval(5)
+        while NSApp.keyWindow !== target || !NSApp.isActive {
+            guard Date() < deadline else { throw PanelSessionError("AppKit did not activate the smoke document") }
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
     }
 
@@ -2023,6 +2114,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             checks += try MacroShortcutAdapter.runUISmokeChecks()
             AppRuntime.smokeProgress("Starting: ExtensionWorkspace.runUISmokeChecks")
             checks += try ExtensionWorkspace.runUISmokeChecks()
+            checks += try TextFileWindow.runBracketsUISmokeChecks()
+            if let fixture = AppRuntime.smokeDirectory {
+                try LocalTransferDialog.smoke(in: fixture)
+                checks.append("Local F5/F6 dialog captures masks, multiple destinations, filters and conflict policy")
+                checks += try await StockPanelPlugins.runUISmokeChecks(in: fixture)
+            }
+            AppRuntime.smokeProgress("Starting: Lua workspace real UI checks")
+            checks += try TextFileWindow.runLuaEditorUISmoke()
+            checks += try TextFileWindow.runStockEditorPluginUISmoke()
+            checks += try await TextFileWindow.runLuaMoonUISmoke()
+            checks += try await ViewerWindow.runLuaViewerUISmoke()
+            checks += try await runLuaWorkspaceUISmokeChecks()
+            AppRuntime.smokeProgress("Starting: FarLuaDocumentHost.runUISmokeChecks")
+            checks += try await FarLuaDocumentHost.runUISmokeChecks(app: self)
+            checks += try await FarLuaPlugins.runUISmokeChecks()
+            checks += try await FarCmdsWorkspace.runUISmokeChecks()
+            if let fixture = AppRuntime.smokeDirectory { checks += try HlfViewerWorkspace.runUISmokeChecks(in: fixture) }
             AppRuntime.smokeProgress("Starting: ShellWorkspace.runUISmokeChecks")
             checks += try await ShellWorkspace.runUISmokeChecks()
             shellWorkspace.stopForExit()
@@ -2356,7 +2464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         // editors; FileTable's override supplies panel marking semantics.
         edit.addItem(withTitle: "Выделить всё", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         let commands = submenu("Команды")
-        for (title, id) in [("Командная строка — Cmd+Enter", "commandLine"), ("Панели / терминал — Ctrl+O", "toggleTerminal"), ("Интерактивный shell", "shell"), ("Настроить меню и ассоциации…", "userCommands"), ("История команд — Alt+F8", "commandHistory"), ("История просмотра и правки — Alt+F11", "viewHistory"), ("История редактора", "editHistory"), ("История папок — Alt+F12", "folderHistory")] {
+        for (title, id) in [("Командная строка — Cmd+Enter", "commandLine"), ("Панели / терминал — Ctrl+O", "toggleTerminal"), ("Интерактивный shell", "shell"), ("Настроить меню и ассоциации…", "userCommands"), ("Настройки командной строки…", "commandLineSettings"), ("История команд — Alt+F8", "commandHistory"), ("История просмотра и правки — Alt+F11", "viewHistory"), ("История редактора", "editHistory"), ("История папок — Alt+F12", "folderHistory")] {
             let item = NSMenuItem(title: title, action: #selector(command(_:)), keyEquivalent: "")
             item.target = self; item.representedObject = id; commands.addItem(item)
         }
@@ -2401,5 +2509,122 @@ enum FarForMacMain {
         app.setActivationPolicy(.regular)
         app.delegate = delegate
         withExtendedLifetime(delegate) { app.run() }
+    }
+}
+
+// FAR macro host navigation always resolves the requested panel before awaiting IO.
+extension AppDelegate {
+    var luaShell: ShellWorkspace { shellWorkspace }
+    var luaFarHome: URL? { shellWorkspace.farCmdsEnvironment["FARHOME"].flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil } }
+    func applyCommandToSelection() {
+        guard canChangePanelResource, !active.loading, !active.isArchive, !active.isRemote, !active.isResource, !active.isVirtual else { NSSound.beep(); return }
+        let panel = active!, generation = panel.locationGeneration
+        shellWorkspace.applyCommand(onBegin: { panel.saveSelectionForOperation() }, onProcessed: { [weak panel] url in
+            guard let panel, panel.locationGeneration == generation else { return }
+            panel.unmarkAppliedFile(url)
+        })
+    }
+    func luaEditor(_ id: Int?) -> TextFileWindow? {
+        if let id, id != -1 { return editors.first { $0.window?.windowNumber == id } }
+        return NSApp.keyWindow?.windowController as? TextFileWindow
+    }
+    func luaEditor(for url: URL) -> TextFileWindow? {
+        editors.last { $0.workingFileURL?.standardizedFileURL == url.standardizedFileURL && $0.window?.isVisible == true }
+    }
+    func luaViewer(_ id: Int?) -> ViewerWindow? {
+        if let id, id != -1 { return viewers.first { $0.window?.windowNumber == id } }
+        return NSApp.keyWindow?.windowController as? ViewerWindow
+    }
+    func luaShowHelp() { help() }
+    func farCmdsRegister(_ editor: TextFileWindow) {
+        editors.removeAll { $0.window?.isVisible == false && $0.retainedArchiveWorkspace == nil && $0.retainedRemoteWorkspace == nil }
+        editors.append(editor)
+    }
+    func farCmdsRegister(_ viewer: ViewerWindow) {
+        viewers.removeAll { $0.window?.isVisible == false }
+        viewers.append(viewer)
+    }
+    @discardableResult func luaOpenFile(_ url: URL, editable: Bool) -> Bool { openDocument(url, editable: editable) }
+    func luaOpenWorkingCopy(_ url: URL) throws -> TextFileWindow {
+        let editor = try TextFileWindow(url: url)
+        editors.append(editor)
+        return editor
+    }
+    func luaFinishUndoGroups() { editors.forEach { $0.luaFinishUndoGroups() } }
+    func luaActivate(active requested: Bool) { activate(requested ? active : passive) }
+    func luaNavigate(_ path: String, active requested: Bool) async -> Bool {
+        let panel = requested ? active! : passive
+        guard !path.isEmpty else { return false }
+        return await withCheckedContinuation { continuation in
+            panel.navigateHistory(to: path, completion: { continuation.resume(returning: $0) })
+        }
+    }
+    func luaRefresh(active requested: Bool) async -> Bool {
+        let panel = requested ? active! : passive
+        panel.refresh()
+        let deadline = Date().addingTimeInterval(60)
+        while panel.loading {
+            if Task.isCancelled || Date() >= deadline { return false }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return true
+    }
+    private func configureLuaCommands() {
+        shellWorkspace.executePluginCommand = { [weak self] prefix, arguments, directory in
+            guard let self else { return false }
+            FarCmdsWorkspace.shared.clearFailure(); FarLuaWorkspace.shared.clearFailure(); FarLuaPlugins.shared.clearFailure()
+            HlfViewerWorkspace.shared.clearFailure()
+            if FarCmdsWorkspace.shared.executePrefix(prefix, arguments, directory: directory) { return true }
+            if HlfViewerWorkspace.shared.executePrefix(prefix, arguments, directory: directory, farHome: self.luaFarHome, pluginRoots: FarLuaPlugins.shared.pluginRoots) { return true }
+            if FarLuaWorkspace.shared.executePrefix(prefix, arguments) { return true }
+            return FarLuaPlugins.shared.executePrefix(prefix, arguments)
+        }
+        shellWorkspace.pluginCommandBusy = { FarCmdsWorkspace.shared.isWorking || FarLuaWorkspace.shared.isRunning || FarLuaPlugins.shared.isWorking }
+        shellWorkspace.pluginCommandFailure = {
+            FarCmdsWorkspace.shared.lastFailure ?? FarLuaWorkspace.shared.lastFailure ?? FarLuaPlugins.shared.lastFailure ?? HlfViewerWorkspace.shared.lastFailure
+        }
+        shellWorkspace.cancelPluginCommand = { FarCmdsWorkspace.shared.stop(); FarLuaWorkspace.shared.stop(); FarLuaPlugins.shared.stop() }
+        shellWorkspace.promptNetworkPath = { [weak self] in
+            guard let panel = self?.active, panel.isRemote else { return nil }
+            return panel.luaPanelProperties.hostTable["Path"]?.hostString
+        }
+        shellWorkspace.showUserMenuHelp = { [weak self] in self?.help() }
+        shellWorkspace.showUserMenuPlugins = { FarLuaPlugins.shared.showMenu() }
+        shellWorkspace.setCommandTitle = { [weak self] title in self?.window.title = title ?? "FarForMac" }
+        shellWorkspace.exitFromCommand = { _ in NSApp.terminate(nil) }
+        shellWorkspace.navigateInternalDirectory = { [weak self] url, isLeft, close, completion in
+            guard let self else { completion(false); return }
+            let panel = isLeft ? self.left! : self.right!
+            if close { panel.leaveResource(focus: false); panel.leaveRemote(focus: false); panel.leaveArchive(focus: false) }
+            panel.navigateHistory(to: url.path, completion: completion)
+        }
+        shellWorkspace.executeFarCommand = { [weak self] command in
+            guard let self else { return false }
+            switch command {
+            case .config: self.showInterfacePreferences(nil)
+            case .about: NSApp.orderFrontStandardAboutPanel(nil)
+            case .regex: self.luaRegexPlayground()
+            case .error(let code):
+                self.inform("POSIX error \(code)", code <= UInt32(Int32.max) ? String(cString: strerror(Int32(code))) : "Нет соответствующего кода POSIX. Windows NTSTATUS в macOS отсутствует.")
+            case .log: self.inform("far:log", "Настройка журналирования FAR ещё не перенесена. Команда не изменила конфигурацию.")
+            }
+            return true
+        }
+    }
+    private func luaRegexPlayground() {
+        let pattern = NSTextField(string: ""), sample = NSTextField(string: "")
+        let stack = NSStackView(views: [NSTextField(labelWithString: "Регулярное выражение (ICU)"), pattern, NSTextField(labelWithString: "Текст"), sample])
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8
+        stack.frame = NSRect(x: 0, y: 0, width: 480, height: 110)
+        pattern.widthAnchor.constraint(equalToConstant: 480).isActive = true
+        sample.widthAnchor.constraint(equalToConstant: 480).isActive = true
+        let alert = NSAlert(); alert.messageText = "Проверка регулярного выражения"; alert.accessoryView = stack
+        alert.addButton(withTitle: "Проверить"); alert.addButton(withTitle: "Закрыть")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            let regex = try NSRegularExpression(pattern: pattern.stringValue)
+            let matches = regex.matches(in: sample.stringValue, range: NSRange(location: 0, length: sample.stringValue.utf16.count))
+            inform("Совпадений: \(matches.count)", matches.prefix(100).map { (sample.stringValue as NSString).substring(with: $0.range) }.joined(separator: "\n"))
+        } catch { showError(error) }
     }
 }

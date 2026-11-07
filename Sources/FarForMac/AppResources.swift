@@ -35,6 +35,9 @@ extension AppDelegate {
         add("Процессы", id: "processList") { [weak self, weak panel] in
             guard let self, let panel, self.canChangePanelResource else { return }; self.showProcesses(in: panel)
         }
+        for (index, entry) in FarLuaPlugins.shared.diskMenuEntries(for: panel).enumerated() {
+            add(entry.title, id: "luaPlugin:\(index)", action: entry.activate)
+        }
         return menu
     }
     func showResourceMenu(for panel: PanelView, anchor: NSView? = nil) {

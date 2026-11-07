@@ -70,6 +70,73 @@ struct SFTPProviderTests {
         #expect(summary.errors == 0); #expect(found.count == 1); #expect(found.first?.lineNumber == 2)
     }
 
+    @Test func localMoveOverTheSameSFTPFileRequiresANewName() throws {
+        let f = try SFTPFixture(); defer { f.stop() }; try f.trustHost()
+        let provider = f.provider, token = TransferCancellation()
+        defer { provider.closeConnection() }
+        let directory = try f.resolvedDirectory()
+        let source = directory.appendingPathComponent("original.txt")
+        let bytes = Data("keep the only copy".utf8)
+        try bytes.write(to: source)
+        #expect(chmod(source.path, 0o600) == 0)
+        let entry = try #require(try provider.stat(path: source.path, cancellation: token))
+
+        #expect(throws: RemoteTransferError.self) {
+            try RemoteTransferEngine.download(provider: provider, path: source.path, to: source, replace: true, move: true)
+        }
+        let copy = try RemoteDirectoryTransfer.prepareDownload(provider: provider, entries: [entry], into: directory, policy: .mergeSkippingExisting)
+        let replacement = try RemoteDirectoryTransfer.resolve(provider: provider, plan: copy, decisions: [entry.path: .replace])
+        #expect(throws: RemoteDirectoryTransferFailure.self) {
+            try RemoteDirectoryTransfer.move(provider: provider, plan: replacement)
+        }
+        let preview = try RemoteDirectoryTransfer.prepareDownload(provider: provider, entries: [entry], into: directory, policy: .mergeSkippingExisting, move: true)
+        #expect(preview.conflicts.first?.canReplace == false)
+        #expect(try Data(contentsOf: source) == bytes)
+        let rename = try RemoteDirectoryTransfer.resolve(provider: provider, plan: preview, decisions: [entry.path: .rename("retained.txt")])
+        let parentBefore = try #require(try provider.stat(path: directory.path, cancellation: token))
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_600_000_000)], ofItemAtPath: directory.path)
+        #expect(try provider.stat(path: directory.path, cancellation: token)?.modified != parentBefore.modified)
+        let report = try RemoteDirectoryTransfer.move(provider: provider, plan: rename)
+        #expect(report.removedSources == [entry.path])
+        #expect(!FileManager.default.fileExists(atPath: source.path))
+        #expect(try Data(contentsOf: directory.appendingPathComponent("retained.txt")) == bytes)
+
+        let empty = directory.appendingPathComponent("empty")
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: false)
+        let emptyEntry = try #require(try provider.stat(path: empty.path, cancellation: token))
+        let merge = try RemoteDirectoryTransfer.prepareDownload(provider: provider, entries: [emptyEntry], into: directory, policy: .mergeSkippingExisting, move: true)
+        #expect(!merge.hasMoveCandidates)
+        let merged = try RemoteDirectoryTransfer.move(provider: provider, plan: merge)
+        #expect(merged.removedSources.isEmpty && FileManager.default.fileExists(atPath: empty.path))
+    }
+
+    @Test func sftpMoveRejectsAnAncestorSubstitutedByASymlink() throws {
+        let f = try SFTPFixture(); defer { f.stop() }; try f.trustHost()
+        let provider = f.provider, token = TransferCancellation()
+        defer { provider.closeConnection() }
+        let directory = try f.resolvedDirectory()
+        let sourceDirectory = directory.appendingPathComponent("source")
+        try FileManager.default.createDirectory(at: sourceDirectory, withIntermediateDirectories: false)
+        let source = sourceDirectory.appendingPathComponent("selected.txt")
+        let bytes = Data("original".utf8)
+        try bytes.write(to: source)
+        let entry = try #require(try provider.stat(path: source.path, cancellation: token))
+        let plan = try RemoteDirectoryTransfer.prepareDownload(provider: provider, entries: [entry], into: directory, policy: .requireNew, move: true)
+        let relocated = directory.appendingPathComponent("relocated")
+        try FileManager.default.moveItem(at: sourceDirectory, to: relocated)
+        try FileManager.default.createSymbolicLink(at: sourceDirectory, withDestinationURL: relocated)
+        #expect(try provider.stat(path: source.path, cancellation: token) == entry)
+        do {
+            _ = try RemoteDirectoryTransfer.move(provider: provider, plan: plan)
+            Issue.record("Expected the linked source ancestor to reject the move")
+        } catch let failure as RemoteDirectoryTransferFailure {
+            #expect(failure.cause as? RemoteTransferError == .conflict(sourceDirectory.path))
+            #expect(failure.report.completed.isEmpty && failure.report.removedSources.isEmpty)
+        }
+        #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent(entry.name).path))
+        #expect(try Data(contentsOf: relocated.appendingPathComponent(entry.name)) == bytes)
+    }
+
     @Test func realSSHSupportsOpaqueNamesProgressResumeCRUDAndCleanupOnCancellation() throws {
         let f = try SFTPFixture(); defer { f.stop() }; try f.trustHost()
         let p = f.provider; let token = TransferCancellation()
@@ -202,6 +269,13 @@ private final class SFTPFixture {
         guard p.terminationStatus == 0 else { throw SFTPError.transport("ssh-keygen fixture failed") }
     }
     func trustHost() throws { for key in try store.probe(connection: connection, cancellation: TransferCancellation()) { try store.trust(key) } }
+    func resolvedDirectory() throws -> URL {
+        // Foundation may shorten /private/var back to /var. The SFTP server
+        // exposes /var as a symlink; use the actual POSIX path for ancestor checks.
+        let path = try #require(realpath(directory.path, nil))
+        defer { free(path) }
+        return URL(fileURLWithPath: String(cString: path))
+    }
     func stop() {
         if server.isRunning { server.terminate(); server.waitUntilExit() }
         try? log.close(); try? FileManager.default.removeItem(at: directory)

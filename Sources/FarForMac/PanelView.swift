@@ -102,7 +102,12 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     let table = FileTable()
     private let fileScroll = NSScrollView()
     private let archiveContainer = NSView()
-    enum ResourceKind { case localNetwork, connections, processes }
+    private struct LuaItemIdentity: Hashable {
+        let name: String
+        let origin: String?
+    }
+    private var luaSavedSelection: (generation: Int, path: String, identities: Set<LuaItemIdentity>)?
+    enum ResourceKind { case localNetwork, connections, processes, plugin }
     private(set) var resourceKind: ResourceKind?
     private(set) var resourceView: NSView?
     private var resourceFocus: (() -> Void)?
@@ -1025,8 +1030,9 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         )
     }
 
-    private func load(_ url: URL?, preserveSelection: Bool, selectName: String? = nil, historyAction: HistoryAction, recordActivity: Bool = true) {
-        guard !isVirtual, !isResource else { return }
+    private func load(_ url: URL?, preserveSelection: Bool, selectName: String? = nil, historyAction: HistoryAction,
+                      recordActivity: Bool = true, completion: ((Bool) -> Void)? = nil) {
+        guard !isVirtual, !isResource else { completion?(false); return }
         restoreDirectorySnapshot()
         let target = (url ?? directory).standardizedFileURL
         generation += 1
@@ -1037,6 +1043,8 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         let options = sortOptions, groups = sortGroups, masks = maskGroups, marks = selection.markedIDs
         let descriptionEncoding = DescriptionPreferences.encoding(for: target)
         Task {
+            var committed = false
+            defer { completion?(committed) }
             do {
                 let result = try await Task.detached(priority: .userInitiated) {
                     let raw = try FileService.list(target, showHidden: hidden, sortResult: false)
@@ -1073,6 +1081,7 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
                 recordDirectoryActivity = recordActivity
                 onDirectoryChange?(self)
                 recordDirectoryActivity = true
+                committed = true
             } catch {
                 guard token == generation else { return }
                 loading = false
@@ -1134,6 +1143,15 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     }
 
     func saveSelectionForOperation() { if let virtualPanel { virtualPanel.saveSelectionForOperation(); return }; selection.saveMarks(); shiftMarking = nil }
+
+    /// Apply Command clears each dispatched item without replacing the snapshot
+    /// kept for Ctrl+M or clearing marks on items that were never processed.
+    func unmarkAppliedFile(_ url: URL) {
+        guard !isResource, !isArchive, !isRemote, !isVirtual else { return }
+        let path = url.standardizedFileURL.path
+        selection.setMarked(visible.filter { $0.url.standardizedFileURL.path == path }.map(\.id), marked: false)
+        reloadMarks()
+    }
 
     func toggleMarkAndAdvance() {
         if let virtualPanel { virtualPanel.toggleMarkAndAdvance(); return }
@@ -1357,11 +1375,12 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
         guard let path = navigation.forwardPath, !loading else { return }
         load(URL(fileURLWithPath: path), preserveSelection: false, historyAction: .forward)
     }
-    func navigateHistory(to path: String, focus shouldFocus: Bool = true, recordActivity: Bool = true) {
+    func navigateHistory(to path: String, focus shouldFocus: Bool = true, recordActivity: Bool = true,
+                         completion: ((Bool) -> Void)? = nil) {
         leaveResource(focus: false)
         if isVirtual { leaveVirtualResults(focus: false) }
         if isRemote { leaveRemote(focus: false) }; if isArchive { leaveArchive(focus: false) }
-        load(URL(fileURLWithPath: path), preserveSelection: false, historyAction: .visit, recordActivity: recordActivity)
+        load(URL(fileURLWithPath: path), preserveSelection: false, historyAction: .visit, recordActivity: recordActivity, completion: completion)
         if shouldFocus { focus() }
     }
     private func persistNavigation() {
@@ -1701,4 +1720,337 @@ final class PanelView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSea
     private static let dateFormatter: DateFormatter = {
         let value = DateFormatter(); value.dateFormat = "dd.MM.yy HH:mm"; return value
     }()
+}
+
+extension PanelView {
+    private var luaPanelType: Int {
+        switch contentMode {
+        case .files: return 0
+        case .tree: return 1
+        case .quickView: return 2
+        case .info: return 3
+        }
+    }
+
+    var luaPanelProperties: FarLuaValue {
+        let providerProperties = archivePanel?.luaPanelProperties ?? remotePanel?.luaPanelProperties ?? virtualPanel?.luaPanelProperties ?? (resourceView as? FarLuaPluginPanelView)?.luaPanelProperties
+        if let providerProperties {
+            var fields = providerProperties.hostTable
+            fields["Left"] = .bool(locationKey == "left"); fields["Visible"] = .bool(!isHiddenOrHasHiddenAncestor)
+            return .table(fields)
+        }
+        let plugin = isArchive || isRemote || isResource || isVirtual
+        let files = contentMode == .files
+        let index = max(0, table.selectedRow)
+        let marks = files ? markedEntries.count : 0
+        return .table(["Path": .string(pathField.stringValue), "Path0": .string(pathField.stringValue), "UNCPath": .string(pathField.stringValue),
+            "Current": .string(files ? cursorEntry?.name ?? "" : ""), "CurPos": .hostInteger(files ? index + 1 : 0),
+            "ItemCount": .hostInteger(files ? table.numberOfRows : 0), "SelCount": .hostInteger(marks), "Selected": .bool(marks > 0),
+            "Plugin": .bool(plugin), "FilePanel": .bool(files), "Folder": .bool(files && (cursorEntry?.isDirectory ?? (index < offset))),
+            "Empty": .bool(!files || visible.isEmpty), "Bof": .bool(!files || index == 0), "Eof": .bool(!files || index + 1 >= table.numberOfRows),
+            "Root": .bool(directory.path == "/"), "Visible": .bool(!isHiddenOrHasHiddenAncestor),
+            "Left": .bool(locationKey == "left"), "LFN": .bool(true), "Filter": .bool(files && !filterField.stringValue.isEmpty),
+            "Type": .hostInteger(luaPanelType), "Width": .hostInteger(Int(bounds.width / 8)), "Height": .hostInteger(Int(bounds.height / 16)),
+            "ColumnCount": .hostInteger(files ? table.tableColumns.count : 0),
+            "HostFile": .string(archiveFrame?.snapshot.sourceURL.path ?? ""), "Prefix": .string(isRemote ? "netbox" : isArchive ? "arclite" : ""), "Format": .string(plugin ? "Plugin" : "")])
+    }
+    private func luaItem(at row: Int) -> FarLuaValue {
+        if row == 0 && offset == 1 { return .table(["FileName": .string(".."), "FileAttributes": .string("d"), "FileSize": .integer(0)]) }
+        guard let value = entry(at: row) else { return .nilValue }
+        return .table(["FileName": .string(value.name), "FileSize": .integer(Int64(value.size)), "FileAttributes": .string((value.isDirectory ? "d" : "") + (value.isSymbolicLink ? "l" : "")),
+            "Description": .string(descriptions[value.name] ?? ""), "Flags": .integer(selection.markedIDs.contains(value.id) ? 0x40000000 : 0)])
+    }
+    func luaPanelCall(_ name: String, _ args: [FarLuaValue]) throws -> [FarLuaValue] {
+        let indexedItem = name == "panel.GetPanelItem" || name == "panel.GetSelectedPanelItem"
+        if indexedItem {
+            let argument = args.lua(2)
+            if argument != .nilValue {
+                guard let index = argument.hostInt else { throw ExtensionAPIError("\(name): индекс должен быть числом.") }
+                if index <= 0 { return [.nilValue] }
+            }
+        }
+        if let plugin = resourceView as? FarLuaPluginPanelView { return try plugin.panelCall(name, args) }
+        if let archivePanel { return try archivePanel.luaPanelCall(name, args, left: locationKey == "left") }
+        if let remotePanel { return try remotePanel.luaPanelCall(name, args, left: locationKey == "left") }
+        if let virtualPanel { return try virtualPanel.luaPanelCall(name, args, left: locationKey == "left") }
+        guard !loading, !isRemote, !isArchive, !isVirtual, !isResource else { throw ExtensionAPIError("\(name): этот тип панели ещё не подключён к LuaFar API.") }
+        if contentMode != .files {
+            switch name {
+            case "panel.GetPanelInfo":
+                var flags = isHiddenOrHasHiddenAncestor ? 0 : 0x1000
+                if active { flags |= 0x2000 }; if locationKey == "left" { flags |= 0x80 }
+                return [.table(["PanelType": .hostInteger(luaPanelType), "ItemsNumber": .integer(0),
+                    "SelectedItemsNumber": .integer(0), "CurrentItem": .integer(0), "TopPanelItem": .integer(0),
+                    "Flags": .hostInteger(flags)])]
+            case "panel.GetCurrentPanelItem", "panel.GetPanelItem", "panel.GetSelectedPanelItem",
+                 "panel.GetColumnTypes", "panel.GetColumnWidths": return [.nilValue]
+            case "panel.RedrawPanel", "panel.BeginSelection", "panel.EndSelection", "panel.SetSelection", "panel.ClearSelection",
+                 "panel.SetSortMode", "panel.SetSortOrder", "panel.SetDirectoriesFirst", "panel.SetViewMode": return [.bool(false)]
+            default: break
+            }
+        }
+        switch name {
+        case "panel.GetPanelInfo":
+            var flags = 0x20
+            if !isHiddenOrHasHiddenAncestor { flags |= 0x1000 }
+            if active { flags |= 0x2000 }; if locationKey == "left" { flags |= 0x80 }
+            if !ascending { flags |= 4 }; if sortOptions.directoriesFirst { flags |= 0x100 }
+            if sortOptions.sort == .selected && ascending { flags |= 0x10 }
+            let top = table.rows(in: table.visibleRect).location
+            var info: [String: FarLuaValue] = [
+                "PanelType": .integer(0), "ItemsNumber": .hostInteger(table.numberOfRows), "SelectedItemsNumber": .hostInteger(selectedEntries.count),
+                "CurrentItem": .hostInteger(table.selectedRow + 1), "TopPanelItem": .hostInteger(top == NSNotFound ? 1 : top + 1),
+                "ViewMode": .integer(displayMode == .brief ? 1 : displayMode == .full ? 3 : -1), "Flags": .hostInteger(flags)
+            ]
+            if let sort = [FileSort.name:2, .extension:3, .modified:4, .created:5, .accessed:6, .size:7][sortOptions.sort] {
+                info["SortMode"] = .hostInteger(sort)
+            }
+            return [.table(info)]
+        case "panel.GetPanelDirectory": return [.table(["Name": .string(directory.path), "Param": .string(""), "File": .string("")])]
+        case "panel.GetCurrentPanelItem": return [luaItem(at: table.selectedRow)]
+        case "panel.GetPanelItem":
+            let ordinal = args.lua(2).hostInt ?? 1
+            guard ordinal > 0 else { return [.nilValue] }
+            return [luaItem(at: ordinal - 1)]
+        case "panel.GetSelectedPanelItem":
+            let ordinal = args.lua(2).hostInt ?? 1
+            guard ordinal > 0 else { return [.nilValue] }
+            let index = ordinal - 1, values = selectedEntries
+            guard values.indices.contains(index), let row = visible.firstIndex(where: { $0.id == values[index].id }) else { return [.nilValue] }
+            return [luaItem(at: row + offset)]
+        case "panel.RedrawPanel":
+            let values = args.lua(2).hostTable
+            if let row = values["CurrentItem"]?.hostInt, row > 0 { moveCursor(to: row - 1) }
+            if let row = values["TopPanelItem"]?.hostInt, row > 0, row <= table.numberOfRows { table.scrollRowToVisible(row - 1) }
+            table.needsDisplay = true; return [.bool(true)]
+        case "panel.BeginSelection", "panel.EndSelection": reloadMarks(); return [.bool(true)]
+        case "panel.SetSelection", "panel.ClearSelection":
+            let argument = args.lua(2)
+            let indices: [Int]
+            switch argument {
+            case .array(let values): indices = values.compactMap(\.hostInt)
+            case .table: indices = []
+            default:
+                guard let index = argument.hostInt, index > 0 else {
+                    throw ExtensionAPIError("\(name): требуется положительный индекс или таблица индексов.")
+                }
+                indices = [index]
+            }
+            let clearing = name == "panel.ClearSelection"
+            let selected = clearing ? selectedEntries : []
+            let ids = indices.compactMap { number -> String? in
+                guard number > 0 else { return nil }
+                let row = number - 1
+                return clearing ? (selected.indices.contains(row) ? selected[row].id : nil) : entry(at: row)?.id
+            }
+            if !ids.isEmpty {
+                selection.setMarked(ids, marked: !clearing && args.lua(3).hostBool)
+                reloadMarks()
+            }
+            return [.bool(true)]
+        case "panel.SetSortMode":
+            guard let value = [2:FileSort.name, 3:.extension, 4:.modified, 5:.created, 6:.accessed, 7:.size][args.lua(2).hostInt ?? 0] else { return [.bool(false)] }
+            setSort(value); return [.bool(true)]
+        case "panel.SetSortOrder": ascending = !args.lua(2).hostBool; return [.bool(true)]
+        case "panel.SetDirectoriesFirst": var options = sortOptions; options.directoriesFirst = args.lua(2).hostBool; setSortOptions(options); return [.bool(true)]
+        case "panel.SetViewMode":
+            switch args.lua(2).hostInt { case 1: setDisplayMode(.brief); case 3: setDisplayMode(.full); default: return [.bool(false)] }; return [.bool(true)]
+        case "panel.GetPanelFormat", "panel.GetPanelHostFile", "panel.GetPanelPrefix": return [.string("")]
+        case "panel.GetColumnTypes": return [.string("N,S,DM")]
+        case "panel.GetColumnWidths": return [.string(table.tableColumns.map { String(Int($0.width / 8)) }.joined(separator: ","))]
+        default: throw ExtensionAPIError("API пока не перенесён: \(name)")
+        }
+    }
+
+    func runLuaAuxiliaryPanelSmokeChecks() throws -> [String] {
+        let context: [FarLuaValue] = [.nilValue, .integer(1)]
+        for name in ["panel.GetPanelItem", "panel.GetSelectedPanelItem"] {
+            for ordinal in [Int64.min, 0, Int64.max] {
+                guard try luaPanelCall(name, context + [.integer(ordinal)]) == [.nilValue] else {
+                    throw PanelSessionError("Lua local panel accepted an out-of-range item index")
+                }
+            }
+        }
+        let firstFile = FarLuaValue.hostInteger(offset + 1)
+        _ = try luaPanelCall("panel.SetSelection", context + [firstFile, .bool(true)])
+        let marks = markedEntries.map(\.id), cursor = table.selectedRow
+        guard !marks.isEmpty else { throw PanelSessionError("Lua auxiliary panel smoke needs a marked file") }
+        defer { setContentMode(.files) }
+        for (mode, type): (PanelContentMode, Int64) in [(.tree, 1), (.quickView, 2), (.info, 3)] {
+            setContentMode(mode)
+            let info = try luaPanelCall("panel.GetPanelInfo", context).lua(0).hostTable
+            let properties = luaPanelProperties.hostTable
+            let redraw: FarLuaValue = .table(["CurrentItem": .integer(cursor == 0 ? 2 : 1)])
+            guard info["PanelType"] == .integer(type), info["ItemsNumber"] == .integer(0),
+                  properties["Type"] == .integer(type), properties["Selected"] == .bool(false),
+                  try luaPanelCall("panel.GetCurrentPanelItem", context) == [.nilValue],
+                  try luaPanelCall("panel.RedrawPanel", context + [redraw]) == [.bool(false)],
+                  try luaPanelCall("panel.ClearSelection", context + [.integer(1)]) == [.bool(false)],
+                  try luaPanelCall("panel.SetSelection", context + [firstFile, .bool(false)]) == [.bool(false)],
+                  try luaMacroPanelCall("Panel.Select", [.integer(0), .integer(0)]) == [.integer(-1)],
+                  try luaMacroPanelCall("Panel.SetPosIdx", [.integer(0), .integer(1)]) == [.integer(0)] else {
+                throw PanelSessionError("Lua auxiliary panel must return the real type and decline hidden file operations")
+            }
+        }
+        setContentMode(.files)
+        guard table.selectedRow == cursor, markedEntries.map(\.id) == marks else {
+            throw PanelSessionError("Lua auxiliary panel operations must preserve hidden file cursor and marks")
+        }
+        return ["Lua distinguishes Tree, QView and Info and preserves the hidden file cursor and marks"]
+    }
+}
+
+extension PanelView {
+    private func luaApplyMarkChanges(_ changes: [FarLuaPanelMarkChange]) throws {
+        guard !changes.isEmpty else { return }
+        if let archivePanel { archivePanel.luaApplyMarkChanges(changes); return }
+        if let remotePanel { remotePanel.luaApplyMarkChanges(changes); return }
+        if let virtualPanel { virtualPanel.luaApplyMarkChanges(changes); return }
+        if let plugin = resourceView as? FarLuaPluginPanelView {
+            // Lua plugin row order is owned by GetFindData. Mutating marks
+            // alone leaves this snapshot intact until the next explicit reload.
+            for state in [false, true] {
+                let indices = changes.filter { $0.marked == state }.map { FarLuaValue.hostInteger($0.row + 1) }
+                if !indices.isEmpty {
+                    _ = try plugin.panelCall("panel.SetSelection", [.nilValue, .integer(1), .array(indices), .bool(state)])
+                }
+            }
+            return
+        }
+        for (row, marked) in changes {
+            if let item = entry(at: row) { selection.setMarked([item.id], marked: marked) }
+        }
+        reloadMarks()
+    }
+
+    func luaMacroPanelCall(_ name: String, _ args: [FarLuaValue]) throws -> [FarLuaValue] {
+        if contentMode != .files {
+            switch name {
+            case "Panel.Select", "Panel.FAttr": return [.integer(-1)]
+            case "Panel.FExist", "Panel.SetPos", "Panel.SetPosIdx": return [.integer(0)]
+            case "Panel.Item": throw ExtensionAPIError("Panel.Item: этот тип панели ещё не поддерживается.")
+            default: break
+            }
+        }
+        let context: [FarLuaValue] = [.nilValue, .integer(1)]
+        let info = try luaPanelCall("panel.GetPanelInfo", context).lua(0).hostTable
+        let count = max(0, info["ItemsNumber"]?.hostInt ?? 0)
+        let current = info["CurrentItem"]?.hostInt ?? 0
+        func item(_ index: Int) throws -> [String: FarLuaValue] {
+            try luaPanelCall("panel.GetPanelItem", context + [.hostInteger(index + 1)]).lua(0).hostTable
+        }
+        func selected(_ item: [String: FarLuaValue]) -> Bool { (item["Flags"]?.hostInt ?? 0) & 0x40000000 != 0 }
+        func attributes(_ item: [String: FarLuaValue]) -> Int {
+            if let bits = item["FileAttributes"]?.hostInt { return bits }
+            let text = item["FileAttributes"]?.hostString ?? ""
+            return (text.contains("d") ? 16 : 32) | (text.contains("l") ? 1024 : 0) | (text.contains("h") ? 2 : 0)
+                | (text.contains("r") ? 1 : 0) | (text.contains("e") ? 0x4000 : 0)
+        }
+        func setPosition(_ index: Int) throws {
+            _ = try luaPanelCall("panel.RedrawPanel", context + [.table(["CurrentItem": .hostInteger(index + 1)])])
+        }
+
+        if name == "Panel.Item" {
+            guard let number = args.lua(1).hostInt, (1...max(1, count)).contains(number), number <= count else {
+                throw ExtensionAPIError("Panel.Item: строка не найдена")
+            }
+            let row = try item(number - 1)
+            switch args.lua(2).hostInt ?? 0 {
+            case 0: return [row["FileName"] ?? .string("")]
+            case 1: return [row["AlternateFileName"] ?? .string("")]
+            case 2: return [.hostInteger(attributes(row))]
+            case 6: return [row["FileSize"] ?? .integer(0)]
+            case 8: return [.bool(selected(row))]
+            case 11: return [row["Description"] ?? .string("")]
+            case 12: return [row["Owner"] ?? .string("")]
+            default: throw ExtensionAPIError("Panel.Item: поле \(args.lua(2).hostInt ?? -1) ещё не перенесено")
+            }
+        }
+
+        if name == "Panel.SetPosIdx", !args.lua(2).hostBool || args.lua(2).hostInt == 0 {
+            let requested = args.lua(1).hostInt ?? 0
+            if requested == 0 { return [.hostInteger(current)] }
+            let index = requested < 0 ? count + requested : requested - 1
+            guard (0..<count).contains(index) else { return [.integer(0)] }
+            try setPosition(index)
+            return [.hostInteger(index + 1)]
+        }
+
+        guard count <= 100_000 else { throw ExtensionAPIError("\(name): превышен предел сканирования панели.") }
+        let items = try (0..<count).map(item)
+        switch name {
+        case "Panel.FExist", "Panel.FAttr", "Panel.SetPos":
+            let pattern = args.lua(1).hostString ?? ""
+            let isMask = name != "Panel.SetPos" && (pattern.contains("*") || pattern.contains("?"))
+            let mask = isMask ? try FileMask(pattern) : nil
+            let names = items.map { $0["FileName"]?.hostString ?? "" }
+            let matches = try mask?.matchingNames(names)
+            guard !pattern.isEmpty, let index = names.firstIndex(where: {
+                $0.caseInsensitiveCompare(pattern) == .orderedSame || matches?.contains($0) == true
+            }) else { return [.integer(name == "Panel.FAttr" ? -1 : 0)] }
+            if name == "Panel.SetPos" { try setPosition(index) }
+            return [.hostInteger(name == "Panel.FAttr" ? attributes(items[index]) : index + 1)]
+        case "Panel.SetPosIdx":
+            let requested = args.lua(1).hostInt ?? 0
+            let candidates = items.indices.filter { selected(items[$0]) }
+            if requested == 0 {
+                guard current > 0 else { return [.integer(0)] }
+                return [.hostInteger(candidates.firstIndex(of: current - 1).map { $0 + 1 } ?? 0)]
+            }
+            let index = requested < 0 ? candidates.count + requested : requested - 1
+            guard candidates.indices.contains(index) else { return [.integer(0)] }
+            try setPosition(candidates[index])
+            return [.hostInteger(requested < 0 ? candidates.count - index : index + 1)]
+        case "Panel.Select":
+            let action = args.lua(1).hostInt ?? 0, mode = args.lua(2).hostInt ?? 0
+            guard !items.isEmpty, (0...3).contains(action), (0...3).contains(mode) else { return [.integer(-1)] }
+            let rows = items.indices.filter { items[$0]["FileName"]?.hostString != nil && items[$0]["FileName"]?.hostString != ".." }
+            func identity(_ index: Int) -> LuaItemIdentity {
+                let value = items[index]
+                let id = virtualPanel?.visible[index].id ?? value["CustomColumnData"]?.hostArray.lua(0).hostString
+                return LuaItemIdentity(name: value["FileName"]?.hostString ?? "", origin: id)
+            }
+            let location = pathField.stringValue
+            if action == 3 {
+                guard let saved = luaSavedSelection, saved.generation == generation, saved.path == location else { return [.integer(0)] }
+                let changes = rows.map { (row: $0, marked: saved.identities.contains(identity($0))) }
+                try luaApplyMarkChanges(changes.filter { selected(items[$0.row]) != $0.marked })
+                return [.hostInteger(changes.filter(\.marked).count)]
+            }
+            let target: [Int]
+            switch mode {
+            case 1:
+                let index = args.lua(3).hostInt ?? 0
+                let number = index == 0 ? current : index
+                guard number > 0, items.indices.contains(number - 1) else { return [.integer(-1)] }
+                target = rows.contains(number - 1) ? [number - 1] : []
+            case 2:
+                let names = Set((args.lua(3).hostString ?? "").split(whereSeparator: { $0 == "\n" || $0 == "\r" }).map {
+                    let name = $0.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+                    return (virtualPanel == nil ? (name as NSString).lastPathComponent : name).lowercased()
+                })
+                target = rows.filter { index in
+                    let value = items[index]
+                    let name = value["FileName"]?.hostString ?? ""
+                    let origin = value["CustomColumnData"]?.hostArray.lua(0).hostString
+                    return names.contains(name.lowercased()) || origin.map { names.contains($0.lowercased()) } == true
+                }
+            case 3:
+                let pattern = (args.lua(3).hostString ?? "").replacingOccurrences(of: "\r\n", with: ";")
+                    .replacingOccurrences(of: "\r", with: ";").replacingOccurrences(of: "\n", with: ";")
+                let mask = try FileMask(pattern)
+                let names = try mask.matchingNames(rows.compactMap { items[$0]["FileName"]?.hostString })
+                target = rows.filter { items[$0]["FileName"]?.hostString.map(names.contains) == true }
+            default: target = rows
+            }
+            let prior = rows.filter { selected(items[$0]) }
+            luaSavedSelection = (generation, location, Set(prior.map(identity)))
+            let changes = target.map { (row: $0, marked: action == 2 ? !selected(items[$0]) : action == 1) }
+            try luaApplyMarkChanges(changes.filter { selected(items[$0.row]) != $0.marked })
+            if mode == 0 { return [.hostInteger(action == 0 ? prior.count : changes.filter(\.marked).count)] }
+            if mode == 1 { return [.integer(1)] }
+            return [.hostInteger(target.count)]
+        default: throw ExtensionAPIError("Неизвестный Panel API: \(name)")
+        }
+    }
 }

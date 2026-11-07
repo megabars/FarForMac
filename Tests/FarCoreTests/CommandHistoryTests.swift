@@ -5,6 +5,19 @@ import Testing
 
 @Suite
 struct CommandHistoryTests {
+    @Test func parameterHistoryIsSeparateAndRoundTripsOldAndNewFiles() throws {
+        var history = try JSONDecoder().decode(CommandHistory.self, from: Data(#"{"capacity":20,"entries":[]}"#.utf8))
+        history.parameterHistory.record("first", for: "Search")
+        history.parameterHistory.record("second", for: "search")
+        history.parameterHistory.record("first", for: "SEARCH")
+        history.parameterHistory.record("", for: "Search")
+        history.parameterHistory.record("third", for: "Other")
+        let loaded = try JSONDecoder().decode(CommandHistory.self, from: JSONEncoder().encode(history))
+        #expect(loaded.entries.isEmpty)
+        #expect(loaded.parameterHistory.values(for: "search") == ["first", "second"])
+        #expect(loaded.parameterHistory.values(for: "Other") == ["third"])
+    }
+
     @Test
     func historyBoundsDeduplicatesFiltersAndRemoves() throws {
         var history = CommandHistory(capacity: 3)

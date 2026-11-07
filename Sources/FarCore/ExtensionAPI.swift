@@ -181,14 +181,23 @@ public struct ExtensionHost: Sendable {
 /// A new process group is created atomically with spawn, avoiding a race between
 /// exec and setpgid. This is lifecycle ownership, not a security boundary: a
 /// deliberately detached descendant can leave the group using setsid/setpgid.
-private final class ExtensionProcess {
+final class ExtensionProcess {
     private let pid: pid_t
     private var finished = false
     private(set) var status: Int32 = 0
-    init(descriptor: ExtensionDescriptor, directory: URL, input: Int32, output: Int32, errors: Int32) throws {
-        guard descriptor.executableURL.isFileURL, descriptor.executableURL.path.hasPrefix("/"),
-              !descriptor.executableURL.path.utf8.contains(0), descriptor.arguments.count <= 100,
-              descriptor.arguments.allSatisfy({ !$0.utf8.contains(0) && $0.utf8.count <= 65_536 }) else {
+    convenience init(descriptor: ExtensionDescriptor, directory: URL, input: Int32, output: Int32, errors: Int32) throws {
+        try self.init(executable: descriptor.executableURL, arguments: descriptor.arguments,
+                      environment: ["PATH=/usr/bin:/bin", "LANG=en_US.UTF-8", "PYTHONDONTWRITEBYTECODE=1"],
+                      directory: directory, input: input, output: output, errors: errors)
+    }
+
+    init(executable: URL, arguments: [String], environment environmentStrings: [String],
+         directory: URL, input: Int32, output: Int32, errors: Int32) throws {
+        guard executable.isFileURL, executable.path.hasPrefix("/"),
+              !executable.path.utf8.contains(0), arguments.count <= 100,
+              arguments.allSatisfy({ !$0.utf8.contains(0) && $0.utf8.count <= 65_536 }),
+              environmentStrings.count <= 16_384,
+              environmentStrings.allSatisfy({ !$0.utf8.contains(0) && $0.utf8.count <= 131_072 }) else {
             throw ExtensionAPIError("Invalid extension executable or arguments.")
         }
         var actions: posix_spawn_file_actions_t?
@@ -210,16 +219,15 @@ private final class ExtensionProcess {
         var defaults = sigset_t(); sigemptyset(&defaults); sigaddset(&defaults, SIGPIPE)
         try checked(posix_spawnattr_setsigdefault(&attributes, &defaults))
         try checked(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF)))
-        let strings = [descriptor.executableURL.path] + descriptor.arguments
+        let strings = [executable.path] + arguments
         var argv = strings.map { strdup($0) } + [nil]
-        let environmentStrings: [String] = ["PATH=/usr/bin:/bin", "LANG=en_US.UTF-8", "PYTHONDONTWRITEBYTECODE=1"]
         var environment: [UnsafeMutablePointer<CChar>?] = environmentStrings.map { strdup($0) } + [nil]
         defer { for pointer in argv + environment { free(pointer) } }
         guard argv.dropLast().allSatisfy({ $0 != nil }), environment.dropLast().allSatisfy({ $0 != nil }) else {
             throw ExtensionAPIError("Could not allocate extension arguments.")
         }
         var child: pid_t = 0
-        try descriptor.executableURL.path.withCString { path in
+        try executable.path.withCString { path in
             try checked(posix_spawn(&child, path, &actions, &attributes, &argv, &environment))
         }
         pid = child

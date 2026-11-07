@@ -24,15 +24,182 @@ final class TransferEngineTests {
     }
     func text(_ url: URL) throws -> String { try String(contentsOf: url, encoding: .utf8) }
     func run(_ sources: [URL], _ target: URL, move: Bool = false,
+             options: LocalTransferOptions? = nil,
              cancellation: TransferCancellation = TransferCancellation(),
              progress: @escaping (TransferProgress) -> Void = { _ in },
              conflict: @escaping (TransferConflict) -> TransferDecision = { _ in .skip },
              error: @escaping (TransferFailure) -> TransferErrorDecision = { _ in .skip }) -> TransferResult {
-        TransferEngine.run(TransferRequest(sources: sources, destination: target, move: move), cancellation: cancellation,
+        TransferEngine.run(TransferRequest(sources: sources, destination: target, move: move, localOptions: options), cancellation: cancellation,
                            onProgress: progress, onConflict: conflict, onError: error)
     }
     func staging(_ directory: URL) throws -> [String] {
         try fm.contentsOfDirectory(atPath: directory.path).filter { $0.hasPrefix(".farmac-transfer-") }
+    }
+
+    @Test func farDestinationListsPreserveQuotedDelimitersAndDirectoryIntent() throws {
+        let targets = try LocalTransferDestination.parse(#" "quoted,a/" ; dir/*.bak , other/ "#, relativeTo: root, multiple: true)
+        #expect(targets.map { $0.url.path } == [root.appendingPathComponent("quoted,a").path,
+                root.appendingPathComponent("dir/*.bak").path, root.appendingPathComponent("other").path])
+        #expect(targets.map(\.forceDirectory) == [true, false, true])
+        #expect(try LocalTransferDestination.parse("a;b", relativeTo: root, multiple: false).count == 1)
+        for invalid in ["a;\"unclosed", "a; ", "a;./a", "*/name", "*.bak/"] {
+            #expect(throws: (any Error).self) { try LocalTransferDestination.parse(invalid, relativeTo: root, multiple: true) }
+        }
+    }
+
+    @Test func destinationListRejectsDirectoryAliasesAndPathsBelowAliasedParents() throws {
+        let destination = try directory("Destination")
+        let alias = root.appendingPathComponent("alias")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: destination)
+        for duplicate in ["Destination/;alias/", "Destination/new/item;alias/new/item"] {
+            #expect(throws: (any Error).self) { try LocalTransferDestination.parse(duplicate, relativeTo: root, multiple: true) }
+        }
+        if try root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames == false {
+            #expect(throws: (any Error).self) {
+                try LocalTransferDestination.parse("alias/New/item;Destination/new/Item", relativeTo: root, multiple: true)
+            }
+        }
+        let distinct = try LocalTransferDestination.parse("alias/one;Destination/two", relativeTo: root, multiple: true)
+        #expect(distinct.map(\.url.path) == [alias.appendingPathComponent("one").path, destination.appendingPathComponent("two").path])
+    }
+
+    @Test func destinationSyntaxPreservesLiteralFilenameWhitespace() throws {
+        let single = try LocalTransferDestination.parse(" report ", relativeTo: root, multiple: false)
+        let quoted = try LocalTransferDestination.parse("\" report \"", relativeTo: root, multiple: false)
+        let list = try LocalTransferDestination.parse(" \" report \" ; \"./~ report \" ", relativeTo: root, multiple: true)
+        #expect(single.first?.url.path == root.appendingPathComponent(" report ").path)
+        #expect(quoted == single)
+        #expect(list.map(\.url.path) == [root.appendingPathComponent(" report ").path, root.appendingPathComponent("~ report ").path])
+    }
+
+    @Test func destinationListRejectsOverlappingEffectiveNamesBeforeQueuing() throws {
+        let source = try file("report.txt")
+        _ = try directory("out/nested")
+        for input in ["out/;out/report.txt", "out/*.txt;out/report.txt", "missing/;missing/report.txt"] {
+            let destinations = try LocalTransferDestination.parse(input, relativeTo: root, multiple: true)
+            #expect(throws: (any Error).self) {
+                try LocalTransferDestination.validateDistinctTargets(destinations, sources: [source])
+            }
+        }
+        let distinct = try LocalTransferDestination.parse("out/;out/nested/;out/report.bak", relativeTo: root, multiple: true)
+        try LocalTransferDestination.validateDistinctTargets(distinct, sources: [source])
+    }
+
+    @Test func farMasksApplyPerSourceAndCreateParentsDuringCopyAndMove() throws {
+        let first = try file("report.part.txt", "one")
+        let second = try file("other.txt", "two")
+        let destination = root.appendingPathComponent("new/sub/*.bak")
+        let copied = run([first, second], destination, options: LocalTransferOptions())
+        #expect(copied.completed == 2 && copied.failed == 0)
+        #expect(try text(root.appendingPathComponent("new/sub/report.part.bak")) == "one")
+        #expect(try text(root.appendingPathComponent("new/sub/other.bak")) == "two")
+        let moved = run([first], root.appendingPathComponent("*.old"), move: true, options: LocalTransferOptions())
+        #expect(moved.completed == 1 && !fm.fileExists(atPath: first.path))
+        #expect(try text(root.appendingPathComponent("report.part.old")) == "one")
+    }
+
+    @Test func newFolderDestinationPreservesDirectoryRuleAndRejectsSelfDescendants() throws {
+        let source = try directory("source")
+        _ = try file("source/item", "payload")
+        let invalid = run([source], source.appendingPathComponent("missing/sub"), options: LocalTransferOptions(forceDirectory: true))
+        #expect(invalid.completed == 0 && invalid.failed == 1)
+        #expect(!fm.fileExists(atPath: source.appendingPathComponent("missing").path))
+        let direct = root.appendingPathComponent("direct")
+        #expect(run([source], direct, options: LocalTransferOptions()).completed == 1)
+        #expect(try text(direct.appendingPathComponent("item")) == "payload")
+        let explicit = root.appendingPathComponent("explicit/sub")
+        #expect(run([source], explicit, options: LocalTransferOptions(forceDirectory: true)).completed == 1)
+        #expect(try text(explicit.appendingPathComponent("source/item")) == "payload")
+    }
+
+    @Test func filterUsesPrioritySizesAndDatesAndLeavesExcludedMoveSources() throws {
+        let source = try directory("source")
+        _ = try directory("source/empty")
+        _ = try file("source/empty/tiny.txt", "a")
+        let kept = try file("source/good.txt", "abcd")
+        let secret = try file("source/private.txt", "secret")
+        let included = try file("source/required.bin", "raw")
+        let stale = try file("source/stale.txt", "stale")
+        let date = Date(timeIntervalSince1970: 1_600_000_000)
+        try fm.setAttributes([.modificationDate: date.addingTimeInterval(-1)], ofItemAtPath: stale.path)
+        let options = LocalTransferOptions(filterRules: [
+            LocalTransferFilterRule(action: .include, mask: "*.txt", minBytes: 2, earliest: date),
+            LocalTransferFilterRule(action: .priorityExclude, mask: "private.*"),
+            LocalTransferFilterRule(action: .priorityInclude, mask: "required.bin")
+        ])
+        let destination = root.appendingPathComponent("out")
+        let result = run([source], destination, move: true, options: options)
+        #expect(result.completed == 2 && result.failed == 0 && result.issues.isEmpty)
+        #expect(!fm.fileExists(atPath: kept.path) && !fm.fileExists(atPath: included.path))
+        #expect(try text(secret) == "secret")
+        #expect(try text(stale) == "stale")
+        #expect(try text(destination.appendingPathComponent("good.txt")) == "abcd")
+        #expect(try text(destination.appendingPathComponent("required.bin")) == "raw")
+        #expect(!fm.fileExists(atPath: destination.appendingPathComponent("empty").path))
+        let noMatches = root.appendingPathComponent("no-matches/unused")
+        let empty = run([source], noMatches, options: LocalTransferOptions(forceDirectory: true, filterRules: [
+            LocalTransferFilterRule(mask: "no-match.txt")
+        ]))
+        #expect(empty.completed == 0 && empty.failed == 0)
+        #expect(!fm.fileExists(atPath: root.appendingPathComponent("no-matches").path))
+        #expect(try LocalTransferFilterRule.parseSize("1K") == 1024)
+        #expect(try LocalTransferFilterRule.parseSize("1k") == 1000)
+        #expect(throws: (any Error).self) { try LocalTransferFilterRule.parseSize("999E") }
+    }
+
+    @Test func folderOnlyIncludeDoesNotTransferUnmatchedFiles() throws {
+        let source = try directory("source")
+        let retained = try file("source/report.txt", "keep")
+        let destination = root.appendingPathComponent("out")
+        let rules = [LocalTransferFilterRule(scope: .directories, mask: "source")]
+        let result = run([source], destination, move: true, options: LocalTransferOptions(filterRules: rules))
+        #expect(result.completed == 0 && result.failed == 0)
+        #expect(try text(retained) == "keep")
+        #expect(!fm.fileExists(atPath: destination.path))
+    }
+
+    @Test func newerAndRenamePoliciesHandleWriteTimeAndOccupiedSuffixes() throws {
+        let input = try directory("input"), output = try directory("output")
+        let source = try file("input/report.txt", "updated")
+        let target = try file("output/report.txt", "old")
+        let occupied = try file("output/report (2).txt", "existing")
+        let date = Date(timeIntervalSince1970: 1_500_000_000)
+        try fm.setAttributes([.modificationDate: date], ofItemAtPath: target.path)
+        try fm.setAttributes([.modificationDate: date], ofItemAtPath: source.path)
+        let options = LocalTransferOptions(conflictPolicy: .newer)
+        #expect(run([source], output, options: options).skipped == 1)
+        try fm.setAttributes([.modificationDate: date.addingTimeInterval(1)], ofItemAtPath: source.path)
+        #expect(run([source], output, options: options).completed == 1)
+        #expect(try text(target) == "updated")
+        #expect(run([source], output, options: LocalTransferOptions(conflictPolicy: .rename)).completed == 1)
+        #expect(try text(occupied) == "existing")
+        #expect(try text(output.appendingPathComponent("report (3).txt")) == "updated")
+        #expect(fm.fileExists(atPath: input.path))
+    }
+
+    @Test func appendConfirmsReadOnlyAndPreservesOriginalOnCancellation() throws {
+        let source = try file("from", "new")
+        let destination = try file("to", "old")
+        try fm.setAttributes([.posixPermissions: 0o444], ofItemAtPath: destination.path)
+        let options = LocalTransferOptions(conflictPolicy: .append, confirmReadOnly: true)
+        var prompts: [TransferConflict] = []
+        let skipped = run([source], destination, options: options, conflict: { prompts.append($0); return .skip })
+        #expect(skipped.skipped == 1)
+        #expect(prompts.count == 1 && prompts.first?.isReadOnlyConfirmation == true && prompts.first?.canAppend == true)
+        #expect(try text(destination) == "old")
+        let token = TransferCancellation()
+        let cancelled = run([source], destination, move: true, options: options, cancellation: token, progress: { update in
+            if update.phase == "Копирование" && update.fileBytes == 3 { token.cancel() }
+        }, conflict: { _ in .replace })
+        #expect(cancelled.cancelled)
+        #expect(try text(destination) == "old")
+        #expect(try text(source) == "new")
+        #expect(try staging(root).isEmpty)
+        let complete = run([source], destination, move: true, options: options, conflict: { _ in .replace })
+        #expect(complete.completed == 1 && complete.failed == 0)
+        #expect(try text(destination) == "oldnew")
+        #expect(!fm.fileExists(atPath: source.path))
+        #expect(try FileTools.metadata(destination).permissions == 0o444)
     }
 
     @Test func newNameAndMetadataArePreserved() throws {
@@ -563,6 +730,41 @@ extension TransferEngineTests {
         let result = run([source], target)
         #expect(result.failed == 0 && result.issues.isEmpty)
         #expect(try Data(contentsOf: target.appendingPathComponent("source/descript.ion")) == raw)
+    }
+
+    @Test(arguments: [true, false])
+    func filteredFreshMovePartitionsDescriptionRecords(controlMatchesFilter: Bool) throws {
+        let source = try directory("source"), target = root.appendingPathComponent("new")
+        let moved = try file("source/moved.txt", "move data")
+        let kept = try file("source/kept.bin", "keep data")
+        let control = try file("source/descript.ion", "kept.bin\t keep description  \r\nmoved.txt move description\n")
+        let rules = [LocalTransferFilterRule(mask: controlMatchesFilter ? "*.txt,descript.ion" : "*.txt")]
+        let result = run([source], target, move: true, options: LocalTransferOptions(filterRules: rules))
+        #expect(result.failed == 0 && result.issues.isEmpty)
+        #expect(!fm.fileExists(atPath: moved.path))
+        #expect(try text(kept) == "keep data")
+        #expect(try text(control) == "kept.bin\t keep description  \r\n")
+        #expect(try text(target.appendingPathComponent("moved.txt")) == "move data")
+        #expect(try FileDescriptions.load(directory: target).descriptions == ["moved.txt": "move description"])
+    }
+
+    @Test func filteredFreshMovePreservesSourceWhenPublishedDescriptionChanges() throws {
+        let source = try directory("source"), target = root.appendingPathComponent("new")
+        let moved = try file("source/moved.txt")
+        _ = try file("source/kept.bin")
+        let control = try file("source/descript.ion", "moved.txt source description\n")
+        let published = target.appendingPathComponent("descript.ion")
+        var replaced = false
+        let result = run([source], target, move: true, options: LocalTransferOptions(filterRules: [LocalTransferFilterRule(mask: "*.txt")]), progress: { event in
+            if event.phase == "Удаление источника", !replaced {
+                replaced = true
+                try! Data("moved.txt concurrent description\n".utf8).write(to: published)
+            }
+        })
+        #expect(replaced && result.failed > 0)
+        #expect(fm.fileExists(atPath: moved.path))
+        #expect(try text(control) == "moved.txt source description\n")
+        #expect(try text(published) == "moved.txt concurrent description\n")
     }
 }
 

@@ -50,7 +50,10 @@ import FarCore
         guard let index = entries.firstIndex(where: { $0.path == path }) else { return }
         select(index + 1)
     }
-    private func reload() { table.reloadData(); summary.stringValue = "Объектов: \(entries.count) · Отмечено: \(marks.count) · F5 копировать · F6 перенести · F8 удалить" }
+    private func reload() { table.reloadData(); updateSummary() }
+    private func updateSummary() {
+        summary.stringValue = "Объектов: \(entries.count) · Отмечено: \(marks.count) · F5 копировать · F6 перенести · F8 удалить"
+    }
     private func select(_ row: Int) { let value = max(0, min(row, entries.count)); table.selectRowIndexes(IndexSet(integer: value), byExtendingSelection: false); table.scrollRowToVisible(value) }
     @objc private func openSelection() {
         guard table.selectedRow > 0 else { parent(); return }
@@ -92,5 +95,41 @@ import FarCore
         default: label.stringValue = entry.modified.map { DateFormatter.localizedString(from: $0, dateStyle: .short, timeStyle: .short) } ?? "—"
         }
         return label
+    }
+}
+
+extension RemotePanelView {
+    var luaPanelProperties: FarLuaValue { luaPanel.properties }
+
+    func luaPanelCall(_ name: String, _ arguments: [FarLuaValue], left: Bool = false) throws -> [FarLuaValue] {
+        try luaPanel.call(name, arguments, left: left)
+    }
+
+    func luaApplyMarkChanges(_ changes: [FarLuaPanelMarkChange]) {
+        var affected = IndexSet()
+        for (row, marked) in changes where row > 0 && entries.indices.contains(row - 1) {
+            let path = entries[row - 1].path
+            let changed = marked ? marks.insert(path).inserted : marks.remove(path) != nil
+            if changed { affected.insert(row) }
+        }
+        guard !affected.isEmpty else { return }
+        table.reloadData(forRowIndexes: affected, columnIndexes: IndexSet(integersIn: 0..<table.numberOfColumns))
+        updateSummary(); onChange?()
+    }
+
+    private var luaPanel: FarLuaBuiltinPanel {
+        FarLuaBuiltinPanel(table: table, active: active, path: currentPath, fullPath: caption, root: currentPath == "/",
+            format: provider.connection.kind.rawValue, hostFile: nil, prefix: nil, sortMode: 2,
+            directoriesFirst: true, ascending: true, selectedFirst: false, filtered: false, parentRow: true,
+            markedRows: { [self] in entries.indices.filter { marks.contains(entries[$0].path) }.map { $0 + 1 } },
+            item: { [self] row in
+                if row == 0 { return .init(name: "..", directory: true) }
+                guard row > 0, entries.indices.contains(row - 1) else { return nil }
+                let entry = entries[row - 1]
+                return .init(name: entry.name, directory: entry.isDirectory, size: entry.size,
+                             symbolicLink: entry.isSymbolicLink, marked: marks.contains(entry.path))
+            },
+            move: select,
+            mark: luaApplyMarkChanges)
     }
 }

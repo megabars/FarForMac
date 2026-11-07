@@ -148,8 +148,11 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     private let message = NSTextField(wrappingLabelWithString: "")
     private let cancelButton = NSButton(title: "Отменить · Esc", target: nil, action: nil)
 
-    convenience init(url: URL, initialByteOffset: Int64? = nil, initialEncoding: ViewerEncoding = .automatic, initialDisplayMode: ViewerDisplayMode? = nil, navigation: ViewerNavigation? = nil, onEdit: @escaping (URL, Int64, ViewerEncoding) -> Bool) throws {
-        self.init(source: nil, url: url, initialByteOffset: initialByteOffset, initialEncoding: initialEncoding, initialDisplayMode: initialDisplayMode, navigation: navigation, onEdit: onEdit)
+    convenience init(url: URL, initialByteOffset: Int64? = nil, initialEncoding: ViewerEncoding = .automatic, initialDisplayMode: ViewerDisplayMode? = nil,
+                     navigation: ViewerNavigation? = nil, useRememberedEncoding: Bool = true, allowsEdit: Bool = true, customTitle: String? = nil,
+                     onEdit: @escaping (URL, Int64, ViewerEncoding) -> Bool) throws {
+        self.init(source: nil, url: url, initialByteOffset: initialByteOffset, initialEncoding: initialEncoding, initialDisplayMode: initialDisplayMode,
+                  navigation: navigation, useRememberedEncoding: useRememberedEncoding, allowsEdit: allowsEdit, customTitle: customTitle, onEdit: onEdit)
     }
 
     convenience init(source: any ViewerByteSource, url: URL, initialByteOffset: Int64? = nil, initialEncoding: ViewerEncoding = .automatic,
@@ -158,7 +161,14 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         self.init(source: Optional(source), url: url, initialByteOffset: initialByteOffset, initialEncoding: initialEncoding, initialDisplayMode: initialDisplayMode, navigation: nil, onEdit: onEdit)
     }
 
-    private init(source: (any ViewerByteSource)?, url: URL, initialByteOffset: Int64?, initialEncoding: ViewerEncoding, initialDisplayMode: ViewerDisplayMode?, navigation: ViewerNavigation?,
+    private let useRememberedEncoding: Bool
+    private let allowsEdit: Bool
+    private let customTitle: String?
+    private var luaReadSent = false
+    private(set) var luaDidSwitchToEditor = false
+
+    private init(source: (any ViewerByteSource)?, url: URL, initialByteOffset: Int64?, initialEncoding: ViewerEncoding, initialDisplayMode: ViewerDisplayMode?,
+                 navigation: ViewerNavigation?, useRememberedEncoding: Bool = true, allowsEdit: Bool = true, customTitle: String? = nil,
                  onEdit: @escaping (URL, Int64, ViewerEncoding) -> Bool) {
         sourceURL = url.standardizedFileURL
         suppliedSource = source
@@ -168,11 +178,14 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         initialOffset = initialByteOffset
         self.initialEncoding = initialEncoding
         self.initialDisplayMode = initialDisplayMode
+        self.useRememberedEncoding = useRememberedEncoding
+        self.allowsEdit = allowsEdit
+        self.customTitle = customTitle
         self.onEdit = onEdit
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         super.init(window: window)
-        window.title = "\(sourceURL.lastPathComponent) — Просмотр"
+        window.title = customTitle ?? "\(sourceURL.lastPathComponent) — Просмотр"
         window.representedURL = sourceURL
         window.isReleasedWhenClosed = false
         window.delegate = self
@@ -198,6 +211,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         retainedWhileOpen = self
         super.showWindow(sender)
         window?.makeFirstResponder(textView)
+        sendLuaReadIfReady()
     }
 
     private func button(_ title: String, _ action: Selector, tag: Int = 0) -> NSButton {
@@ -235,8 +249,9 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         previousFileButton.target = self; previousFileButton.action = #selector(previousFileRequested)
         nextFileButton.target = self; nextFileButton.action = #selector(nextFileRequested)
         let fileNavigation = row([previousFileButton, nextFileButton, followButton])
-        let formats = row([mode, encoding, wrapButton, effectiveEncoding,
-                           button("Редактор · F6", #selector(editRequested))])
+        let edit = button("Редактор · F6", #selector(editRequested))
+        edit.isHidden = !allowsEdit
+        let formats = row([mode, encoding, wrapButton, effectiveEncoding, edit])
         cancelButton.target = self; cancelButton.action = #selector(cancelRequested)
         cancelButton.isEnabled = false
         let navigation = row([button("Начало", #selector(pageRequested), tag: -2),
@@ -328,7 +343,8 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
             self.identity = source.identity
             let saved = self.canFollow ? Self.readHistory().first { $0.url == self.sourceURL.absoluteString } : nil
             if let saved {
-                self.requestedEncoding = saved.encoding; self.isHex = saved.hex; self.isDump = saved.dump == true && !saved.hex
+                if self.useRememberedEncoding { self.requestedEncoding = saved.encoding }
+                self.isHex = saved.hex; self.isDump = saved.dump == true && !saved.hex
                 self.baseMode = (saved.baseDump ?? saved.dump) == true ? .dump : .text; self.wraps = saved.wrap
                 self.wordWrap = saved.wordWrap ?? true
             }
@@ -457,7 +473,9 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
 
     private func present(_ loaded: Loaded, revealSelection: Bool = true) {
         presenting = true
-        viewerDocument = loaded.document; operationControls.forEach { $0.isEnabled = true }
+        viewerDocument = loaded.document
+        sendLuaReadIfReady()
+        operationControls.forEach { $0.isEnabled = true }
         page = loaded.page; hexPage = loaded.hexPage; displayedLayout = loaded.layout
         if let hexPage { hexBytesPerRow = hexPage.bytesPerRow }
         displayOffset = loaded.offset
@@ -490,6 +508,12 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         if isDump, loaded.layout != renderLayout {
             DispatchQueue.main.async { [weak self] in self?.reflowDumpIfNeeded() }
         }
+    }
+
+    private func sendLuaReadIfReady() {
+        guard !luaReadSent, viewerDocument != nil, let window, window.isVisible else { return }
+        luaReadSent = true
+        FarLuaWorkspace.shared.event("ViewerEvent", [.hostInteger(window.windowNumber), .integer(0), .nilValue])
     }
 
     private func work<T: Sendable>(_ title: String,
@@ -683,7 +707,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
             self.identity = loaded.document.source.identity; self.requestedEncoding = requested
             self.encoding.selectItem(at: ViewerEncoding.allCases.firstIndex(of: requested) ?? 0)
             self.pathLabel.stringValue = target.path
-            self.window?.title = "\(target.lastPathComponent) — Просмотр"; self.window?.representedURL = target
+            self.window?.title = self.customTitle ?? "\(target.lastPathComponent) — Просмотр"; self.window?.representedURL = target
             self.lastMatch = nil; self.lastSearchSignature = nil
             self.undoPosition = nil; self.sessionBookmarks = [:]
             self.updateHistory(allowIdentityReset: true) { $0.accessed = Date(); $0.hex = hex; $0.dump = dump; $0.baseDump = baseDump }
@@ -877,6 +901,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
     }
 
     @objc private func editRequested() {
+        guard allowsEdit else { return }
         guard cancellation == nil else {
             message.stringValue = "Дождитесь загрузки выбранной кодировки или отмените операцию перед переходом в редактор."
             return
@@ -888,7 +913,10 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         }
         let offset = currentByteOffset
         cancelBackgroundWork()
-        if onEdit(sourceURL, offset, document.encoding) { window?.close() }
+        if onEdit(sourceURL, offset, document.encoding) {
+            luaDidSwitchToEditor = true
+            window?.close()
+        }
     }
 
     @objc private func cancelRequested() { cancelBackgroundWork(); message.stringValue = "Операция отменена." }
@@ -953,6 +981,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
             let consumed = MainActor.assumeIsolated {
                 guard let self, event.window === self.window, self.window?.isKeyWindow == true,
                       self.window?.attachedSheet == nil else { return false }
+                if FarLuaWorkspace.shared.handle(event) { return true }
                 if CommandWorkspace.shared.handle(event) { return true }
                 return self.handleKey(event)
             }
@@ -971,6 +1000,7 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         case (3, .command), (98, []): showSearchDialog()
         case (53, []), (99, []), (109, []), (87, []):
             if cancellation != nil { cancelRequested() } else { closeRequested() }
+        case (103, []): FarLuaPlugins.shared.showMenu()
         case (122, []): showViewerHelp()
         case (120, []): f2Requested()
         case (120, .shift): if cancellation == nil { toggleWrapType() }
@@ -1182,6 +1212,9 @@ final class ViewerWindow: NSWindowController, NSWindowDelegate, NSTextViewDelega
         stopFollowing()
         let offset = currentByteOffset
         updateHistory { $0.offset = offset }
+        if luaReadSent {
+            FarLuaWorkspace.shared.event("ViewerEvent", [.hostInteger(window?.windowNumber ?? -1), .integer(1), .nilValue])
+        }
         closed = true
         cancelBackgroundWork()
     }
@@ -1209,6 +1242,7 @@ private func NSButtonWithTag(_ tag: Int) -> NSButton {
 }
 
 extension ViewerWindow {
+    var luaDocumentIsClosed: Bool { closed }
     static func registerAutomation(in workspace: CommandWorkspace) {
         workspace.register("viewer.wrap", title: "Перенос строк в просмотрщике", contexts: [.viewer], recordable: true) {
             guard let viewer = NSApp.keyWindow?.windowController as? ViewerWindow, viewer.cancellation == nil else { throw CommandRegistryError.contextMismatch }
@@ -1423,5 +1457,101 @@ extension ViewerWindow {
         try require(large.displayOffset == secondOffset && large.currentByteOffset == secondOffset && large.textView.selectedRange().length == 0,
                     "Hex width change keeps its viewport and ignores a match outside the displayed block")
         return ["Viewer whole-word search controls", "Viewer cyclic search controls", "Viewer End anchors growing file", "Viewer numbered bookmark keyboard shortcuts", "Viewer Shift F2 wrap type", "Viewer F8 code-page cycling", "Viewer search stops follow", "Viewer dump resize and F2/F4 modes", "Viewer hex code page and width shortcuts", "Viewer captured panel neighbors", "Viewer cancelled navigation preserves file", "Viewer stale neighbor preserves file", "Viewer hex page grid round trip and selection bounds"]
+    }
+}
+
+// LuaFar viewer positions are byte offsets (zero-based), unlike editor coordinates.
+extension ViewerWindow {
+    var sourceFileURL: URL { sourceURL }
+    var luaViewerProperties: FarLuaValue {
+        .table(["FileName": .string(sourceURL.path), "Selected": .bool(textView.selectedRange().length > 0), "State": .hostInteger((isHex ? 4 : 0) | (wraps ? 8 : 0) | (wordWrap ? 16 : 0))])
+    }
+    var luaViewerInfo: FarLuaValue {
+        guard let document = viewerDocument else { return .nilValue }
+        let cp: [ViewerEncoding: Int] = [.automatic: -1, .utf8:65001, .utf16LE:1200, .utf16BE:1201, .windows1251:1251, .windows1252:1252, .latin1:28591, .dos437:437, .dos866:866]
+        return .table(["ViewerID": .hostInteger(window?.windowNumber ?? -1), "FileName": .string(sourceURL.path),
+            "FileSize": .integer(document.size), "FilePos": .integer(currentByteOffset), "LeftPos": .hostInteger(visibleColumn + 1),
+            "WindowSizeX": .hostInteger(Int(scroll.bounds.width / columnWidth)), "WindowSizeY": .hostInteger(Int(scroll.bounds.height / 16)),
+            "Options": .integer(0), "TabSize": .integer(8),
+            "CurMode": .table(["CodePage": .hostInteger(cp[document.encoding] ?? -1), "ViewMode": .integer(isHex ? 1 : isDump ? 2 : 0), "Flags": .integer((wraps ? 1 : 0) | (wordWrap ? 2 : 0))])])
+    }
+    func luaViewerCall(_ name: String, _ args: [FarLuaValue]) async throws -> [FarLuaValue] {
+        guard !closed, args.lua(0).hostInt == nil || args.lua(0).hostInt == -1 || args.lua(0).hostInt == window?.windowNumber else { return [.nilValue] }
+        let deadline = Date().addingTimeInterval(60)
+        func awaitLoad() async throws {
+            while cancellation != nil {
+                try Task.checkCancellation()
+                guard Date() < deadline else { throw ExtensionAPIError("Viewer: чтение не завершилось за 60 секунд") }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+        try await awaitLoad()
+        switch name {
+        case "viewer.GetFileName": return [.string(sourceURL.path)]
+        case "viewer.GetInfo": return [luaViewerInfo]
+        case "viewer.Quit": window?.performClose(nil); return [.bool(closed)]
+        case "viewer.Redraw": textView.needsDisplay = true; return []
+        case "viewer.SetPosition":
+            guard let document = viewerDocument else { return [.nilValue] }
+            let props = args.lua(1).hostTable
+            let raw = Int64(props["StartPos"]?.hostInt ?? args.lua(1).hostInt ?? 0)
+            let flags = props["Flags"]?.hostInt ?? args.lua(3).hostInt ?? 0
+            guard flags & ~15 == 0 else { throw ExtensionAPIError("viewer.SetPosition: неизвестные флаги") }
+            var target = raw
+            if flags & 2 != 0 { target = Int64(Double(document.size) * Double(min(100, max(0, raw))) / 100) }
+            if flags & 4 != 0 {
+                let addition = currentByteOffset.addingReportingOverflow(target)
+                guard !addition.overflow else { return [.nilValue] }; target = addition.partialValue
+            }
+            target = min(document.size, max(0, target))
+            let column = max(1, props["LeftPos"]?.hostInt ?? args.lua(2).hostInt ?? 1) - 1
+            loadPage(at: target, column: column)
+            try await awaitLoad()
+            return [.integer(flags & 8 != 0 ? raw : currentByteOffset)]
+        case "viewer.Select":
+            guard let document = viewerDocument, let start = args.lua(1).hostInt, let length = args.lua(2).hostInt,
+                  start >= 0, length >= 0, Int64(start) <= document.size, Int64(length) <= document.size - Int64(start) else { return [.bool(false)] }
+            loadPage(at: Int64(start), selection: Int64(start)..<Int64(start + length))
+            try await awaitLoad(); return [.bool(true)]
+        case "viewer.SetMode":
+            let props = args.lua(1).hostTable
+            let names = ["VSMT_VIEWMODE":0, "VSMT_WRAP":1, "VSMT_WORDWRAP":2]
+            guard let kind = props["Type"]?.hostInt ?? names[props["Type"]?.hostString ?? ""], let param = props["iParam"]?.hostInt else { return [.bool(false)] }
+            switch kind {
+            case 0: guard (0...2).contains(param) else { return [.bool(false)] }; mode.selectItem(at: param); applyMode(updateBase: true)
+            case 1: wraps = param != 0; wrapButton.state = wraps ? .on : .off; loadPage(at: currentByteOffset)
+            case 2: wordWrap = param != 0; loadPage(at: currentByteOffset)
+            default: return [.bool(false)]
+            }
+            try await awaitLoad(); return [.bool(true)]
+        default: throw ExtensionAPIError("API пока не перенесён: \(name)")
+        }
+    }
+}
+
+extension ViewerWindow {
+    static func runLuaViewerUISmoke() async throws -> [String] {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("far-lua-viewer-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let file = root.appendingPathComponent("viewer.txt")
+        let data = Data("alpha\nbeta\ngamma\n".utf8)
+        try data.write(to: file)
+        let viewer = try ViewerWindow(url: file, onEdit: { _, _, _ in false })
+        defer { viewer.cancelBackgroundWork(); viewer.window?.close(); try? FileManager.default.removeItem(at: root) }
+        viewer.showWindow(nil)
+        let first = try await viewer.luaViewerCall("viewer.GetInfo", [])
+        guard first.lua(0).hostTable["FileSize"] == .hostInteger(data.count) else { throw ExtensionAPIError("Lua viewer info must wait for the actual file snapshot") }
+        let position = try await viewer.luaViewerCall("viewer.SetPosition", [.nilValue, .table(["StartPos":.integer(50), "Flags":.integer(2)])])
+        guard position == [.integer(Int64(data.count / 2))] else { throw ExtensionAPIError("Lua viewer percent position must use byte offsets") }
+        let relative = try await viewer.luaViewerCall("viewer.SetPosition", [.nilValue, .integer(-2), .integer(1), .integer(4)])
+        guard relative == [.integer(Int64(data.count / 2 - 2))] else { throw ExtensionAPIError("Lua viewer relative offset was not applied") }
+        let selected = try await viewer.luaViewerCall("viewer.Select", [.nilValue, .integer(0), .integer(5)])
+        guard selected == [.bool(true)], (viewer.textView.string as NSString).substring(with: viewer.textView.selectedRange()) == "alpha" else { throw ExtensionAPIError("Lua viewer selection did not highlight requested bytes") }
+        let mode = try await viewer.luaViewerCall("viewer.SetMode", [.nilValue, .table(["Type":.integer(0), "iParam":.integer(1), "Flags":.integer(0)])])
+        guard mode == [.bool(true)], viewer.isHex, viewer.luaViewerInfo.hostTable["CurMode"]?.hostTable["ViewMode"] == .integer(1) else { throw ExtensionAPIError("Lua viewer must switch the real rendering mode") }
+        guard try await viewer.luaViewerCall("viewer.Select", [.nilValue, .integer(Int64.max), .integer(2)]) == [.bool(false)] else { throw ExtensionAPIError("Lua viewer accepted an overflowing selection") }
+        _ = try await viewer.luaViewerCall("viewer.SetPosition", [.nilValue, .table(["StartPos": .integer(0), "LeftPos": .integer(Int64.min)])])
+        guard viewer.visibleColumn == 0 else { throw ExtensionAPIError("Lua viewer failed to clamp a negative horizontal position") }
+        return ["Lua viewer waits for file info and uses zero-based byte offsets", "Lua viewer percentage and relative positions preserve file bounds", "Lua viewer selects actual bytes and switches the real HEX renderer"]
     }
 }

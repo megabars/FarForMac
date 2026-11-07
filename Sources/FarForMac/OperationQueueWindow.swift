@@ -63,7 +63,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
 
     Выберите строку и нажмите «Отменить выбранное», чтобы удалить ожидающее задание или запросить отмену текущего. «Отменить всё» отменяет ожидающие задания и текущую операцию. Уже завершённые изменения сохраняются; отмена не откатывает скопированные или перенесённые объекты. Закрытие окна не останавливает очередь.
 
-    При совпадении имён доступны замена, пропуск, новое имя и отмена. Для двух папок используется отдельное объединение содержимого; дерево назначения не заменяется. «Для всех таких конфликтов» действует только до конца текущего задания, отдельно для объединений папок и остальных совпадений.
+    При совпадении имён доступны замена, пропуск, новое имя и добавление к обычному файлу. F3 на строке источника или назначения открывает просмотр. Подтверждение для файла только для чтения запрашивается отдельно. «Запомнить выбор» действует до конца задания.
 
     При ошибке можно повторить текущий объект, пропустить его и продолжить либо отменить задание. Подробности и ошибки выбранного задания доступны в журнале. «Повторить задание» заново ставит все его исходные пути в конец очереди; уже существующие файлы снова вызовут проверку конфликтов.
 
@@ -98,8 +98,11 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
         var temporarySources: Bool? = nil
         var propagateDescriptions: Bool? = nil
         var descriptionEncodings: [String: FileDescriptionEncoding]? = nil
+        var localOptions: LocalTransferOptions? = nil
+        var appendsContent: Bool? = nil
+        var canRetry: Bool { temporarySources != true && appendsContent != true && localOptions?.conflictPolicy != .append }
         var request: TransferRequest {
-            TransferRequest(sources: sources.map { URL(fileURLWithPath: $0) }, destination: URL(fileURLWithPath: destination), move: move, propagateDescriptions: propagateDescriptions ?? false, descriptionEncodings: descriptionEncodings ?? [:])
+            TransferRequest(sources: sources.map { URL(fileURLWithPath: $0) }, destination: URL(fileURLWithPath: destination), move: move, propagateDescriptions: propagateDescriptions ?? false, descriptionEncodings: descriptionEncodings ?? [:], localOptions: localOptions)
         }
         var title: String { "\(move ? "Перенос" : "Копирование"): \(sources.count == 1 ? URL(fileURLWithPath: sources[0]).lastPathComponent : "\(sources.count) исходных объектов")" }
     }
@@ -117,6 +120,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
     private var cancelDecision: (() -> Void)?
     private var decisionAlert: NSAlert?
     private var conflictPolicies: [Bool: TransferDecision] = [:]
+    private var readOnlyPolicy: TransferDecision?
     private let worker = DispatchQueue(label: "FarMac.file-transfer", qos: .userInitiated)
     private let journalKey = "FarMac.transferJournal.v1"
     private let table = NSTableView()
@@ -148,13 +152,17 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     @discardableResult func enqueue(_ request: TransferRequest, retaining resource: AnyObject? = nil) -> Bool {
-        guard !request.sources.isEmpty else { return false }
+        enqueueBatch([request], retaining: resource)
+    }
+
+    @discardableResult func enqueueBatch(_ requests: [TransferRequest], retaining resource: AnyObject? = nil) -> Bool {
+        guard !requests.isEmpty, requests.allSatisfy({ !$0.sources.isEmpty }) else { return false }
         guard canEnqueue?() ?? true else {
             heading.stringValue = "Добавление недоступно: дождитесь завершения текущего изменения файлов."
             showWindow(nil)
             return false
         }
-        guard jobs.filter({ $0.state.pending }).count < 100 else {
+        guard jobs.filter({ $0.state.pending }).count + requests.count <= 100 else {
             let alert = NSAlert()
             alert.messageText = "В очереди уже 100 заданий"
             alert.informativeText = "Дождитесь завершения или отмените часть заданий перед добавлением новых."
@@ -162,16 +170,20 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
             showWindow(nil)
             return false
         }
-        var job = Job(id: UUID(), sources: request.sources.map(\.path), destination: request.destination.path, move: request.move, created: Date(), state: .queued, summary: "Ожидает выполнения", issues: [])
-        job.temporarySources = resource != nil
-        job.propagateDescriptions = request.propagateDescriptions
-        job.descriptionEncodings = request.descriptionEncodings
-        temporaryResources[job.id] = resource
-        runtimeRequests[job.id] = request
-        jobs.append(job)
+        for request in requests {
+            var job = Job(id: UUID(), sources: request.sources.map(\.path), destination: request.destination.path, move: request.move, created: Date(), state: .queued, summary: "Ожидает выполнения", issues: [])
+            job.temporarySources = resource != nil
+            job.propagateDescriptions = request.propagateDescriptions
+            job.descriptionEncodings = request.descriptionEncodings
+            job.localOptions = request.localOptions
+            temporaryResources[job.id] = resource
+            runtimeRequests[job.id] = request
+            jobs.append(job)
+        }
+        let selection = jobs.last?.id
         trimJournal()
         persist()
-        refreshUI(select: job.id)
+        refreshUI(select: selection)
         showWindow(nil)
         onChange?()
         startNext()
@@ -262,6 +274,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
         let token = TransferCancellation()
         activeID = job.id; cancellation = token
         conflictPolicies.removeAll()
+        readOnlyPolicy = nil
         jobs[index].state = .running; jobs[index].summary = "Подготовка…"
         persist(); refreshUI()
         heading.stringValue = job.title
@@ -304,12 +317,13 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
     private func finish(_ result: TransferResult, id: UUID) {
         guard activeID == id, let index = jobs.firstIndex(where: { $0.id == id }) else { return }
         jobs[index].state = result.cancelled ? .cancelled : result.failed > 0 ? (result.completed > 0 ? .partial : .failed) : result.skipped > 0 || !result.issues.isEmpty ? .partial : .completed
-        jobs[index].summary = result.summary + (jobs[index].temporarySources == true ? " Для повтора снова извлеките объекты из архива." : "")
+        jobs[index].summary = result.summary + (jobs[index].temporarySources == true ? " Для повтора снова извлеките объекты из архива." : jobs[index].canRetry ? "" : " Для повтора добавления создайте новое задание и проверьте файл назначения.")
         jobs[index].issues = result.issues
         runtimeRequests.removeValue(forKey: id)
         temporaryResources.removeValue(forKey: id)
         activeID = nil; cancellation = nil; cancelDecision = nil; decisionAlert = nil
         conflictPolicies.removeAll()
+        readOnlyPolicy = nil
         heading.stringValue = jobs[index].state.title + ": " + jobs[index].title
         for bar in [fileProgress, batchProgress] { bar.stopAnimation(nil); bar.isIndeterminate = false }
         trimJournal(); persist(); refreshUI()
@@ -320,48 +334,95 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
 
     private func resolveConflict(_ conflict: TransferConflict, id: UUID, cancellation token: TransferCancellation, answer: TransferAnswer<TransferDecision>, nameError: String? = nil) {
         guard activeID == id, !token.isCancelled, !answer.isResolved else { answer.resolve(.cancel); return }
-        if let decision = conflictPolicies[conflict.isDirectoryMerge] {
-            if case .replace = decision, !conflict.canReplace {
-                // A file policy never authorizes replacing a directory tree.
-            } else { answer.resolve(decision); return }
+        if conflict.isReadOnlyConfirmation, let readOnlyPolicy { answer.resolve(readOnlyPolicy); return }
+        if !conflict.isReadOnlyConfirmation, let decision = conflictPolicies[conflict.isDirectoryMerge] {
+            switch decision {
+            case .replace where !conflict.canReplace, .append where !conflict.canAppend: break
+            default: answer.resolve(decision); return
+            }
         }
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = nameError ?? (conflict.isDirectoryMerge ? "Объединить папки?" : "Объект уже существует")
-        alert.informativeText = "Источник: \(conflict.source.path)\nНазначение: \(conflict.destination.path)\n\n" + (conflict.isDirectoryMerge ? "Содержимое папок будет объединено. Совпадения внутри проверяются отдельно; дерево назначения сохраняется." : (conflict.canReplace ? "Замена удалит существующий файл назначения только для этого совпадения." : "Типы объектов различаются. Папки не заменяются целиком: пропустите объект или укажите новое имя."))
-        alert.addButton(withTitle: conflict.isDirectoryMerge ? "Объединить" : "Заменить").isEnabled = conflict.isDirectoryMerge || conflict.canReplace
-        alert.addButton(withTitle: "Пропустить")
-        alert.addButton(withTitle: "Новое имя")
-        alert.addButton(withTitle: "Отменить задание").keyEquivalent = "\u{1b}"
-        let name = NSTextField(string: conflict.destination.lastPathComponent)
+        alert.messageText = nameError ?? (conflict.isReadOnlyConfirmation ? "Файл только для чтения" : conflict.isDirectoryMerge ? "Объединить папки?" : "Объект уже существует")
+        alert.informativeText = conflict.destination.path
+        var choices: [TransferDecision] = []
+        func button(_ title: String, _ decision: TransferDecision, enabled: Bool = true) {
+            let control = alert.addButton(withTitle: title)
+            control.isEnabled = enabled
+            choices.append(decision)
+            if case .cancel = decision { control.keyEquivalent = "\u{1b}" }
+        }
+        button(conflict.isDirectoryMerge ? "Объединить" : "Заменить", conflict.isDirectoryMerge ? .merge : .replace,
+               enabled: conflict.isDirectoryMerge || conflict.canReplace)
+        button("Пропустить", .skip)
+        if !conflict.isReadOnlyConfirmation {
+            button("Переименовать", .renameAutomatically)
+            if conflict.canAppend { button("Добавить", .append) }
+        }
+        button("Отмена", .cancel)
+
+        func preview(_ label: String, _ url: URL, _ size: Int64?, _ modified: Date?) -> TransferPreviewButton {
+            let date = modified.map { DateFormatter.localizedString(from: $0, dateStyle: .short, timeStyle: .medium) } ?? "—"
+            let details = size.map(bytes) ?? "—"
+            let row = TransferPreviewButton(title: "\(label): \(url.lastPathComponent) · \(details) · \(date)",
+                                            url: url, onOpen: { [weak self] in self?.previewConflictFile(url, from: alert.window) })
+            row.toolTip = url.path + " · F3"
+            row.isEnabled = !conflict.isDirectoryMerge
+            return row
+        }
+        let sourcePreview = preview("Источник", conflict.source, conflict.sourceSize, conflict.sourceModified)
+        let destinationPreview = preview("Назначение", conflict.destination, conflict.destinationSize, conflict.destinationModified)
+        let name = NSTextField(string: conflict.suggestedName ?? conflict.destination.lastPathComponent)
         name.placeholderString = "Новое имя без пути"
-        let applyAll = NSButton(checkboxWithTitle: "Для всех таких конфликтов в этом задании", target: nil, action: nil)
-        let accessory = vertical([label("Имя для кнопки «Новое имя»:", size: 11), name, applyAll], spacing: 8)
-        accessory.frame = NSRect(x: 0, y: 0, width: 420, height: 80)
+        name.setAccessibilityLabel("Имя при переименовании")
+        let applyAll = NSButton(checkboxWithTitle: "Запомнить выбор", target: nil, action: nil)
+        let renameRow = horizontal([label("Имя при переименовании", size: 11), name])
+        name.widthAnchor.constraint(equalToConstant: 250).isActive = true
+        var fields: [NSView] = [sourcePreview, destinationPreview]
+        if !conflict.isReadOnlyConfirmation { fields.append(renameRow) }
+        fields.append(applyAll)
+        let accessory = vertical(fields, spacing: 7)
+        accessory.alignment = .leading
+        accessory.frame = NSRect(x: 0, y: 0, width: 470, height: conflict.isReadOnlyConfirmation ? 90 : 126)
         alert.accessoryView = accessory
         present(alert, cancel: { answer.resolve(.cancel) }) { [weak self] response in
             guard let self, !token.isCancelled, !answer.isResolved else { answer.resolve(.cancel); return }
-            let decision: TransferDecision
-            switch response {
-            case .alertFirstButtonReturn: decision = conflict.isDirectoryMerge ? .merge : .replace
-            case .alertSecondButtonReturn: decision = .skip
-            case .alertThirdButtonReturn:
+            let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+            var decision = choices.indices.contains(index) ? choices[index] : .cancel
+            if case .renameAutomatically = decision, applyAll.state != .on {
                 let newName = name.stringValue
-                guard !newName.isEmpty, newName != ".", newName != "..", !newName.contains("/"), !newName.contains("\0"), newName != conflict.destination.lastPathComponent else {
+                guard !newName.isEmpty, newName != ".", newName != "..", !newName.contains("/"),
+                      !newName.contains("\0"), newName != conflict.destination.lastPathComponent else {
                     self.resolveConflict(conflict, id: id, cancellation: token, answer: answer, nameError: "Укажите другое непустое имя без /, . и ..")
                     return
                 }
                 decision = .rename(newName)
-            default: decision = .cancel
+            }
+            if case .append = decision, let index = self.jobs.firstIndex(where: { $0.id == id }) {
+                self.jobs[index].appendsContent = true
+                self.persist()
             }
             if applyAll.state == .on {
                 switch decision {
-                case .replace, .skip, .merge: self.conflictPolicies[conflict.isDirectoryMerge] = decision
+                case .replace, .skip, .merge, .append, .renameAutomatically:
+                    if conflict.isReadOnlyConfirmation { self.readOnlyPolicy = decision }
+                    else { self.conflictPolicies[conflict.isDirectoryMerge] = decision }
                 default: break
                 }
             }
             if case .cancel = decision { token.cancel() }
             answer.resolve(decision)
+        }
+    }
+
+    private func previewConflictFile(_ url: URL, from parent: NSWindow?) {
+        do {
+            let viewer = try ViewerWindow(url: url) { _, _, _ in false }
+            viewer.showWindow(nil)
+        } catch {
+            guard let parent else { return }
+            let warning = NSAlert(error: error)
+            warning.beginSheetModal(for: parent)
         }
     }
 
@@ -418,7 +479,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
     }
     @objc private func cancelAllAction() { cancelAll() }
     @objc private func retrySelected() {
-        guard let index = selectedIndex, !jobs[index].state.pending, jobs[index].temporarySources != true else { return }
+        guard let index = selectedIndex, !jobs[index].state.pending, jobs[index].canRetry else { return }
         enqueue(jobs[index].request)
     }
     @objc private func clearHistory() {
@@ -446,7 +507,7 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
         }
         let job = jobs[index]
         cancelButton.isEnabled = job.state == .queued || job.state == .running
-        retryButton.isEnabled = !job.state.pending && job.temporarySources != true
+        retryButton.isEnabled = !job.state.pending && job.canRetry
         let date = DateFormatter.localizedString(from: job.created, dateStyle: .short, timeStyle: .medium)
         details.string = "\(job.title)\n\(date) • \(job.state.title)\nНазначение: \(job.destination)\nИсточники:\n\(job.sources.joined(separator: "\n"))\n\n\(job.summary)" + (job.issues.isEmpty ? "" : "\n\nОшибки и замечания:\n" + job.issues.joined(separator: "\n"))
     }
@@ -528,4 +589,26 @@ final class FileOperationQueue: NSWindowController, NSTableViewDataSource, NSTab
     }
 
     private func bytes(_ count: Int64) -> String { ByteCountFormatter.string(fromByteCount: max(0, count), countStyle: .file) }
+}
+
+@MainActor
+private final class TransferPreviewButton: NSButton {
+    private let onOpen: () -> Void
+
+    init(title: String, url: URL, onOpen: @escaping () -> Void) {
+        self.onOpen = onOpen
+        super.init(frame: .zero)
+        self.title = title
+        setAccessibilityLabel(title)
+        bezelStyle = .inline
+        target = self
+        action = #selector(openFile)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var acceptsFirstResponder: Bool { isEnabled }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 99 { performClick(nil) }
+        else { super.keyDown(with: event) }
+    }
+    @objc private func openFile() { onOpen() }
 }

@@ -34,6 +34,17 @@ import Testing
         XCTAssertEqual(try String(contentsOf: source), "expected")
         XCTAssertTrue(provider.renamed.isEmpty)
     }
+    @Test func ftpMoveIsRejectedBeforeStartingTheUpload() throws {
+        let source = try file("source", "contents")
+        for kind in [NetworkProtocol.ftp, .ftps] {
+            let provider = FTPRemoteProvider(connection: NetworkConnection(kind: kind, host: "unused.invalid"), password: nil)
+            do {
+                try RemoteTransferEngine.upload(provider: provider, from: source, to: "/target", move: true)
+                Issue.record("Expected unsupported FTP move")
+            } catch RemoteTransferError.unsupported(_) { }
+        }
+        #expect(try String(contentsOf: source, encoding: .utf8) == "contents")
+    }
     @Test func testRemoteEditDetectsSameSizeSameMetadataByteChange() throws {
         let provider = MemoryRemote(); provider.files["/edit"] = Data("before".utf8)
         let workspace = try RemoteWorkspace(parent: directory)

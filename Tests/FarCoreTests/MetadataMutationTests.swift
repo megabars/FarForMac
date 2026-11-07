@@ -257,4 +257,96 @@ import Testing
         }
     }
 
+    @Test func creationDateAndBSDFlagsApplyOnlyToReviewedFields() throws {
+        try fixture { root in
+            let item = root.appendingPathComponent("file")
+            try Data("unchanged".utf8).write(to: item)
+            let before = try FileTools.metadata(item)
+            let created = Date(timeIntervalSince1970: 1_500_000_000.25)
+            let plan = try MetadataMutation.prepare(url: item, changes: MetadataChanges(created: created, hidden: true, noDump: true))
+            #expect(plan.entries.first?.previousCreated == before.created)
+            #expect(plan.entries.first?.previousFlags == before.flags)
+            #expect(try FileTools.metadata(item).created == before.created)
+            let result = MetadataMutation.apply(plan)
+            #expect(result.completed == 1 && result.error == nil)
+            let after = try FileTools.metadata(item)
+            #expect(abs(after.created.timeIntervalSince1970 - created.timeIntervalSince1970) < 0.00001)
+            #expect(after.flags == before.flags | UInt32(UF_HIDDEN | UF_NODUMP))
+            #expect(after.permissions == before.permissions && after.modified == before.modified && after.accessed == before.accessed)
+            let clearHidden = try MetadataMutation.prepare(url: item, changes: MetadataChanges(hidden: false))
+            #expect(MetadataMutation.apply(clearHidden).error == nil)
+            #expect(try FileTools.metadata(item).flags == (before.flags & ~UInt32(UF_HIDDEN)) | UInt32(UF_NODUMP))
+            #expect(try String(contentsOf: item, encoding: .utf8) == "unchanged")
+        }
+    }
+
+    @Test func aclCanBeReviewedReplacedAndCleared() throws {
+        try fixture { root in
+            let item = root.appendingPathComponent("file"), aclFixture = root.appendingPathComponent("acl-fixture")
+            try Data("unchanged".utf8).write(to: item)
+            try Data().write(to: aclFixture)
+            let empty = try MetadataMutation.aclText(url: item)
+            let before = try FileTools.metadata(item)
+            try setFixtureACL("everyone allow readattr", on: aclFixture)
+            let initial = try MetadataMutation.aclText(url: aclFixture)
+            #expect(initial != empty)
+            let install = try MetadataMutation.prepare(url: item, changes: MetadataChanges(aclText: initial))
+            #expect(install.entries.first?.previousACLText == empty)
+            #expect(try MetadataMutation.aclText(url: item) == empty)
+            #expect(MetadataMutation.apply(install).error == nil)
+            #expect(try MetadataMutation.aclText(url: item) == initial)
+            try setFixtureACL("everyone allow readextattr", on: aclFixture)
+            let replacement = try MetadataMutation.aclText(url: aclFixture)
+            #expect(replacement != initial)
+            let replace = try MetadataMutation.prepare(url: item, changes: MetadataChanges(aclText: replacement))
+            #expect(replace.entries.first?.previousACLText == initial)
+            #expect(MetadataMutation.apply(replace).error == nil)
+            #expect(try MetadataMutation.aclText(url: item) == replacement)
+            let clear = try MetadataMutation.prepare(url: item, changes: MetadataChanges(aclText: ""))
+            #expect(MetadataMutation.apply(clear).error == nil)
+            #expect(try MetadataMutation.aclText(url: item) == empty)
+            let after = try FileTools.metadata(item)
+            #expect(after.permissions == before.permissions && after.modified == before.modified && after.accessed == before.accessed)
+            #expect(try String(contentsOf: item, encoding: .utf8) == "unchanged")
+        }
+    }
+
+    @Test func aclAndUIDValidationRejectInvalidAndStaleChanges() throws {
+        try fixture { root in
+            let item = root.appendingPathComponent("file")
+            try Data().write(to: item)
+            for invalid in ["not an ACL", "\0", String(repeating: "a", count: 65_537)] {
+                #expect(throws: (any Error).self) {
+                    try MetadataMutation.prepare(url: item, changes: MetadataChanges(aclText: invalid))
+                }
+            }
+            #expect(throws: (any Error).self) {
+                try MetadataMutation.prepare(url: root, changes: MetadataChanges(aclText: ""), recursive: true)
+            }
+            if geteuid() != 0 {
+                #expect(throws: (any Error).self) {
+                    try MetadataMutation.prepare(url: item, changes: MetadataChanges(ownerID: 0))
+                }
+            }
+            #expect(throws: (any Error).self) {
+                try MetadataMutation.prepare(url: item, changes: MetadataChanges(ownerID: .max))
+            }
+            let clear = try MetadataMutation.prepare(url: item, changes: MetadataChanges(aclText: ""))
+            try setFixtureACL("everyone allow readattr", on: item)
+            let current = try MetadataMutation.aclText(url: item)
+            let stale = MetadataMutation.apply(clear)
+            #expect(stale.completed == 0 && stale.error != nil)
+            #expect(try MetadataMutation.aclText(url: item) == current)
+        }
+    }
+
+    private func setFixtureACL(_ permission: String, on item: URL) throws {
+        let command = Process()
+        command.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        command.arguments = ["+a", permission, item.path]
+        try command.run()
+        command.waitUntilExit()
+        try #require(command.terminationStatus == 0)
+    }
+
 }

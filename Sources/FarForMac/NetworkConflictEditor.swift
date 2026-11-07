@@ -43,6 +43,9 @@ final class NetworkConflictEditor: NSObject, NSTableViewDataSource, NSTableViewD
             switch actions[index] {
             case 1: decision = conflicts[index].canReplace ? .replace : .skip
             case 2: decision = .rename(names[index])
+            case 3: decision = conflicts[index].canCompareDates ? .newer : .skip
+            case 4: decision = conflicts[index].canReplace ? .append : .skip
+            case 5: decision = conflicts[index].canResume ? .resume : .skip
             default: decision = .skip
             }
             return (conflicts[index].mapping.source, decision)
@@ -54,9 +57,14 @@ final class NetworkConflictEditor: NSObject, NSTableViewDataSource, NSTableViewD
         let conflict = conflicts[row]
         switch tableColumn?.identifier.rawValue {
         case "action":
-            let picker = NSPopUpButton(); picker.addItems(withTitles: ["Пропустить", "Заменить", "Другое имя"].map(L10n.text))
+            let picker = NSPopUpButton()
+            picker.addItems(withTitles: ["Пропустить", "Заменить", "Другое имя", "Если источник новее", "Добавить в конец", "Продолжить"].map(L10n.text))
+            picker.autoenablesItems = false
             picker.item(at: 1)?.isEnabled = conflict.canReplace
-            picker.autoenablesItems = false; picker.tag = row; picker.selectItem(at: actions[row])
+            picker.item(at: 3)?.isEnabled = conflict.canCompareDates
+            picker.item(at: 4)?.isEnabled = conflict.canReplace
+            picker.item(at: 5)?.isEnabled = conflict.canResume
+            picker.tag = row; picker.selectItem(at: actions[row])
             picker.target = self; picker.action = #selector(actionChanged(_:))
             picker.setAccessibilityLabel(L10n.text("Действие") + ": " + conflict.mapping.source)
             return picker
@@ -74,7 +82,7 @@ final class NetworkConflictEditor: NSObject, NSTableViewDataSource, NSTableViewD
     }
     @objc private func actionChanged(_ sender: NSPopUpButton) {
         guard conflicts.indices.contains(sender.tag) else { return }
-        actions[sender.tag] = sender.indexOfSelectedItem == 1 && !conflicts[sender.tag].canReplace ? 0 : sender.indexOfSelectedItem
+        actions[sender.tag] = sender.selectedItem?.isEnabled == true ? sender.indexOfSelectedItem : 0
         table.reloadData(forRowIndexes: IndexSet(integer: sender.tag), columnIndexes: IndexSet(integer: 2))
     }
     func controlTextDidChange(_ notification: Notification) {

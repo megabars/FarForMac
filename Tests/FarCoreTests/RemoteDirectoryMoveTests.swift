@@ -48,19 +48,16 @@ import Testing
         #expect(f.remote.files["/tree/a"] == Data("keep server".utf8) && f.remote.files["/tree/sub/b"] == Data("four".utf8))
     }
 
-    @Test func mergeMoveRemovesReviewedEmptySourceDirectoriesInBothDirections() throws {
+    @Test func mergeMoveRetainsEmptyDirectoriesThatCouldAliasTheSource() throws {
         for download in [true, false] {
             let f = try DirectoryMoveFixture(); defer { f.cleanup() }
             try f.directory("tree/empty"); f.remote.directories.formUnion(["/tree", "/tree/empty"])
             let plan = try download ? f.download(.mergeSkippingExisting) : f.upload(.mergeSkippingExisting)
-            #expect(plan.copies.isEmpty && plan.skipped.isEmpty)
+            #expect(plan.copies.isEmpty && plan.skipped.isEmpty && !plan.hasMoveCandidates)
             let report = try RemoteDirectoryTransfer.move(provider: f.remote, plan: plan)
-            #expect(report.retainedSources.isEmpty && report.failedSourceRemovals.isEmpty)
-            if download {
-                #expect(!f.remote.directories.contains("/tree") && FileManager.default.fileExists(atPath: f.local.appendingPathComponent("tree/empty").path))
-            } else {
-                #expect(!FileManager.default.fileExists(atPath: f.local.appendingPathComponent("tree").path) && f.remote.directories.contains("/tree/empty"))
-            }
+            #expect(report.removedSources.isEmpty && report.retainedSources.count == 2 && report.failedSourceRemovals.isEmpty)
+            #expect(f.remote.directories.contains("/tree/empty"))
+            #expect(FileManager.default.fileExists(atPath: f.local.appendingPathComponent("tree/empty").path))
         }
     }
 
@@ -184,6 +181,45 @@ import Testing
         #expect(try f.read("tree/a") == "BAD")
     }
 
+    @Test func sourceChangedDuringFinalDestinationReadbackIsNeverRemoved() throws {
+        let source = DirectoryMoveRemote(), destination = DirectoryMoveRemote()
+        source.file("/candidate", "old")
+        destination.directories.insert("/other")
+        let target = "/other/candidate"
+        let plan = try RemoteDirectoryTransfer.prepareRemote(source: source, destination: destination,
+            entries: [source.entry("/candidate")], into: "/other", policy: .requireNew, move: true)
+        var deletionStarted = false, finalReadbacks = 0
+        destination.afterDownload = { path in
+            guard deletionStarted, path == target else { return }
+            finalReadbacks += 1
+            if finalReadbacks == 2 { source.file("/candidate", "new") }
+        }
+        let report = try RemoteDirectoryTransfer.copy(provider: destination, plan: plan, move: true, sourceProvider: source) { update in
+            if update.path.hasPrefix("Удаление источника: ") { deletionStarted = true }
+        }
+        #expect(finalReadbacks == 2)
+        #expect(report.completed.map(\.destination) == [target] && report.removedSources.isEmpty)
+        #expect(report.failedSourceRemovals.contains { $0.source == "/candidate" && !$0.outcomeUnknown })
+        #expect(source.files["/candidate"] == Data("new".utf8) && destination.files[target] == Data("old".utf8))
+    }
+
+    @Test func equalProfilesWithSeparateSessionsUseTheirOwnNamespaces() throws {
+        let source = DirectoryMoveRemote()
+        let destination = DirectoryMoveRemote(connection: source.connection)
+        let path = "/candidate", bytes = Data("contents".utf8)
+        source.file(path, "contents")
+        let entry = source.entry(path)
+        #expect(throws: RemoteTransferError.self) {
+            try RemoteDirectoryTransfer.prepareRemote(source: source, destination: source, entries: [entry],
+                into: "/", policy: .requireNew, move: true)
+        }
+        let plan = try RemoteDirectoryTransfer.prepareRemote(source: source, destination: destination, entries: [entry],
+            into: "/", policy: .requireNew, move: true)
+        let report = try RemoteDirectoryTransfer.copy(provider: destination, plan: plan, move: true, sourceProvider: source)
+        #expect(report.removedSources == [path])
+        #expect(source.files[path] == nil && destination.files[path] == bytes)
+    }
+
     @Test func renameDecisionRejectsTraversalAndExistingDestination() throws {
         let f = try DirectoryMoveFixture(); defer { f.cleanup() }; f.remote.tree()
         try f.directory("tree"); try f.write("tree/a", "keep"); try f.write("tree/taken", "existing")
@@ -203,7 +239,7 @@ import Testing
         let preview = try f.download(.mergeSkippingExisting)
         let plan = try RemoteDirectoryTransfer.resolve(provider: f.remote, plan: preview, decisions: ["/tree/a": .replace])
         try f.write("tree/a", "NEW")
-        let error = try failure { try RemoteDirectoryTransfer.move(provider: f.remote, plan: plan) }
+        let error = try failure { try RemoteDirectoryTransfer.copy(provider: f.remote, plan: plan) }
         #expect(error.report.completed.isEmpty && error.report.removedSources.isEmpty)
         #expect(try f.read("tree/a") == "NEW" && f.remote.files["/tree/a"] == Data("one".utf8))
     }
@@ -246,7 +282,7 @@ import Testing
         let report = try RemoteDirectoryTransfer.move(provider: f.remote, plan: plan)
         #expect(report.completed.count == 1 && !report.removedSources.contains("/tree/sub/b"))
         #expect(report.retainedSources.contains("/tree/sub/b"))
-        #expect(report.failedSourceRemovals.contains { $0.source == "/tree/sub/b" && $0.outcomeUnknown && $0.reason.localizedCaseInsensitiveContains("ответ") })
+        #expect(report.failedSourceRemovals.contains { $0.source == "/tree/sub/b" && $0.outcomeUnknown })
         #expect(f.remote.files["/tree/sub/b"] == nil && f.remote.directories.contains("/tree/sub"))
         #expect(try f.read("tree/sub/b") == "four")
     }
@@ -278,10 +314,11 @@ private final class DirectoryMoveFixture {
 }
 
 private final class DirectoryMoveRemote: RemoteNoReplaceRenameProvider, RemoteBoundedDownloadProvider, RemoteNonRecursiveDirectoryRemoval {
-    let connection = NetworkConnection(kind: .sftp, host: "move.test")
+    let connection: NetworkConnection
     var files: [String: Data] = [:], directories: Set<String> = ["/"]
     var versions: [String: Int] = [:], removals: [String] = []
     var afterRemove: ((String) -> Void)?, afterDownload: ((String) -> Void)?, removeFailure: String?, loseRemoveResponse: String?, loseRenameResponse = false
+    init(connection: NetworkConnection = NetworkConnection(kind: .sftp, host: "move.test")) { self.connection = connection }
     func file(_ path: String, _ value: String) { files[path] = Data(value.utf8); versions[path, default: 0] += 1 }
     func tree() { directories.formUnion(["/tree", "/tree/sub", "/tree/empty"]); file("/tree/a", "one"); file("/tree/sub/b", "four") }
     func entry(_ path: String) -> RemoteEntry { try! stat(path: path, cancellation: TransferCancellation())! }

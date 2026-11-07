@@ -12,11 +12,15 @@ let package = Package(
     targets: [
         .systemLibrary(name: "CArchive"),
         .target(name: "CFarPTY"),
+        .target(
+            name: "CFarLua",
+            cSettings: [.define("LUA_USE_MACOSX"), .headerSearchPath("Vendor/lua")]
+        ),
         .target(name: "CNetwork", linkerSettings: [.linkedLibrary("curl")]),
-        .target(name: "FarCore", dependencies: ["CFarPTY", "CArchive", "CNetwork"]),
+        .target(name: "FarCore", dependencies: ["CFarPTY", "CArchive", "CNetwork", "CFarLua"]),
         .executableTarget(name: "FarForMac", dependencies: ["FarCore"]),
         .executableTarget(name: "FarPerformance", dependencies: ["FarCore"]),
-        .testTarget(name: "FarCoreTests", dependencies: ["FarCore"])
+        .testTarget(name: "FarCoreTests", dependencies: ["FarCore"], resources: [.copy("Fixtures/FarLua")])
     ],
     swiftLanguageModes: [.v5]
 )

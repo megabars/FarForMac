@@ -7,6 +7,50 @@ final class EditorTextView: NSTextView {
     var indentSelection: ((Bool) -> Void)?
     var tabSize = 4
     var usesSpaces = true
+    var overtype = false
+    var autoIndentNewline = false
+    var beforeUserInput: (() -> (() -> Void)?)?
+    private var processingUserInput = false
+
+    private func trackInput(_ operation: () -> Void) {
+        guard !processingUserInput else { operation(); return }
+        let finished = beforeUserInput?()
+        processingUserInput = true
+        operation()
+        processingUserInput = false
+        if !hasMarkedText() { finished?() }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 122 { super.keyDown(with: event); return }
+        trackInput { super.keyDown(with: event) }
+    }
+
+    override func paste(_ sender: Any?) { trackInput { super.paste(sender) } }
+    override func cut(_ sender: Any?) { trackInput { super.cut(sender) } }
+
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        var range = replacementRange
+        if overtype, !hasMarkedText(), selectedRange().length == 0, range.location == NSNotFound,
+           let value = insertString as? String, value.count == 1, value.first?.isNewline == false {
+            let source = string as NSString
+            let caret = selectedRange().location
+            if caret < source.length, ![10, 13].contains(source.character(at: caret)) {
+                range = source.rangeOfComposedCharacterSequence(at: caret)
+            }
+        }
+        trackInput { super.insertText(insertString, replacementRange: range) }
+    }
+
+    override func insertNewline(_ sender: Any?) {
+        guard autoIndentNewline, isEditable else { super.insertNewline(sender); return }
+        let source = string as NSString
+        let caret = selectedRange().location
+        let start = source.lineRange(for: NSRange(location: caret, length: 0)).location
+        let prefix = source.substring(with: NSRange(location: start, length: caret - start))
+        let indent = prefix.prefix(while: { $0 == " " || $0 == "\t" })
+        insertText("\n" + indent, replacementRange: selectedRange())
+    }
 
     override func insertTab(_ sender: Any?) {
         guard isEditable else { return }

@@ -23,6 +23,9 @@ final class ExtensionWorkspace: NSObject, NSMenuItemValidation {
     func installMenu(in bar: NSMenu) {
         let root = NSMenuItem(title: "Расширения", action: nil, keyEquivalent: "")
         let menu = NSMenu(title: root.title); root.submenu = menu; bar.addItem(root)
+        let brackets = NSMenuItem(title: "Парные скобки…", action: #selector(showBrackets), keyEquivalent: "")
+        brackets.target = self; menu.addItem(brackets)
+        menu.addItem(.separator())
         for (index, entry) in examples.enumerated() {
             let item = NSMenuItem(title: entry.0, action: #selector(runExample(_:)), keyEquivalent: "")
             item.tag = index; item.target = self; menu.addItem(item)
@@ -34,6 +37,7 @@ final class ExtensionWorkspace: NSObject, NSMenuItemValidation {
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(cancel) { return isRunning }
         guard !isRunning, !CommandWorkspace.shared.macros.isPlaying, NSApp.modalWindow == nil, NSApp.keyWindow?.attachedSheet == nil else { return false }
+        if item.action == #selector(showBrackets) { return NSApp.keyWindow?.windowController is TextFileWindow }
         if item.action == #selector(runExample(_:)) {
             let kind = examples[item.tag].2
             let context = CommandWorkspace.shared.context
@@ -42,6 +46,34 @@ final class ExtensionWorkspace: NSObject, NSMenuItemValidation {
             return context == .editor || context == .viewer
         }
         return CommandWorkspace.shared.context != .dialog
+    }
+    @objc private func showBrackets() {
+        guard let editor = NSApp.keyWindow?.windowController as? TextFileWindow else { return }
+        BracketsWorkspace.show(for: editor)
+    }
+    func showEditorPlugins(_ editor: TextFileWindow, selectedAction: Int? = nil) {
+        guard !isRunning, !CommandWorkspace.shared.macros.isPlaying else { return }
+        var selected = selectedAction
+        if selected == nil {
+            let menu = PanelListMenu(title: "Команды плагинов", hint: "Enter — выполнить · Esc — отмена")
+            menu.replaceRows([.init(title: "Парные скобки"), .init(title: "EditCase", selectable: editor.isEditable), .init(title: "Align", selectable: editor.isEditable)])
+            menu.onActivate = { selected = $0; menu.dismiss() }
+            menu.run(relativeTo: editor.window); menu.onActivate = nil
+        }
+        if selected == 0 { BracketsWorkspace.show(for: editor) }
+        if selected == 1 {
+            let choices = examples.enumerated().filter { $0.element.1.hasPrefix("editcase-") }
+            let actions = PanelListMenu(title: "EditCase", hint: "Enter — выполнить · Esc — отмена")
+            actions.replaceRows(choices.map { .init(title: $0.element.0) })
+            var chosen: Int?
+            actions.onActivate = { chosen = choices[$0].offset; actions.dismiss() }
+            defer { actions.onActivate = nil }
+            actions.run(relativeTo: editor.window)
+            if let chosen { let item = NSMenuItem(); item.tag = chosen; runExample(item) }
+        }
+        if selected == 2, let index = examples.firstIndex(where: { $0.1 == "align" }) {
+            let item = NSMenuItem(); item.tag = index; runExample(item)
+        }
     }
     @objc func cancel() { cancellation?.cancel() }
     private func bundledScript() throws -> URL {

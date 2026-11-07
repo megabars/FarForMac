@@ -1,6 +1,6 @@
 FarForMac Proprietary Evaluation License
-Revision 2 — 4 November 2026
-Covered application version: 0.8.0
+Revision 3 — 7 November 2026
+Covered application version: 0.9.0
 
 Copyright (c) 2026 Ivan Mezentsev. All rights reserved, except for the
 permissions expressly granted below and the rights described in section 5.
@@ -8,7 +8,7 @@ permissions expressly granted below and the rights described in section 5.
 1. Scope and licensor
 
 Ivan Mezentsev (the "Licensor") grants this license for the Licensor's own
-FarForMac versions 0.7.0 and 0.8.0 application, source code, example extensions and
+FarForMac versions 0.7.0, 0.8.0 and 0.9.0 application, source code, example extensions and
 documentation (the "Software"). Third-party components are excluded from
 this proprietary grant and remain subject to their own terms.
 
@@ -21,7 +21,7 @@ already validly granted under other applicable terms.
 2. Free evaluation permission
 
 Subject to these terms, you receive a non-exclusive, royalty-free license to
-download, install and run versions 0.7.0 and 0.8.0 on devices you own or control solely
+download, install and run versions 0.7.0, 0.8.0 and 0.9.0 on devices you own or control solely
 to test and evaluate its functionality. Individuals and organizations may
 evaluate the Software, including for a possible future business purchase.
 You may make reasonable backup copies for that evaluation.
@@ -52,7 +52,7 @@ rights are granted by this license. Rights not expressly granted are reserved.
 
 4. Future versions and contributions
 
-These terms cover versions 0.7.0 and 0.8.0 only. They do not promise free future versions,
+These terms cover versions 0.7.0, 0.8.0 and 0.9.0 only. They do not promise free future versions,
 updates, support, a commercial license or any particular feature. Future
 versions may be offered for a fee or under different terms. Such changes do
 not by themselves end the evaluation permission for your covered version copy

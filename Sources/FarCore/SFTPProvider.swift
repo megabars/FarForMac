@@ -372,6 +372,16 @@ public final class SFTPProvider: RemoteSearchDownloadProvider, RemoteBoundedDown
     }
     public func upload(from source: URL, to path: String, cancellation: TransferCancellation,
                        progress: @escaping (NetworkProgress) -> Void) throws {
+        try upload(from: source, to: path, replace: true, cancellation: cancellation, progress: progress)
+    }
+
+    func uploadNew(from source: URL, to path: String, cancellation: TransferCancellation,
+                   progress: @escaping (NetworkProgress) -> Void) throws {
+        try upload(from: source, to: path, replace: false, cancellation: cancellation, progress: progress)
+    }
+
+    private func upload(from source: URL, to path: String, replace: Bool, cancellation: TransferCancellation,
+                        progress: @escaping (NetworkProgress) -> Void) throws {
         try validatePath(path)
         guard source.isFileURL, !source.path.contains("\0") else { throw SFTPError.invalidConfiguration }
         let input = open(source.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
@@ -414,7 +424,7 @@ public final class SFTPProvider: RemoteSearchDownloadProvider, RemoteBoundedDown
                 throw SFTPError.unsupported("Локальный файл изменился при отправке.")
             }
             try s.close(handle)
-            try s.rename(from: temp, to: path, replace: true)
+            try s.rename(from: temp, to: path, replace: replace)
             ownsTemp = false
         }
     }
@@ -736,3 +746,5 @@ final class SFTPProcess {
         }
     }
 }
+
+extension SFTPProvider: RemoteExclusiveUploadProvider {}

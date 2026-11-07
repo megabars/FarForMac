@@ -170,8 +170,15 @@ extension SFTPPasswordTests {
     }
 
     @Test func idleRequestDeadlineResetsAndTimeoutInvalidatesOnlyActiveTransport() throws {
-        let f = try JumpSSHFixture(); defer { f.stop() }; try f.trustAll()
-        var connection = f.connection; connection.timeoutSeconds = 1.5
+        let f = try JumpSSHFixture(); defer { f.stop() }
+        // Exercise request deadlines on the real target without spending the
+        // same short budget on two unrelated gateway handshakes.
+        var connection = f.connection
+        connection.timeoutSeconds = 1.5
+        connection.sftpJumpHosts = []
+        connection.host = "127.0.0.1"
+        let target = f.key("target")
+        try f.store.trust(SFTPHostKey(host: connection.host, port: connection.port, keyType: target.keyType, publicKey: target.publicKey))
         let p = SFTPProvider(connection: connection, password: f.password, knownHostsURL: f.store.url)
         defer { p.closeConnection() }
         #expect(try p.stat(path: "/hello.txt", cancellation: TransferCancellation()) != nil)
