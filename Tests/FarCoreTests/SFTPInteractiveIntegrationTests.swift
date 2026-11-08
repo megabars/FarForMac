@@ -96,7 +96,11 @@ extension SFTPPasswordTests {
                     try f.store.trust(SFTPHostKey(host: expected.host, port: expected.port, keyType: other.keyType, publicKey: other.publicKey))
                 }
                 let requests = InteractiveRequests()
-                let provider = SFTPProvider(connection: f.connection, knownHostsURL: f.store.url) { challenge in
+                // The last case must authenticate two real jumps before it can
+                // check target trust. The connection deadline is shared by all three.
+                var connection = f.connection
+                connection.timeoutSeconds = 15
+                let provider = SFTPProvider(connection: connection, knownHostsURL: f.store.url) { challenge in
                     requests.append(challenge); try? challenge.respond(fixtureAnswer(challenge, fixture: f))
                 }
                 let expected: SFTPError = changed ? .changedHostKey : .unknownHostKey
@@ -104,9 +108,10 @@ extension SFTPPasswordTests {
                     _ = try provider.list(path: "/", cancellation: TransferCancellation())
                     Issue.record("Untrusted MFA endpoint accepted")
                 } catch let error as SFTPJumpHostError {
-                    #expect(index < 2 && error.index == index && error.error == expected)
+                    #expect(index < 2 && error.index == index && error.error == expected,
+                            "\(names[index]): expected \(expected), got \(error.error) at jump \(error.index + 1)")
                 } catch let error as SFTPError {
-                    #expect(index == 2 && error == expected)
+                    #expect(index == 2 && error == expected, "\(names[index]): expected \(expected), got \(error)")
                 }
                 #expect(f.counter(names[index], "interactive") == 0)
                 #expect(!requests.values.contains { $0.endpoint.jumpHostIndex == (index < 2 ? index : nil) })
