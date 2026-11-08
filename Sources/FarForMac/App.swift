@@ -2408,11 +2408,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 "Search Enter restores nested panel; F3 opens actual nested member through host controller"]
     }
 
+    @objc private func showAbout(_ sender: Any?) {
+        let supportURL = URL(string: "https://boosty.to/fromsiberiavr/donate")!
+        let support = NSAttributedString(string: L10n.text("Поддержать проект на Boosty"), attributes: [.link: supportURL])
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: support])
+    }
+
     func setupMenu() {
         let bar = NSMenu()
         let appItem = NSMenuItem(); bar.addItem(appItem)
         let appMenu = NSMenu(); appItem.submenu = appMenu
-        appMenu.addItem(withTitle: "О FarForMac", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let about = NSMenuItem(title: "О FarForMac", action: #selector(showAbout(_:)), keyEquivalent: "")
+        about.target = self; appMenu.addItem(about)
         let preferences = NSMenuItem(title: "Доступность и язык…", action: #selector(showInterfacePreferences(_:)), keyEquivalent: ",")
         preferences.target = self; appMenu.addItem(preferences)
         appMenu.addItem(.separator())
@@ -2602,7 +2609,7 @@ extension AppDelegate {
             guard let self else { return false }
             switch command {
             case .config: self.showInterfacePreferences(nil)
-            case .about: NSApp.orderFrontStandardAboutPanel(nil)
+            case .about: self.showAbout(nil)
             case .regex: self.luaRegexPlayground()
             case .error(let code):
                 self.inform("POSIX error \(code)", code <= UInt32(Int32.max) ? String(cString: strerror(Int32(code))) : "Нет соответствующего кода POSIX. Windows NTSTATUS в macOS отсутствует.")

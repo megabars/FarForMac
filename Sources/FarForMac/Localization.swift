@@ -315,6 +315,7 @@ enum L10n {
         "Копировать…": "Copy…", "Переместить…": "Move…", "Создать папку…": "Create folder…",
         "В Корзину…": "Move to Trash…", "Переименовать…": "Rename…",
         "О FarForMac": "About FarForMac", "Скрыть FarForMac": "Hide FarForMac", "Выйти из FarForMac": "Quit FarForMac",
+        "Поддержать проект на Boosty": "Support the project on Boosty",
         "Отменить": "Undo", "Повторить": "Redo", "Вырезать": "Cut", "Копировать": "Copy", "Вставить": "Paste", "Выделить всё": "Select All",
         "Закрыть окно": "Close Window", "Свернуть": "Minimize", "Готово": "Ready", "Файловый менеджер": "File manager",
         "Имя": "Name", "Размер": "Size", "Изменён": "Modified", "Расширение": "Extension", "Создан": "Created", "Доступ": "Accessed",
