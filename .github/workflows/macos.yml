@@ -65,8 +65,12 @@ jobs:
         run: |
           set -o pipefail
           script/ui_smoke.sh 2>&1 | tee dist/validation/ui-smoke.log
-      - uses: actions/upload-artifact@v7
+      - name: Upload build and diagnostic artifacts
+        uses: actions/upload-artifact@v7
         if: always()
+        # The runner has already validated the bundle. Transient upload failures
+        # must not change the result of compilation, tests, or UI validation.
+        continue-on-error: true
         with:
           name: FarForMac-${{ matrix.os }}
           retention-days: 7

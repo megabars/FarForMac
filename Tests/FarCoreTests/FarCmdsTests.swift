@@ -66,10 +66,26 @@ struct FarCmdsTests {
             .init(command: text, directory: nil, stream: .combined, display: .hide, destination: nil)
         }
         let token = ExtensionCancellation()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { token.cancel() }
-        #expect(throws: CancellationError.self) {
-            try FarCmdsCaptureRunner(timeout: 5).run(command("/bin/sleep 3"), directory: root, environment: [:], cancellation: token)
+        let ready = root.appendingPathComponent("capture-started")
+        // The runner blocks its calling thread. Observe readiness on a separate
+        // thread so a busy test pool cannot delay the cancellation callback.
+        let observer = Thread {
+            let deadline = ProcessInfo.processInfo.systemUptime + 10
+            while !Thread.current.isCancelled && ProcessInfo.processInfo.systemUptime < deadline {
+                if FileManager.default.fileExists(atPath: ready.path) {
+                    token.cancel()
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
         }
+        observer.start()
+        defer { observer.cancel() }
+        #expect(throws: CancellationError.self) {
+            try FarCmdsCaptureRunner(timeout: 15).run(command(": > capture-started; exec /bin/sleep 60"),
+                                                       directory: root, environment: [:], cancellation: token)
+        }
+        #expect(FileManager.default.fileExists(atPath: ready.path))
         #expect(throws: FarCmdsError.self) {
             try FarCmdsCaptureRunner(timeout: 5, outputLimit: 4).run(command("printf 'too much'"), directory: root, environment: [:])
         }
