@@ -116,6 +116,7 @@ private final class NetworkDownloadBatch {
     func connect(in panel: PanelView) {
         guard available() else { return }
         let window = NetworkConnectionWindow(profiles: AppRuntime.isSmoke ? [] : nil); connectionWindow = window
+        window.canConnect = { [weak self, weak panel] in panel != nil && self?.available(quiet: true) == true }
         window.onConnect = { [weak self, weak panel] connection, password, save, saveSecret in
             guard let self, let panel else { return }
             self.connect(connection, password: password, in: panel, save: save, saveSecret: saveSecret)

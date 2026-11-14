@@ -68,6 +68,7 @@ extension AppDelegate {
             panel.onRemoteReturn = { [weak self] in self?.showSavedConnections(in: $0) }
             self.network.connectProfile(connection, password: password, in: panel)
         }
+        browser.canConnect = { [weak self, weak panel] in panel != nil && self?.canChangePanelResource == true }
         panel.showResource(browser, kind: .connections, caption: browser.caption,
             focus: { browser.focus() }, refresh: { browser.refresh() }, stop: { [weak self] in self?.network.cancel() },
             setActive: { browser.setActive($0) }, perform: { browser.perform(function: $0, shifted: $1) })

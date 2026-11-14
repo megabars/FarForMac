@@ -10,6 +10,7 @@ final class SavedConnectionsPanelView: NSView, NSTableViewDataSource, NSTableVie
     var onError: ((Error) -> Void)?
     var onConnect: ((NetworkConnection) -> Void)?
     var onConnectEdited: ((NetworkConnection, String?) -> Void)?
+    var canConnect: () -> Bool = { true }
     var exportDirectory: (() -> URL?)?
     var caption: String { label("Сохранённые подключения", "Stored sessions") + " [/" + group.joined(separator: "/") + "]" }
 
@@ -251,6 +252,7 @@ final class SavedConnectionsPanelView: NSView, NSTableViewDataSource, NSTableVie
         if editor?.window?.isVisible == true { editor?.window?.makeKeyAndOrderFront(nil); return }
         let path = profile.map(SavedNetworkProfiles.path(for:)) ?? (group.isEmpty ? "" : group.joined(separator: "/") + "/")
         let controller = NetworkConnectionWindow(connection: profile, sessionPath: path)
+        controller.canConnect = { [weak self] in self?.canConnect() ?? false }
         controller.onSaveSession = { [weak self] edited, password, savePassword in
             guard let self else { throw NetworkError.cancelled }
             try self.save(edited, replacing: profile, password: password, savePassword: savePassword)
@@ -261,17 +263,33 @@ final class SavedConnectionsPanelView: NSView, NSTableViewDataSource, NSTableVie
     }
 
     private func save(_ edited: NetworkConnection, replacing original: NetworkConnection?, password: String?, savePassword: Bool) throws {
-        var current = try NetworkProfileStore.load(from: storeURL)
+        let previous = try NetworkProfileStore.load(from: storeURL)
+        var current = previous
         guard current.first(where: { $0.id == edited.id }) == original else { throw NetworkError.changedSource }
         try SavedNetworkProfiles.upsert(edited, in: &current)
-        // An old credential must never outlive a change of server, protocol, identity, or route under the same UUID.
-        if original != nil { try NetworkCredentials.remove(for: edited.id) }
+        let changesCredentialScope = original.map { old in
+            old.kind != edited.kind || old.host != edited.host || old.port != edited.port || old.username != edited.username ||
+            old.privateKeyPath != edited.privateKeyPath || old.sftpAuthenticationMode != edited.sftpAuthenticationMode ||
+            old.sftpJumpHosts != edited.sftpJumpHosts
+        } ?? false
+        // Clear the old credential before publishing metadata for a different endpoint or route.
+        if changesCredentialScope { try NetworkCredentials.remove(for: edited.id) }
         try NetworkProfileStore.save(current, to: storeURL)
-        navigate(to: edited.profileGroup, selecting: .profile(edited.id))
-        if savePassword, let password, !password.isEmpty {
-            do { try NetworkCredentials.save(password: password, for: edited.id) }
-            catch { report(error) }
+        do {
+            if savePassword, let password, !password.isEmpty {
+                try NetworkCredentials.save(password: password, for: edited.id)
+            } else if original != nil, !changesCredentialScope {
+                try NetworkCredentials.remove(for: edited.id)
+            }
+        } catch {
+            let credentialError = error
+            do { try NetworkProfileStore.save(previous, to: storeURL) }
+            catch {
+                throw NetworkError.io(credentialError.localizedDescription + "\n" + error.localizedDescription)
+            }
+            throw credentialError
         }
+        navigate(to: edited.profileGroup, selecting: .profile(edited.id))
     }
 
     private func changeName(duplicate: Bool) {

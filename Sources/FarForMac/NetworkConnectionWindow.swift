@@ -5,6 +5,7 @@ import FarCore
 final class NetworkConnectionWindow: FileToolsWindowController, NSTextFieldDelegate {
     var onConnect: ((NetworkConnection, String?, Bool, Bool) -> Void)?
     var onSaveSession: ((NetworkConnection, String?, Bool) throws -> Void)?
+    var canConnect: () -> Bool = { true }
     private let profiles: [NetworkConnection]
     private let sessionPath: String?
     private let preset: NetworkConnection?
@@ -205,7 +206,43 @@ final class NetworkConnectionWindow: FileToolsWindowController, NSTextFieldDeleg
               savedProfile?.sftpAuthenticationMode == .password, !openedConnection else {
             throw NetworkError.io("A new session must save into its current group without logging in or requiring a stored password")
         }
-        return ["SSH import clears saved credentials and creates a fresh editable profile", "SFTP form submits jump hosts with target password authentication", "Changing the SSH route clears the target secret", "SSH configuration controls are disabled for other protocols"] + (try SFTPJumpHostsWindow.runUISmokeChecks()) + (try SSHAuthenticationWindow.runUISmokeChecks()) + ["Interactive SFTP allows key plus MFA without a static or saved secret", "A saved session can be created inside a group without logging in or storing its password"]
+        let edited = NetworkConnectionWindow(sessionPath: "Test session")
+        defer { edited.close() }
+        edited.host.stringValue = "saved.example"
+        edited.authentication.selectItem(at: 1)
+        edited.authenticationChanged()
+        var submittedSecret: String?, rememberSubmittedSecret = false
+        edited.showWindow(nil)
+        guard let editWindow = edited.window, editWindow.makeFirstResponder(edited.password),
+              let fieldEditor = edited.password.currentEditor() as? NSTextView else {
+            throw NetworkError.io("The password field must accept focus in the session editor")
+        }
+        fieldEditor.insertText("fixture-pasted-password", replacementRange: NSRange(location: 0, length: 0))
+        edited.rememberSecret.state = .on
+        let credentialError = NetworkError.io("Fixture Keychain write failed")
+        edited.onSaveSession = { _, _, _ in throw credentialError }
+        edited.connect()
+        guard editWindow.isVisible, edited.status.stringValue == credentialError.localizedDescription,
+              edited.password.stringValue == "fixture-pasted-password" else {
+            throw NetworkError.io("A Keychain failure must keep the session editor and password available for retry")
+        }
+        edited.onSaveSession = { _, secret, remember in
+            submittedSecret = secret; rememberSubmittedSecret = remember
+        }
+        var connectedSecret: String?
+        edited.onConnect = { _, secret, _, _ in connectedSecret = secret }
+        edited.canConnect = { false }
+        edited.connect()
+        guard editWindow.isVisible, submittedSecret == nil, connectedSecret == nil else {
+            throw NetworkError.io("A busy file manager must leave the connection editor open without saving or connecting")
+        }
+        edited.canConnect = { true }
+        guard NSApp.sendAction(#selector(connect), to: edited, from: nil),
+              submittedSecret == "fixture-pasted-password", rememberSubmittedSecret,
+              connectedSecret == submittedSecret else {
+            throw NetworkError.io("Connect must save and submit the password pasted into the focused field")
+        }
+        return ["SSH import clears saved credentials and creates a fresh editable profile", "SFTP form submits jump hosts with target password authentication", "Changing the SSH route clears the target secret", "SSH configuration controls are disabled for other protocols"] + (try SFTPJumpHostsWindow.runUISmokeChecks()) + (try SSHAuthenticationWindow.runUISmokeChecks()) + ["Interactive SFTP allows key plus MFA without a static or saved secret", "A saved session can be created inside a group without logging in or storing its password", "Session editor keeps the pasted password after storage or busy errors and submits it on retry"]
     }
     static func confirmCleartextConnection(_ type: NetworkProtocol) -> Bool {
         guard type.isCleartext else { return true }
@@ -218,6 +255,12 @@ final class NetworkConnectionWindow: FileToolsWindowController, NSTextFieldDeleg
     @objc private func saveSession() { submit(connect: false) }
     private func submit(connect shouldConnect: Bool) {
         do {
+            guard window?.makeFirstResponder(nil) != false else {
+                throw NetworkError.invalidConnection(L10n.text("Проверьте введённые параметры подключения."))
+            }
+            if shouldConnect, !canConnect() {
+                throw NetworkError.io(L10n.text("Дождитесь завершения текущей файловой операции."))
+            }
             let type = NetworkProtocol.allCases[max(0, kind.indexOfSelectedItem)]
             guard let number = Int(port.stringValue), let seconds = Double(timeout.stringValue) else { throw NetworkError.invalidConnection("Порт и таймаут должны быть числами.") }
             let save = remember.state == .on
@@ -240,7 +283,7 @@ final class NetworkConnectionWindow: FileToolsWindowController, NSTextFieldDeleg
             }
             try connection.validate()
             let secret = password.isEnabled ? password.stringValue : nil
-            if shouldConnect, type == .sftp, connection.sftpAuthenticationMode == .password, secret?.isEmpty ?? true {
+            if shouldConnect || saveSecret, type == .sftp, connection.sftpAuthenticationMode == .password, secret?.isEmpty ?? true {
                 throw NetworkError.invalidConnection(L10n.text("Введите пароль для входа SFTP."))
             }
             if sessionPath != nil {
@@ -253,6 +296,9 @@ final class NetworkConnectionWindow: FileToolsWindowController, NSTextFieldDeleg
             guard !saveSecret || save else { status.stringValue = "Для пароля в Связке ключей сохраните и параметры подключения."; return }
             password.stringValue = ""; close()
             onConnect?(connection, secret, save, saveSecret)
-        } catch { status.stringValue = error.localizedDescription }
+        } catch {
+            status.textColor = .systemRed
+            status.stringValue = error.localizedDescription
+        }
     }
 }
